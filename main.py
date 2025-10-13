@@ -9,6 +9,7 @@ import logging
 import time
 import gc    
 from torch_geometric.loader import DataLoader as GeoDataLoader
+import os
 
 from FrontEnd           import FrontEnd
 from RawDataHandler     import RawDataHandler
@@ -58,7 +59,8 @@ class MainApp:
         self.frontendApp = FrontEnd(self.args.tickers)
 
         #   2. Show loading overlay
-        self.loader = LoadingOverlay(self.frontendApp.root, avi_path="misc\loading.avi", delay=24)
+        avi_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "loading.avi")
+        self.loader = LoadingOverlay(self.frontendApp.root, avi_path, delay=24)
     
     def _load_data_and_start_gui(self):
         # === STEP 1: Establish feature columns ===
