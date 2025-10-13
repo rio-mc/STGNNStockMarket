@@ -47,7 +47,7 @@ class Trainer:
         self.model.edge_index = self.edge_index
         self.model.target_node_index = self.targetIdx
     
-    def train(self, dataloader, num_epochs, save_model_path=None, stop_event=None):
+    def train(self, dataloader, num_epochs, stop_event=None):
         # === STEP 1: Start Memory Tracking ===
         # ------------------------------------
         self._init_energy_monitoring()
@@ -129,9 +129,6 @@ class Trainer:
                 val_l=[v["loss"] for v in self.evaluator.get_validation_loss("LSTM")],
                 val_s=[v["loss"] for v in self.evaluator.get_validation_loss("STGNN")],
             )
-
-            if save_model_path:
-                torch.save(self.model.state_dict(), save_model_path)
 
 		# === STEP 9: Terminate Memeory Tracking ===
         # ------------------------------------

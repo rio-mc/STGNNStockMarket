@@ -328,7 +328,6 @@ class MainApp:
             trainer_lstm.train(
                 dl_lstm_train,
                 self.args.lstm_epochs,
-                self.args.lstm_save,
                 stop_event=stop_event,
             )
             self.logger.info(f"[startPipeline] LSTM training completed in {time.time() - l_start:.2f}s")
@@ -452,7 +451,6 @@ class MainApp:
             trainer_stgnn.train(
                 dl_stgnn_train,
                 num_epochs=self.args.stgnn_epochs,
-                save_model_path=self.args.stgnn_save,
                 stop_event=stop_event
             )
             self.logger.info(f"[startPipeline] STGNN training completed in {time.time() - s_start:.2f}s")
