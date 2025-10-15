@@ -17,7 +17,8 @@ class Trainer:
                  tickers=None, targetTicker=None,
                  frontend=None, evaluator=None,
                  prediction_horizon = None,
-                 seq_len = None
+                 seq_len = None,
+                 model_name = None
                  ):
 		# === STEP 1: Configuration Setup ===
         # ------------------------------------
@@ -46,6 +47,7 @@ class Trainer:
         self.targetIdx = self._resolve_target_index()
         self.model.edge_index = self.edge_index
         self.model.target_node_index = self.targetIdx
+        self.model_name = model_name
     
     def train(self, dataloader, num_epochs, stop_event=None):
         # === STEP 1: Start Memory Tracking ===
@@ -117,7 +119,7 @@ class Trainer:
             # ------------------------------------
 
             #   1. Set model to plot
-            model_key = "STGNN" if self.graphBuilder else "LSTM"
+            model_key = self.model_name
 
             #   2. Store loss
             self.evaluator.record_training_loss(model_key, avg_loss)
@@ -126,8 +128,10 @@ class Trainer:
             self.evaluator.plot_loss(
                 hist_l=self.evaluator.get_training_loss("LSTM"),
                 hist_s=self.evaluator.get_training_loss("STGNN"),
+                hist_g=self.evaluator.get_training_loss("GRU"),
                 val_l=[v["loss"] for v in self.evaluator.get_validation_loss("LSTM")],
                 val_s=[v["loss"] for v in self.evaluator.get_validation_loss("STGNN")],
+                val_g=[v["loss"] for v in self.evaluator.get_validation_loss("GRU")],
             )
 
 		# === STEP 9: Terminate Memeory Tracking ===
@@ -214,7 +218,7 @@ class Trainer:
                 loss = self.criterion(logits, y)
 
                 #   6. Record losses
-                model_key = "STGNN" if self.graphBuilder else "LSTM"
+                model_key = self.model_name
                 self.evaluator.record_validation_loss(model_key, loss.item(), timestamp)
 
             except Exception as e:
@@ -246,13 +250,12 @@ class Trainer:
             y_pred=y_pred_all,
             probs=probs_all,
             prediction_dates=prediction_dates,
-            hist_lstm=self.evaluator.get_training_loss("LSTM") if not self.graphBuilder else None,
-            hist_stgnn=self.evaluator.get_training_loss("STGNN") if self.graphBuilder else None,
-            val_lstm=self.evaluator.get_validation_loss("LSTM") if not self.graphBuilder else None,
-            val_stgnn=self.evaluator.get_validation_loss("STGNN") if self.graphBuilder else None,
-            horizon=self.prediction_horizon
+            hist_train=self.evaluator.get_training_loss(self.model_name),
+            hist_val=self.evaluator.get_validation_loss(self.model_name),
+            horizon=self.prediction_horizon,
+            model_name=self.model_name
         )
-    
+            
     def _unpack_batch(self, batch):
         # === STEP 1: GeoBatch Handling (STGNN) ===
         # ------------------------------------

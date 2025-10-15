@@ -18,6 +18,7 @@ from TensorFactory      import TensorFactory
 from GraphBuilder       import GraphBuilder
 from Trainer            import Trainer
 from LSTMClassifier     import LSTMClassifier
+from GRUClassifier      import GRUClassifier
 from STGNNClassifier    import STGNNClassifier
 from ModelDataset       import LSTMDataset, STGNNDataset
 from EvaluationMethods  import EvaluationMethods
@@ -288,6 +289,7 @@ class MainApp:
                 self.horizon
             )
             dl_lstm_train = torch.utils.data.DataLoader(lstm_train_ds, self.args.batch_size, shuffle=True)
+            dl_gru_train = dl_lstm_train
 
             #   3. Create LSTM validation dataset
             lstm_val_ds = LSTMDataset(
@@ -320,7 +322,8 @@ class MainApp:
                 frontend=self.frontendApp,
                 evaluator=evaluator,
                 prediction_horizon=self.horizon,
-                seq_len=self.seq_len
+                seq_len=self.seq_len,
+                model_name="LSTM"
             )
 
             #   6. Train LSTM model (with efficiency tracking)
@@ -369,7 +372,9 @@ class MainApp:
             #   3. Update front-end
             self.logger.info(f"[startPipeline] LSTM={dir_l} ({conf_l:.1f}%)")
             self.frontendApp.root.after(0, lambda: self.frontendApp.updateResults(
-                f"{dir_l} (Next {horizon//bars_per_day}d)", conf_l, "-", 0.0
+                f"{dir_l} (Next {horizon//bars_per_day}d)", conf_l, 
+                "-", 0.0, 
+                "-", 0.0
             ))
             
             #   4.  Check stop_event
@@ -385,8 +390,73 @@ class MainApp:
                 torch.cuda.reset_peak_memory_stats()
             Utils.log_gpu_memory("Before STGNN")
 
-            # === STEP 12: STGNN — Graph-Based Model Pipeline ===
+            # === STEP 12: GRU Training Phase ===
+            self.frontendApp.set_status("Training GRU...")
+
+            gru_model = GRUClassifier(
+                feature_dim=len(self.raw_feature_cols),
+                hidden_dim=self.args.lstm_hidden,
+                num_layers=self.args.lstm_layers,
+                out_channels=1,
+                bidirectional=self.args.bidirectional,
+                dropout=self.args.dropout
+            ).to(self.device)
+
+            trainer_gru = Trainer(
+                gru_model,
+                Adam(gru_model.parameters(), lr=self.args.lstm_lr),
+                BCEWithLogitsLoss(),
+                self.device,
+                graphBuilder=None,
+                features=None,
+                tickers=[stock],
+                targetTicker=stock,
+                frontend=self.frontendApp,
+                evaluator=evaluator,
+                prediction_horizon=self.horizon,
+                seq_len=self.seq_len,
+                model_name="GRU"
+            )
+
+            trainer_gru.train(dl_gru_train, self.args.lstm_epochs, stop_event=stop_event)
+            eval_result_gru = trainer_gru.evaluate_rolling(lstm_val_ds)
+
+            evaluator.evaluate("GRU", eval_result_gru, price_df=price_df)
+
+            # === STEP 12.5: GRU Final Prediction Phase ===
+            # ----------------------------------------------
+            self.frontendApp.set_status("Predicting with GRU...")
+
+            #   1. Prepare data for prediction
+            live_g = val_df_stock[self.raw_feature_cols].iloc[-self.seq_len:].values.astype(np.float32)
+            arr_g = torch.tensor(live_g, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+            #   2. Predict directional confidence
+            with torch.no_grad():
+                prob_g = torch.sigmoid(gru_model(arr_g)[0]).item()
+            dir_g, conf_g = ("Upwards", prob_g * 100) if prob_g >= 0.5 else ("Downwards", (1 - prob_g) * 100)
+
+            #   3. Log and optionally update the GUI immediately
+            self.logger.info(f"[startPipeline] GRU={dir_g} ({conf_g:.1f}%)")
+            self.frontendApp.root.after(0, lambda: self.frontendApp.updateResults(
+                f"{dir_l} (Next {horizon//bars_per_day}d)", conf_l,
+                f"{dir_g} (Next {horizon//bars_per_day}d)", conf_g,
+                "-", 0.0
+            ))
+
+            # === STEP 13: Clear memory ===
             # ------------------------------------
+            del gru_model
+            del dl_gru_train
+            torch.cuda.empty_cache()  # Clears unused cached memory
+            gc.collect()              # Force Python garbage collection
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            Utils.log_gpu_memory("Before STGNN")
+
+            # === STEP 14: STGNN — Graph-Based Model Pipeline ===
+            # ------------------------------------
+
             self.frontendApp.set_status("Training STGNN...")
 
             #   1. Use full train set of all tickers and the fixed graph from earlier.
@@ -442,7 +512,8 @@ class MainApp:
                 self.frontendApp,
                 evaluator,
                 prediction_horizon=self.horizon,
-                seq_len=self.seq_len
+                seq_len=self.seq_len,
+                model_name="STGNN"
             )
             
             #   6. Train STGNN model (with efficiency tracking)
@@ -459,7 +530,7 @@ class MainApp:
             #   7. Check stop_event
             self._check_stop(stop_event)
 
-		    # === STEP 13: Extract latent embeddings from STGNN ===
+		    # === STEP 15: Extract latent embeddings from STGNN ===
             # ------------------------------------
             with torch.no_grad():
                 #   1. Prepare input data for embedding — use TRAINING features only
@@ -487,7 +558,7 @@ class MainApp:
             #   4. Check stop_event
             self._check_stop(stop_event)
             
-            # === STEP 14: Rebuild the graph  ===
+            # === STEP 16: Rebuild the graph  ===
             # ------------------------------------
             self.frontendApp.set_status("Rebuilding graph...")
 
@@ -517,7 +588,7 @@ class MainApp:
             trainer_stgnn.edge_index = edge_index_new
             trainer_stgnn.model.edge_index = edge_index_new
 
-            # === STEP 15: STGNN Evaluation Phase ===
+            # === STEP 17: STGNN Evaluation Phase ===
             # --------------------------------------
             self.frontendApp.set_status("Evaluating STGNN...")
 
@@ -535,7 +606,7 @@ class MainApp:
             #   3. Check stop_event
             self._check_stop(stop_event)
 
-		    # === STEP 16: STGNN Final Prediction Phase ===
+		    # === STEP 18: STGNN Final Prediction Phase ===
             # ------------------------------------
             self.frontendApp.set_status("Predicting with STGNN...")
 
@@ -569,13 +640,14 @@ class MainApp:
             dir_s_str = "Upwards" if prob_s >= 0.5 else "Downwards"
             conf_s = prob_s * 100 if dir_s_str == "Upwards" else (1 - prob_s) * 100
 
-		    # === STEP 17: Final front-end update ===
+		    # === STEP 19: Final front-end update ===
             # ------------------------------------
             self.frontendApp.set_status("Predictions completed.")
 
             #   1. Update frontend with both models' outputs
             self.frontendApp.root.after(0, lambda: self.frontendApp.updateResults(
                 f"{dir_l} (Next {horizon//bars_per_day}d)", conf_l,
+                f"{dir_g} (Next {horizon//bars_per_day}d)", conf_g,
                 f"{dir_s_str} (Next {horizon//bars_per_day}d)", conf_s
             ))
 
@@ -587,16 +659,17 @@ class MainApp:
 
             return (
                 f"{dir_l} (Next {horizon//bars_per_day}d)", conf_l,
+                f"{dir_g} (Next {horizon//bars_per_day}d)", conf_g,
                 f"{dir_s_str} (Next {horizon//bars_per_day}d)", conf_s
-            ) if dir_l and dir_s_str else ("-", 0.0, "-", 0.0)
-        
+            ) if all(v is not None for v in [dir_l, dir_g, dir_s_str]) else ("—", 0.0, "—", 0.0, "—", 0.0)
+            
         except InterruptedError:
             # ====================================
 		    # ===   Raises if stop_event triggered termination
             self.logger.info("[startPipeline] Pipeline interrupted by stop_event")
             self.frontendApp.root.after_idle(self.frontendApp._reset_ui)
             self.pipeline_running = False
-            return ("-", 0.0, "-", 0.0)
+            return ("-", 0.0, "-", 0.0, "-", 0.0)
 
     def run(self):
 		# ====================================

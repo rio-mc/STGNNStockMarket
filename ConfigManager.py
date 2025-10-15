@@ -50,9 +50,9 @@ class ConfigManager:
         # ====================================
 		# === STGNN Architecture        
         parser.add_argument("--stgnn_blocks", type=int, default=3, help="Number of ST Blocks")
-        parser.add_argument("--tcn_channels", type=int, default=48, help="Channels in TCN layer")
+        parser.add_argument("--tcn_channels", type=int, default=24, help="Channels in TCN layer")
         parser.add_argument("--tcn_kernel_size", type=int, default=1, help="Kernel size in TCN layer")
-        parser.add_argument("--gcn_hidden", type=int, default=36, help="Hidden dimension in GCN")
+        parser.add_argument("--gcn_hidden", type=int, default=16, help="Hidden dimension in GCN")
 
         # ====================================
 		# === Graph Construction

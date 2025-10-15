@@ -98,14 +98,26 @@ class FrontEnd:
         #   6. Prediction results panel
         self.resultFrame = tk.Frame(self.mainTab)
         self.resultFrame.pack(fill=tk.X)
+
+        # --- LSTM
         self.lstmRes = tk.LabelFrame(self.resultFrame, text="LSTM Prediction", padx=10, pady=10)
-        self.stgnnRes = tk.LabelFrame(self.resultFrame, text="STGNN Prediction", padx=10, pady=10)
         self.lstmRes.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=20, pady=5)
-        self.stgnnRes.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=20, pady=5)
         self.lstmStatus = tk.Label(self.lstmRes, text="Trending: —", font=("Helvetica", 12, "bold"), fg="green")
         self.lstmConf = tk.Label(self.lstmRes, text="Confidence: —")
         self.lstmStatus.pack()
         self.lstmConf.pack()
+
+        # --- GRU
+        self.gruRes = tk.LabelFrame(self.resultFrame, text="GRU Prediction", padx=10, pady=10)
+        self.gruRes.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=20, pady=5)
+        self.gruStatus = tk.Label(self.gruRes, text="Trending: —", font=("Helvetica", 12, "bold"), fg="blue")
+        self.gruConf = tk.Label(self.gruRes, text="Confidence: —")
+        self.gruStatus.pack()
+        self.gruConf.pack()
+
+        # --- STGNN
+        self.stgnnRes = tk.LabelFrame(self.resultFrame, text="STGNN Prediction", padx=10, pady=10)
+        self.stgnnRes.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=20, pady=5)
         self.stgnnStatus = tk.Label(self.stgnnRes, text="Trending: —", font=("Helvetica", 12, "bold"), fg="red")
         self.stgnnConf = tk.Label(self.stgnnRes, text="Confidence: —")
         self.stgnnStatus.pack()
@@ -151,6 +163,10 @@ class FrontEnd:
         self.stgnn_eval_pane.pack(fill=tk.BOTH, expand=True)
         self.loss_pane = tk.Frame(self.loss_pane_frame)
         self.loss_pane.pack(fill=tk.BOTH, expand=True)
+        self.gru_eval_frame = tk.LabelFrame(self.eval_horizontal_pane, text="GRU Evaluation", padx=5, pady=5)
+        self.eval_horizontal_pane.add(self.gru_eval_frame, stretch="always")
+        self.gru_eval_pane = tk.PanedWindow(self.gru_eval_frame, orient=tk.VERTICAL)
+        self.gru_eval_pane.pack(fill=tk.BOTH, expand=True)
 
         #   9. Backtesting tab
         self.backtestTab = ttk.Frame(self.notebook)
@@ -163,6 +179,10 @@ class FrontEnd:
         self.backtest_stgnn_pane = tk.Frame(self.backtest_stgnn_pane)
         self.backtest_lstm_pane.pack(fill=tk.BOTH, expand=True)
         self.backtest_stgnn_pane.pack(fill=tk.BOTH, expand=True)
+        self.backtest_gru_pane = tk.LabelFrame(self.backtestTab, text="GRU Backtest")
+        self.backtest_gru_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.backtest_gru_pane = tk.Frame(self.backtest_gru_pane)
+        self.backtest_gru_pane.pack(fill=tk.BOTH, expand=True)
 
         #   10. Metrics tab
         self.metricsTab = tk.Frame(self.notebook)
@@ -185,6 +205,14 @@ class FrontEnd:
         self.stgnn_metrics_pane.add(self.stgnn_roc_pane)
         self.stgnn_threshold_pane = tk.LabelFrame(self.stgnn_metrics_pane, text="Threshold Curve")
         self.stgnn_metrics_pane.add(self.stgnn_threshold_pane)
+        self.gru_metrics_frame = tk.LabelFrame(self.metrics_pane, text="GRU Metrics", padx=5, pady=5)
+        self.metrics_pane.add(self.gru_metrics_frame, stretch="always")
+        self.gru_metrics_pane = tk.PanedWindow(self.gru_metrics_frame, orient=tk.VERTICAL)
+        self.gru_metrics_pane.pack(fill=tk.BOTH, expand=True)
+        self.gru_roc_pane = tk.LabelFrame(self.gru_metrics_pane, text="ROC / PR Curve")
+        self.gru_metrics_pane.add(self.gru_roc_pane)
+        self.gru_threshold_pane = tk.LabelFrame(self.gru_metrics_pane, text="Threshold Curve")
+        self.gru_metrics_pane.add(self.gru_threshold_pane)
 
         #   11. Placeholders & state
         self._compute_callback = None
@@ -262,7 +290,7 @@ class FrontEnd:
                 cancelled = True
             else:
                 self.root.after(0, lambda:
-                    self.updateResults(*metrics if metrics else ("—", 0.0, "—", 0.0))
+                    self.updateResults(*metrics if metrics else ("—", 0.0, "—", 0.0, "—", 0.0))
                 )
         except Cancelled:
             cancelled = True
@@ -680,16 +708,22 @@ class FrontEnd:
 
     def _deliver_results(self, metrics):
         # ====================================
-		# === Helper to unpack the returned metrics tuple and update the UI
-        dir_l, conf_l, dir_s, conf_s = metrics
-        # Note: wrap UI calls in .after to ensure they run on the main thread
+        # === Helper to unpack the returned metrics tuple and update the UI
+        try:
+            dir_l, conf_l, dir_g, conf_g, dir_s, conf_s = metrics
+        except ValueError:
+            # fallback safety: if fewer metrics provided
+            dir_l, conf_l, dir_g, conf_g, dir_s, conf_s = "—", 0.0, "—", 0.0, "—", 0.0
+
+        # Wrap UI calls in .after to ensure they run on the main thread
         self.root.after(
             0,
             lambda: self.updateResults(
                 f"{dir_l}", conf_l,
+                f"{dir_g}", conf_g,
                 f"{dir_s}", conf_s
             )
-        )    
+        ) 
 
     # ====================================
     # === Helper to expose backtest frame for LSTM
@@ -740,28 +774,37 @@ class FrontEnd:
 
         self.root.after(0, lambda: [self.clear_axis(pane) for pane in clear_targets])    
 
-    def updateResults(self, lstm_trend, lstm_conf, stgnn_trend, stgnn_conf):
-        # ====================================
-		# === Helper to update front-end live model prediction results
-        """Update the two result label boxes."""
+    def updateResults(self, lstm_trend, lstm_conf, gru_trend, gru_conf, stgnn_trend, stgnn_conf):
+        """Update the three result label boxes."""
+        # LSTM
         self.lstmStatus.config(
             text=f"Trending: {lstm_trend}",
             fg="green" if "Upwards" in lstm_trend else "red"
-        )        
+        )
         self.lstmConf.config(
             text=f"Confidence: {lstm_conf:.1f}%",
             fg="green" if "Upwards" in lstm_trend else "red"
-        )        
-        
+        )
+
+        # GRU
+        self.gruStatus.config(
+            text=f"Trending: {gru_trend}",
+            fg="green" if "Upwards" in gru_trend else "red"
+        )
+        self.gruConf.config(
+            text=f"Confidence: {gru_conf:.1f}%",
+            fg="green" if "Upwards" in gru_trend else "red"
+        )
+
+        # STGNN
         self.stgnnStatus.config(
             text=f"Trending: {stgnn_trend}",
             fg="green" if "Upwards" in stgnn_trend else "red"
         )
-
         self.stgnnConf.config(
             text=f"Confidence: {stgnn_conf:.1f}%",
             fg="green" if "Upwards" in stgnn_trend else "red"
-        )    
+        )
     
     def refresh_selected_tabs(self):
         # ====================================

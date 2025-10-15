@@ -30,6 +30,7 @@ class EvaluationMethods:
         #   1. Set up from front-end
         self.frontend = frontend
         self.lstm_eval_pane = frontend.lstm_eval_pane
+        self.gru_eval_pane = frontend.gru_eval_pane
         self.stgnn_eval_pane = frontend.stgnn_eval_pane
         self.loss_pane = frontend.loss_pane
 
@@ -52,20 +53,25 @@ class EvaluationMethods:
 
         #   3. Configure backtest pane
         self.backtest_lstm_pane = frontend.backtest_lstm_pane
+        self.backtest_gru_pane = frontend.backtest_gru_pane
         self.backtest_stgnn_pane = frontend.backtest_stgnn_pane
 
         #   4. Configure metrics pane
         self.lstm_roc_pane = frontend.lstm_roc_pane
+        self.gru_roc_pane = frontend.gru_roc_pane
         self.stgnn_roc_pane = frontend.stgnn_roc_pane
         self.lstm_threshold_pane = frontend.lstm_threshold_pane
+        self.gru_threshold_pane = frontend.gru_threshold_pane
         self.stgnn_threshold_pane = frontend.stgnn_threshold_pane
 
         #   5. Initialise histories
         self.loss_history_lstm = []
+        self.loss_history_gru = []
         self.loss_history_stgnn = []
         self.val_loss_history_lstm = []
+        self.val_loss_history_gru = []
         self.val_loss_history_stgnn = []
-                    
+
     def evaluate(
         self,
         model_name: str,
@@ -93,7 +99,13 @@ class EvaluationMethods:
         self.frontend.root.after(0, lambda: self.plot_roc_and_pr(result.y_true, result.probs, model_name))
 
         #   4. Threshold Curve
-        threshold_pane = self.lstm_threshold_pane if model_name.upper() == "LSTM" else self.stgnn_threshold_pane
+        if model_name.upper() == "LSTM":
+            threshold_pane = self.lstm_threshold_pane
+        elif model_name.upper() == "GRU":
+            threshold_pane = self.gru_threshold_pane
+        else:
+            threshold_pane = self.stgnn_threshold_pane
+
         self.frontend.root.after(0, lambda: self.plot_recall_threshold(
             truths=result.y_true,
             probs=result.probs,
@@ -146,7 +158,10 @@ class EvaluationMethods:
 
             # === STEP 5: Plot Equity Curve ===
             # ------------------------------------
-            pane = self.backtest_lstm_pane if model_name.upper() == "LSTM" else self.backtest_stgnn_pane
+            pane = self.backtest_lstm_pane if model_name.upper() == "LSTM" \
+            else self.backtest_gru_pane if model_name.upper() == "GRU" \
+            else self.backtest_stgnn_pane
+
             self.frontend.root.after(0, lambda: self.plot_equity_curve(
                 equity=equity,
                 pane=pane,
@@ -160,6 +175,9 @@ class EvaluationMethods:
         if model_name.upper() == "LSTM":
             self._val_lstm = [v["loss"] for v in result.val_lstm] if result.val_lstm else []
             self._hist_lstm = result.hist_lstm or []
+        elif model_name.upper() == "GRU":
+            self._val_gru = [v["loss"] for v in getattr(result, "val_gru", [])] if getattr(result, "val_gru", None) else []
+            self._hist_gru = getattr(result, "hist_gru", []) or []
         else:
             self._val_stgnn = [v["loss"] for v in result.val_stgnn] if result.val_stgnn else []
             self._hist_stgnn = result.hist_stgnn or []
@@ -168,15 +186,19 @@ class EvaluationMethods:
         self,
         hist_l: Optional[List[float]] = None,
         hist_s: Optional[List[float]] = None,
+        hist_g: Optional[List[float]] = None,
         val_l: Optional[List[float]] = None,
-        val_s: Optional[List[float]] = None
+        val_s: Optional[List[float]] = None,
+        val_g: Optional[List[float]] = None
     ):
         # === STEP 1: Grab Histories ===
         # ------------------------------------
         hist_l = hist_l if hist_l is not None else self.loss_history_lstm
         hist_s = hist_s if hist_s is not None else self.loss_history_stgnn
+        hist_g = hist_g if hist_g is not None else self.loss_history_gru
         val_l = val_l if val_l is not None else self.val_loss_history_lstm
         val_s = val_s if val_s is not None else self.val_loss_history_stgnn
+        val_g = val_g if val_g is not None else self.val_loss_history_gru
 
         # === STEP 2: Clear Plots ===
         # ------------------------------------
@@ -185,11 +207,13 @@ class EvaluationMethods:
 
         # === STEP 3: Training Plot And Formatting ===
         # ------------------------------------
-        epochs = list(range(1, max(len(hist_l), len(hist_s)) + 1))
+        epochs = list(range(1, max(len(hist_l), len(hist_s), len(hist_g)) + 1))
         if hist_l:
             self.ax_train.plot(epochs[:len(hist_l)], hist_l, label='LSTM Train', linewidth=1.5)
         if hist_s:
             self.ax_train.plot(epochs[:len(hist_s)], hist_s, label='STGNN Train', linewidth=1.5)
+        if hist_g:
+            self.ax_train.plot(epochs[:len(hist_g)], hist_g, label='GRU Train', linewidth=1.5)
         max_ticks = 10
         if len(epochs) > max_ticks:
             step = max(1, len(epochs) // max_ticks)
@@ -213,6 +237,13 @@ class EvaluationMethods:
             'LSTM',
             '--',
             'tab:blue'
+        )
+        self._plot_validation_series(
+            self.ax_val,
+            self.val_loss_history_gru,
+            'GRU',
+            '-.',
+            'tab:green'
         )
         self._plot_validation_series(
             self.ax_val,
@@ -258,7 +289,13 @@ class EvaluationMethods:
         # ------------------------------------
 
         #   1. Establish which to plot
-        pane = self.lstm_eval_pane if model_name == "LSTM" else self.stgnn_eval_pane
+        if model_name.upper() == "LSTM":
+            pane = self.lstm_eval_pane
+        elif model_name.upper() == "GRU":
+            pane = self.gru_eval_pane
+        else:
+            pane = self.stgnn_eval_pane
+
         fig, (ax_cm, ax_txt) = plt.subplots(
             nrows=2, ncols=1,
             figsize=(5, 5),
@@ -306,8 +343,14 @@ class EvaluationMethods:
     ) -> None:
 		# === STEP 1: Create Figures ===
         # ------------------------------------
-        pane = self.lstm_roc_pane if model_name == "LSTM" else self.stgnn_roc_pane
+        if model_name.upper() == "LSTM":
+            pane = self.lstm_roc_pane
+        elif model_name.upper() == "GRU":
+            pane = self.gru_roc_pane
+        else:
+            pane = self.stgnn_roc_pane
         if pane is None:
+            print(f"[WARN] No pane found for {model_name} ROC/PR plot.")
             return
         fig, axes = (plt.subplots(1, 2, figsize=(8, 3)) if probs is not None
                     else (plt.figure(figsize=(5, 4)), plt.gca()))
@@ -418,13 +461,20 @@ class EvaluationMethods:
 		# === Helper to record training loss
         if model_name.upper() == "LSTM":
             self.loss_history_lstm.append(loss)
+        elif model_name.upper() == "GRU":
+            self.loss_history_gru.append(loss)
         elif model_name.upper() == "STGNN":
             self.loss_history_stgnn.append(loss)
 
     def get_training_loss(self, model_name: str):
         # ====================================
 		# === Helper to get training loss
-        return self.loss_history_lstm if model_name.upper() == "LSTM" else self.loss_history_stgnn
+        if model_name.upper() == "LSTM":
+            return self.loss_history_lstm
+        elif model_name.upper() == "GRU":
+            return self.loss_history_gru
+        else:
+            return self.loss_history_stgnn
     
     def record_validation_loss(self, model_name: str, loss: float, timestamp: pd.Timestamp):
         # ====================================
@@ -432,13 +482,20 @@ class EvaluationMethods:
         entry = {"loss": loss, "date": timestamp}
         if model_name.upper() == "LSTM":
             self.val_loss_history_lstm.append(entry)
+        elif model_name.upper() == "GRU":
+            self.val_loss_history_gru.append(entry)
         elif model_name.upper() == "STGNN":
             self.val_loss_history_stgnn.append(entry)
 
     def get_validation_loss(self, model_name: str):
         # ====================================
 		# === Helper to get validation loss
-        return self.val_loss_history_lstm if model_name.upper() == "LSTM" else self.val_loss_history_stgnn
+        if model_name.upper() == "LSTM":
+            return self.val_loss_history_lstm
+        elif model_name.upper() == "GRU":
+            return self.val_loss_history_gru
+        else:
+            return self.val_loss_history_stgnn
     
     def _plot_validation_series(self, ax, loss_history, label_prefix, line_style, colour):
         # ====================================
@@ -467,8 +524,10 @@ class EvaluationMethods:
 		# === Helper to reset histories
         self.loss_history_lstm.clear()
         self.loss_history_stgnn.clear()
+        self.loss_history_gru.clear()
         self.val_loss_history_lstm.clear()
         self.val_loss_history_stgnn.clear()
+        self.val_loss_history_gru.clear()
     
     def _clear_pane(self, pane):
         # ====================================
