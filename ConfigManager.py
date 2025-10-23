@@ -8,19 +8,43 @@ class ConfigManager:
         parser = argparse.ArgumentParser("Spatio-Temporal Forecasting")
 
         # ====================================
-		# === Raw Data
+		# === Raw Data : https://www.slickcharts.com/sp500 ===
         parser.add_argument("--mode", choices=["csv", "yfinance", "av"], default="yfinance")
         parser.add_argument("--data_dir", default="./data")
-        parser.add_argument("--tickers", nargs="+", default=[
+
+        parser.add_argument("--av_key", default=None)
+
+        # ====================================
+		# === Stock Tickers
+        ALL_TICKERS = [
             "NVDA", "MSFT", "AAPL", "AMZN", "META",
             "AVGO", "GOOGL", "GOOG", "BRK-B", "TSLA",
             "JPM", "WMT", "ORCL", "LLY", "V",
-            "MA", "NFLX", "XOM", "COST", "JNJ"
+            "MA", "NFLX", "XOM", "COST", "JNJ",
+            "PLTR", "ABBV", "HD", "BAC", "AMD",
+            "PG", "UNH", "GE", "CVX", "KO",
+            "CSCO", "IBM", "WFC", "TMUS", "MS",
+            "CRM", "AXP", "PM", "CAT", "RTX",
+            "GS", "ABT", "MCD", "MRK", "MU",
+            "TMO", "LIN", "PEP", "DIS", "NOW"
         ]
+
+        test_limit = 20 
+        tickers_for_test = [ALL_TICKERS[i] for i in range(min(test_limit, len(ALL_TICKERS)))]
+
+        parser.add_argument(
+            "--tickers",
+            nargs="+",
+            default=tickers_for_test,
+            help="List of stock tickers to include in analysis."
         )
-        
-        parser.add_argument("--av_key", default=None)
-        parser.add_argument("--seq_len", type=int, default=1, help="Length of historical sequence used for training")
+
+        # ====================================
+        # === Sequence Length
+        parser.add_argument(
+            "--seq-len", type=int, default=3,
+            help="Number of past timesteps to use as temporal lookback window."
+        )
 
         # ====================================
 		# === Generic Training
@@ -57,5 +81,18 @@ class ConfigManager:
         # ====================================
 		# === Graph Construction
         parser.add_argument("--max_k", type=int, default=5, help="Number of edges to retain per node (KNN)")
+
+        # ====================================
+		# === Graph Rewiring
+        parser.add_argument("--rewiring", action="store_true",
+            help="Enable post-training graph rewiring after STGNN training.")
+        parser.add_argument("--no-rewiring", dest="rewiring", action="store_false",
+            help="Disable post-training graph rewiring.")
+        parser.set_defaults(rewiring=False)
+
+        # ====================================
+		# === Sequence Length Horizon
+        parser.add_argument("--lookback", type=int, default=20,
+            help="Number of time steps to use as temporal lookback (sequence length).")
 
         return parser.parse_args()

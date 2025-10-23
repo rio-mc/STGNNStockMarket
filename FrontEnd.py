@@ -541,6 +541,8 @@ class FrontEnd:
         xs, ys, zs = coords[:,0], coords[:,1], coords[:,2]
         self._last_drawn_tickers = tickers
         self._last_drawn_pos = {t: (xs[i], ys[i], zs[i]) for i, t in enumerate(tickers)}
+        self._last_pruned_edges = pruned_edges
+        self._last_mst_edges = mst_edges
 
         #   4. Clear & scatter
         ax.clear()
@@ -548,7 +550,9 @@ class FrontEnd:
         for i, tkr in enumerate(tickers):
             ax.text(xs[i], ys[i], zs[i], tkr, size=6)
 
-        #   5. Draw edges (pruned & MST)
+        # 5. Draw edges (pruned & MST)
+        self._last_edge_labels = []  # reset cache
+
         if pruned_edges:
             for i, j, w in pruned_edges:
                 ax.plot(
@@ -556,19 +560,18 @@ class FrontEnd:
                     color='blue', linewidth=1.5, alpha=0.5
                 )
                 mx, my, mz = (xs[i] + xs[j]) / 2, (ys[i] + ys[j]) / 2, (zs[i] + zs[j]) / 2
-                #   6. Plot cosine weight as label
                 ax.text(mx, my, mz, f"{w:.2f}", fontsize=5, color='black', alpha=0.6)
+                # Store distinct midpoints and weights
+                self._last_edge_labels.append(((i, j), (mx, my, mz), w))
 
-            for i,j,_ in mst_edges or []:
+        if mst_edges:
+            for i, j, w in mst_edges:
                 ax.plot(
                     [xs[i], xs[j]], [ys[i], ys[j]], [zs[i], zs[j]],
                     color='red', linewidth=2.0, alpha=0.7, linestyle='--'
                 )
-            from matplotlib.lines import Line2D
-            max_k = self._main_app.get_max_k()
-            proxy1 = Line2D([0], [0], color='lightblue', lw=1.5, label=f'Max-{max_k} edges')            
-            proxy2 = Line2D([0],[0], color='red',      lw=1.5, label='MST edges')
-            ax.legend(handles=[proxy1, proxy2], loc='upper left')
+                mx, my, mz = (xs[i] + xs[j]) / 2, (ys[i] + ys[j]) / 2, (zs[i] + zs[j]) / 2
+                self._last_edge_labels.append(((i, j), (mx, my, mz), w))
 
         #   7. Fix axes to a cube
         ax.set_xlim(-1,1); ax.set_ylim(-1,1); ax.set_zlim(-1,1)
@@ -651,8 +654,27 @@ class FrontEnd:
         sel = self.table.selection()
         if not sel:
             return
-        # assume first column is the ticker symbol
+
         ticker = self.table.item(sel[0], "values")[0]
+
+        # Toggle deselection
+        if getattr(self, "_highlighted_ticker", None) == ticker:
+            self.table.selection_remove(sel[0])
+            self._highlighted_ticker = None
+            # Redraw the original graph with weights
+            if hasattr(self, "_last_drawn_tickers"):
+                tickers = self._last_drawn_tickers
+                coords = np.array([self._last_drawn_pos[t] for t in tickers])
+                self.plot3d_on_ax(
+                    tickers,
+                    coords,
+                    getattr(self, "_last_pruned_edges", None),
+                    getattr(self, "_last_mst_edges", None)
+                )
+            return
+
+        # Otherwise, highlight new ticker
+        self._highlighted_ticker = ticker
         if hasattr(self, "_onTickerClick"):
             self._onTickerClick(ticker)
 
@@ -666,7 +688,7 @@ class FrontEnd:
         # ====================================
 		# === Helper to highlight selected node
 
-        #   1. Remove any old highlights
+        # 1. Remove old highlights
         for m in getattr(self, "_highlight_markers", []):
             try:
                 m.remove()
@@ -674,9 +696,85 @@ class FrontEnd:
                 pass
         self._highlight_markers = []
 
-        #   2. Highlight the selected node
+        # 2. Sanity checks
+        if not hasattr(self, "_last_drawn_pos") or not hasattr(self, "_last_drawn_tickers"):
+            print("[Warning] No graph data available to highlight.")
+            return
+
+        xs, ys, zs = [], [], []
+        for t in self._last_drawn_tickers:
+            x, y, z = self._last_drawn_pos[t]
+            xs.append(x)
+            ys.append(y)
+            zs.append(z)
+        xs, ys, zs = np.array(xs), np.array(ys), np.array(zs)
+        tickers = self._last_drawn_tickers
+
+        # 3. Compute node distances to selected node
+        target = np.array(coord)
+        distances = np.linalg.norm(np.stack([xs, ys, zs], axis=1) - target, axis=1)
+        max_d = distances.max() if distances.max() > 0 else 1.0
+        norm_d = distances / max_d
+
+        # 4. Retrieve stored edges
+        pruned_edges = getattr(self, "_last_pruned_edges", None)
+        mst_edges = getattr(self, "_last_mst_edges", None)
+
+        ax = self.graphAx
+        current_elev, current_azim = ax.elev, ax.azim
+        ax.clear()
+
+        # 5. Draw edges with exponential fade
+        def edge_alpha(i, j):
+            d_mean = (norm_d[i] + norm_d[j]) / 2.0
+            return float(np.exp(-2.5 * d_mean))
+        
+        if pruned_edges:
+            for i, j, w in pruned_edges:
+                alpha = edge_alpha(i, j)
+                ax.plot(
+                    [xs[i], xs[j]], [ys[i], ys[j]], [zs[i], zs[j]],
+                    color='blue', linewidth=1.2, alpha=alpha
+                )
+
+        if mst_edges:
+            for i, j, _ in mst_edges:
+                alpha = edge_alpha(i, j)
+                ax.plot(
+                    [xs[i], xs[j]], [ys[i], ys[j]], [zs[i], zs[j]],
+                    color='red', linewidth=1.8, linestyle='--', alpha=alpha
+                )
+
+        if hasattr(self, "_last_edge_labels"):
+            for (i_j, (mx, my, mz), w) in self._last_edge_labels:
+                i, j = i_j
+                d_mean = (norm_d[i] + norm_d[j]) / 2.0
+                alpha = float(np.exp(-2.5 * d_mean))
+                ax.text(
+                    mx, my, mz, f"{w:.2f}",
+                    fontsize=5, color='black',
+                    alpha=alpha, ha='center', va='center'
+                )
+
+        # 6. Scatter all nodes unchanged
+        for i, t in enumerate(tickers):
+            colour = "red" if t == ticker else "grey"
+            size = 70 if t == ticker else 40
+            ax.scatter(
+                [xs[i]], [ys[i]], [zs[i]],
+                s=size,
+                depthshade=True,
+                alpha=1.0,
+                edgecolors=colour,
+                linewidths=1.0,
+                facecolors="none" if t != ticker else "red",
+                zorder=5 if t == ticker else 3
+            )
+            ax.text(xs[i], ys[i], zs[i], t, size=6, alpha=1.0)
+
+        # 7. Halo highlight around selected node
         x, y, z = coord
-        halo = self.graphAx.scatter(
+        halo = ax.scatter(
             [x], [y], [z],
             s=400,
             facecolors="none",
@@ -686,44 +784,17 @@ class FrontEnd:
         )
         self._highlight_markers.append(halo)
 
-        #   3. Reorient camera to face the selected node
-        import numpy as np
-        az = -np.degrees(np.arctan2(y, x))  # Rotate to centre on node
-        self.graphAx.view_init(elev=20, azim=az)
-
-        #   4. Reset zoom and axis limits
-        self.graphAx.set_xlim(-1, 1)
-        self.graphAx.set_ylim(-1, 1)
-        self.graphAx.set_zlim(-1, 1)
-        self.graphAx.set_box_aspect((1, 1, 1))  # Ensure equal scaling
-
-        #   5. Reset axis styling
+        # 8. View and render
+        ax.view_init(elev=current_elev, azim=current_azim)
+        ax.set_xlim(-1, 1)
+        ax.set_ylim(-1, 1)
+        ax.set_zlim(-1, 1)
+        ax.set_box_aspect((1, 1, 1))
         for axis in ('x', 'y', 'z'):
-            getattr(self.graphAx, f"{axis}axis").pane.fill = False
-        self.graphAx.grid(False)
-        self.graphAx.set_axis_off()
-
-        #   6. Redraw the updated view
+            getattr(ax, f"{axis}axis").pane.fill = False
+        ax.grid(False)
+        ax.set_axis_off()
         self.graphCanvas.draw_idle()
-
-    def _deliver_results(self, metrics):
-        # ====================================
-        # === Helper to unpack the returned metrics tuple and update the UI
-        try:
-            dir_l, conf_l, dir_g, conf_g, dir_s, conf_s = metrics
-        except ValueError:
-            # fallback safety: if fewer metrics provided
-            dir_l, conf_l, dir_g, conf_g, dir_s, conf_s = "—", 0.0, "—", 0.0, "—", 0.0
-
-        # Wrap UI calls in .after to ensure they run on the main thread
-        self.root.after(
-            0,
-            lambda: self.updateResults(
-                f"{dir_l}", conf_l,
-                f"{dir_g}", conf_g,
-                f"{dir_s}", conf_s
-            )
-        ) 
 
     # ====================================
     # === Helper to expose backtest frame for LSTM
@@ -747,7 +818,7 @@ class FrontEnd:
         self.updateProgress(0.0)
         try:
             #   2. Provide fallback placeholders (safe defaults)
-            self.updateResults("—", 0.0, "—", 0.0)
+            self.updateResults("—", 0.0, "—", 0.0, "—", 0.0)
         except Exception as e:
             print(f"[WARNING] updateResults failed during UI reset: {e}")
 
@@ -762,13 +833,17 @@ class FrontEnd:
         #   5. Clear all evaluation panes in the GUI thread
         clear_targets = [
             self.lstm_eval_pane,
+            self.gru_eval_pane,
             self.stgnn_eval_pane,
             self.loss_pane,
             self.backtest_lstm_pane,
+            self.backtest_gru_pane,
             self.backtest_stgnn_pane,
             self.lstm_roc_pane,
+            self.gru_roc_pane,
             self.stgnn_roc_pane,
             self.lstm_threshold_pane,
+            self.gru_threshold_pane,
             self.stgnn_threshold_pane
         ]
 

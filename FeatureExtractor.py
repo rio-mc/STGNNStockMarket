@@ -51,7 +51,7 @@ class FeatureExtractor:
 
             #   1. Drop any rows with NaNs before normalisation
             dfFeat.dropna(inplace=True)
-            print("[DEBUG] Raw last row before normalisation:\n", dfFeat.iloc[-1][["return", "volatility", "momentum"]])
+            # print("[DEBUG] Raw last row before normalisation:\n", dfFeat.iloc[-1][["return", "volatility", "momentum"]])
 
             # === STEP 3: Normalisation ===
             # ------------------------------------
@@ -59,7 +59,6 @@ class FeatureExtractor:
             dfFeat[normalise_cols] = (
                 dfFeat[normalise_cols] - dfFeat[normalise_cols].mean()
             ) / (dfFeat[normalise_cols].std(ddof=0) + 1e-8)
-            print("[DEBUG] Normalised last row:\n", dfFeat.iloc[-1][["return", "volatility", "momentum"]])
             dfFeat = dfFeat.replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
             # === STEP 3: Ensure Consistent Outputs ===

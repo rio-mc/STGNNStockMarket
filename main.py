@@ -149,7 +149,7 @@ class MainApp:
             #   5. Set chosen stock and prediction horizon from front-end
             horizon = Utils.parse_window(gui_window, bars_per_day)
             self.horizon = horizon
-            self.seq_len = Utils.map_seq_len_from_horizon(horizon, bars_per_day)
+            self.seq_len = self.args.seq_len
 
             #   6. Check stop_event
             self._check_stop(stop_event)
@@ -558,35 +558,38 @@ class MainApp:
             #   4. Check stop_event
             self._check_stop(stop_event)
             
-            # === STEP 16: Rebuild the graph  ===
+            # === STEP 16 (Optional): Rebuild the graph  ===
             # ------------------------------------
-            self.frontendApp.set_status("Rebuilding graph...")
+            rebuild_graph = bool(getattr(self.args, "rewiring", False))
 
-            #   1. Use the same features used to generate the latent node embeddings.
-            graph_builder_refreshed = GraphBuilder(
-                dfFeats=train_feats,
-                max_k=self.get_max_k(),
-                n_pca=3
-            )
+            if rebuild_graph:
+                self.frontendApp.set_status("Rebuilding graph...")
 
-            #   2. Update the back-end graph
-            graph_builder_refreshed.set_node_embeddings(latent_embeddings)
-            tickers_new, coords_new, pruned_new, mst_new = graph_builder_refreshed.getLightGraph()
-            Utils.log_graph_memory(G, coords3d, edge_index, tag="Post-training")
+                #   1. Use the same features used to generate the latent node embeddings.
+                graph_builder_refreshed = GraphBuilder(
+                    dfFeats=train_feats,
+                    max_k=self.get_max_k(),
+                    n_pca=3
+                )
 
-            #   3. Update the front-end graph
-            self.frontendApp.root.after(0, lambda: self.frontendApp.plot3d_on_ax(
-                tickers=tickers_new,
-                coords=coords_new,
-                pruned_edges=pruned_new,
-                mst_edges=mst_new
-            ))
+                #   2. Update the back-end graph
+                graph_builder_refreshed.set_node_embeddings(latent_embeddings)
+                tickers_new, coords_new, pruned_new, mst_new = graph_builder_refreshed.getLightGraph()
+                Utils.log_graph_memory(G, coords3d, edge_index, tag="Post-training")
 
-            #   4. Update model and trainer with new graph
-            edge_index_new = torch.tensor([(i, j) for i, j, _ in pruned_new], dtype=torch.long).T.to(self.device)
-            trainer_stgnn.graphBuilder = graph_builder_refreshed
-            trainer_stgnn.edge_index = edge_index_new
-            trainer_stgnn.model.edge_index = edge_index_new
+                #   3. Update the front-end graph
+                self.frontendApp.root.after(0, lambda: self.frontendApp.plot3d_on_ax(
+                    tickers=tickers_new,
+                    coords=coords_new,
+                    pruned_edges=pruned_new,
+                    mst_edges=mst_new
+                ))
+
+                #   4. Update model and trainer with new graph
+                edge_index_new = torch.tensor([(i, j) for i, j, _ in pruned_new], dtype=torch.long).T.to(self.device)
+                trainer_stgnn.graphBuilder = graph_builder_refreshed
+                trainer_stgnn.edge_index = edge_index_new
+                trainer_stgnn.model.edge_index = edge_index_new
 
             # === STEP 17: STGNN Evaluation Phase ===
             # --------------------------------------
