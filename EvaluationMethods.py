@@ -151,7 +151,7 @@ class EvaluationMethods:
                     print(f"[EQUITY] Failed at {date}: {e}")
                     equity.append(equity[-1])
 
-		    # === STEP 4: Compute Sharpe ratio from equity curve ===
+            # === STEP 4: Compute Sharpe ratio from equity curve ===
             # ------------------------------------
             returns = np.diff(equity) / equity[:-1]
             sharpe = np.mean(returns) / np.std(returns) if np.std(returns) > 0 else 0.0
@@ -181,6 +181,19 @@ class EvaluationMethods:
         else:
             self._val_stgnn = [v["loss"] for v in result.val_stgnn] if result.val_stgnn else []
             self._hist_stgnn = result.hist_stgnn or []
+
+        # === STEP 7: Return summary dictionary ===
+        # -----------------------------------------
+        return {
+            "model": model_name,
+            "accuracy": acc,
+            "f1": f1,
+            "sharpe": sharpe if 'sharpe' in locals() else None,
+            "ticker": price_df.columns[0] if hasattr(price_df, "columns") else None,
+            "n_predictions": len(result.y_pred),
+            "horizon": result.horizon,
+        }
+
 
     def plot_loss(
         self,

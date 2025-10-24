@@ -1,3 +1,4 @@
+import copy
 from threading import Thread
 import threading
 import numpy as np
@@ -10,6 +11,12 @@ import time
 import gc    
 from torch_geometric.loader import DataLoader as GeoDataLoader
 import os
+import itertools
+
+# cuBLAS determinism (PyTorch will raise without this when deterministic=True on CUDA >= 10.2)
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+# Optional but recommended for stricter numerical reproducibility
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")  # stable device ordering
 
 from FrontEnd           import FrontEnd
 from RawDataHandler     import RawDataHandler
@@ -34,11 +41,16 @@ class MainApp:
         # === STEP 1: Set up configuration ===
         # ------------------------------------
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        Utils.set_seed()
         self.args = ConfigManager.parseArgs()
         self.args.interval = '1h'
+
+        self.args.base_seed = getattr(self.args, "base_seed", 42)
+        self.args.deterministic = getattr(self.args, "deterministic", False)
+        Utils.set_seed(self.args.base_seed, deterministic=self.args.deterministic)
+
         self.pipeline_running = False
-        
+        self.data_ready = threading.Event()
+
         # === STEP 2: Set up logging ===
         # ------------------------------------
 
@@ -99,6 +111,8 @@ class MainApp:
             self.frontendApp.bindTickerClick(self.frontendApp.on_ticker_click)
             self.frontendApp.setComputeCallback(self.startPipeline)
 
+            self.data_ready.set()
+
         # === STEP 5: Run loading on new thread for performance ===
         # ------------------------------------
         threading.Thread(target=background_task).start()
@@ -106,7 +120,6 @@ class MainApp:
     def startPipeline(self, gui_window: str, stock: str, stop_event: threading.Event):
 		# === STEP 1: Ensure stop_event initialisation is correct ===
         # ------------------------------------
-        self.pipeline_running = False
         if self.pipeline_running:
             self.logger.warning("Pipeline already running.")
             return
@@ -115,7 +128,12 @@ class MainApp:
 		# ====================================
 		# ===   Place core pipeline in try/except for stop_event termination
         try:
-		    # === STEP 2: Clear memory states ===
+            torch.use_deterministic_algorithms(self.args.deterministic)  # True => strict, False => normal
+            torch.backends.cudnn.deterministic = self.args.deterministic
+            torch.backends.cudnn.benchmark = not self.args.deterministic
+            # NOTE: self._set_all_seeds(run_seed) was already called by run_experiments()
+
+            # === STEP 2: Clear memory states ===
             # ------------------------------------
             gc.collect()
             if torch.cuda.is_available():
@@ -241,11 +259,14 @@ class MainApp:
 
             #   4. Extract (src, dst) pairs and format as 2×E tensor for PyG.
             edge_index = None
-            edge_index = torch.tensor([(i, j) for i, j, _ in pruned]).T  # or mst
+            edge_index = torch.tensor(
+                [(i, j) for i, j, _ in pruned],
+                dtype=torch.long
+            ).t().contiguous()
 
             #   5. Keep CPU copy for later, make GOU copy for training
-            self.init_edge_index = edge_index
-            edge_index = edge_index.to(self.device)
+            self.init_edge_index = edge_index.clone()      # keep a CPU copy
+            self.graphBuilder.edge_index = self.init_edge_index
             self.graphBuilder.edge_index = self.init_edge_index
 
             #   6. Track memory of graph components
@@ -272,6 +293,13 @@ class MainApp:
             #   10. Check stop_event
             self._check_stop(stop_event)
 
+            # === MISC: per-run seeded DataLoader ===
+            dl_gen = torch.Generator(device="cpu")
+            # self.current_seed was set by self._set_all_seeds(run_seed) in run_experiments()
+            # Fallback to base_seed if not set (defensive)
+            seed_for_loaders = getattr(self, "current_seed", int(self.args.base_seed)) % (2**32)
+            dl_gen.manual_seed(seed_for_loaders)
+
             # === STEP 8: LSTM Training Phase ===
             # ------------------------------------
             self.frontendApp.set_status("Training LSTM...")
@@ -288,7 +316,14 @@ class MainApp:
                 stock,
                 self.horizon
             )
-            dl_lstm_train = torch.utils.data.DataLoader(lstm_train_ds, self.args.batch_size, shuffle=True)
+
+            dl_lstm_train = torch.utils.data.DataLoader(
+                lstm_train_ds,
+                batch_size=self.args.batch_size,
+                shuffle=True,
+                generator=dl_gen,
+                worker_init_fn=self._seed_worker
+            )            
             dl_gru_train = dl_lstm_train
 
             #   3. Create LSTM validation dataset
@@ -333,6 +368,9 @@ class MainApp:
                 self.args.lstm_epochs,
                 stop_event=stop_event,
             )
+            lstm_energy_Wh = getattr(trainer_lstm, "total_energy_Wh", None)
+            lstm_train_secs = getattr(trainer_lstm, "total_train_seconds", None)
+            lstm_avg_power_W = getattr(trainer_lstm, "avg_power_W", None)
             self.logger.info(f"[startPipeline] LSTM training completed in {time.time() - l_start:.2f}s")
             Utils.log_gpu_memory("After LSTM")
 
@@ -348,7 +386,7 @@ class MainApp:
             eval_result_lstm = trainer_lstm.evaluate_rolling(lstm_val_ds)
 
             #   2. Update front-end
-            evaluator.evaluate(
+            metrics_lstm = evaluator.evaluate(
                 model_name="LSTM",
                 result=eval_result_lstm,
                 price_df=price_df
@@ -402,6 +440,7 @@ class MainApp:
                 dropout=self.args.dropout
             ).to(self.device)
 
+            g_start = time.time()
             trainer_gru = Trainer(
                 gru_model,
                 Adam(gru_model.parameters(), lr=self.args.lstm_lr),
@@ -419,9 +458,23 @@ class MainApp:
             )
 
             trainer_gru.train(dl_gru_train, self.args.lstm_epochs, stop_event=stop_event)
+            gru_energy_Wh = getattr(trainer_gru, "total_energy_Wh", None)
+            gru_train_secs = getattr(trainer_gru, "total_train_seconds", None)
+            gru_avg_power_W = getattr(trainer_gru, "avg_power_W", None)
+
+            self.logger.info(f"[startPipeline] GRU training completed in {time.time() - g_start:.2f}s")
+            Utils.log_gpu_memory("After GRU")
+
+            self._check_stop(stop_event)
+            self.frontendApp.set_status("Evaluating GRU...")
+
             eval_result_gru = trainer_gru.evaluate_rolling(lstm_val_ds)
 
-            evaluator.evaluate("GRU", eval_result_gru, price_df=price_df)
+            metrics_gru = evaluator.evaluate(
+                "GRU", 
+                eval_result_gru, 
+                price_df=price_df
+            )
 
             # === STEP 12.5: GRU Final Prediction Phase ===
             # ----------------------------------------------
@@ -486,9 +539,16 @@ class MainApp:
                 stock,
                 self.horizon
             )
-            dl_stgnn_train = GeoDataLoader(stgnn_train_ds, self.args.batch_size, shuffle=True)
-            
-            #   4. Create LSTM validation dataset
+
+            dl_stgnn_train = GeoDataLoader(
+                stgnn_train_ds,
+                batch_size=self.args.batch_size,
+                shuffle=True,
+                generator=dl_gen,
+                worker_init_fn=self._seed_worker
+            )           
+
+            #   4. Create STGNN validation dataset
             stgnn_val_ds = STGNNDataset(
                 tf_val,
                 graph_builder,
@@ -524,13 +584,16 @@ class MainApp:
                 num_epochs=self.args.stgnn_epochs,
                 stop_event=stop_event
             )
+            stgnn_energy_Wh = getattr(trainer_stgnn, "total_energy_Wh", None)
+            stgnn_train_secs = getattr(trainer_stgnn, "total_train_seconds", None)
+            stgnn_avg_power_W = getattr(trainer_stgnn, "avg_power_W", None)
             self.logger.info(f"[startPipeline] STGNN training completed in {time.time() - s_start:.2f}s")
             Utils.log_gpu_memory("After STGNN")
 
             #   7. Check stop_event
             self._check_stop(stop_event)
 
-		    # === STEP 15: Extract latent embeddings from STGNN ===
+            # === STEP 15: Extract latent embeddings from STGNN ===
             # ------------------------------------
             with torch.no_grad():
                 #   1. Prepare input data for embedding — use TRAINING features only
@@ -586,9 +649,12 @@ class MainApp:
                 ))
 
                 #   4. Update model and trainer with new graph
-                edge_index_new = torch.tensor([(i, j) for i, j, _ in pruned_new], dtype=torch.long).T.to(self.device)
+                edge_index_new = torch.tensor(
+                    [(i, j) for i, j, _ in pruned],
+                    dtype=torch.long
+                ).t().contiguous()
                 trainer_stgnn.graphBuilder = graph_builder_refreshed
-                trainer_stgnn.edge_index = edge_index_new
+                trainer_stgnn.edge_index = edge_index_new.clone()
                 trainer_stgnn.model.edge_index = edge_index_new
 
             # === STEP 17: STGNN Evaluation Phase ===
@@ -600,7 +666,7 @@ class MainApp:
             eval_result_stgnn = trainer_stgnn.evaluate_rolling(stgnn_val_ds)
 
             #   2. Update front-end
-            evaluator.evaluate(
+            metrics_stgnn = evaluator.evaluate(
                 model_name="STGNN",
                 result=eval_result_stgnn,
                 price_df=price_df
@@ -609,7 +675,7 @@ class MainApp:
             #   3. Check stop_event
             self._check_stop(stop_event)
 
-		    # === STEP 18: STGNN Final Prediction Phase ===
+            # === STEP 18: STGNN Final Prediction Phase ===
             # ------------------------------------
             self.frontendApp.set_status("Predicting with STGNN...")
 
@@ -648,17 +714,54 @@ class MainApp:
             self.frontendApp.set_status("Predictions completed.")
 
             #   1. Update frontend with both models' outputs
-            self.frontendApp.root.after(0, lambda: self.frontendApp.updateResults(
-                f"{dir_l} (Next {horizon//bars_per_day}d)", conf_l,
-                f"{dir_g} (Next {horizon//bars_per_day}d)", conf_g,
-                f"{dir_s_str} (Next {horizon//bars_per_day}d)", conf_s
-            ))
+            if self.frontendApp:
+                self.frontendApp.root.after(0, lambda: self.frontendApp.updateResults(
+                    f"{dir_l} (Next {horizon//bars_per_day}d)", conf_l,
+                    f"{dir_g} (Next {horizon//bars_per_day}d)", conf_g,
+                    f"{dir_s_str} (Next {horizon//bars_per_day}d)", conf_s
+                ))
 
             #   2. Refresh tabs for visibility
             self.frontendApp.root.after(0, lambda: self.frontendApp.refresh_selected_tabs())
 
             #   3. Establish pipeline completion
             self.pipeline_running = False
+            
+            # === STEP 20: Log results for auto-test ===
+            # ------------------------------------
+            self.results_log = getattr(self, "results_log", [])
+            self.results_log.extend([
+                {
+                    **metrics_lstm,
+                    "ticker": stock,
+                    "horizon": gui_window,
+                    "seed": self.current_seed,
+                    "energy_Wh": lstm_energy_Wh,
+                    "train_seconds": lstm_train_secs,
+                    "avg_power_W": lstm_avg_power_W,
+                    "model": "LSTM",
+                },
+                {
+                    **metrics_gru,
+                    "ticker": stock,
+                    "horizon": gui_window,
+                    "seed": self.current_seed,
+                    "energy_Wh": gru_energy_Wh,
+                    "train_seconds": gru_train_secs,
+                    "avg_power_W": gru_avg_power_W,
+                    "model": "GRU",
+                },
+                {
+                    **metrics_stgnn,
+                    "ticker": stock,
+                    "horizon": gui_window,
+                    "seed": self.current_seed,
+                    "energy_Wh": stgnn_energy_Wh,
+                    "train_seconds": stgnn_train_secs,
+                    "avg_power_W": stgnn_avg_power_W,
+                    "model": "STGNN",
+                },
+            ])
 
             return (
                 f"{dir_l} (Next {horizon//bars_per_day}d)", conf_l,
@@ -673,6 +776,9 @@ class MainApp:
             self.frontendApp.root.after_idle(self.frontendApp._reset_ui)
             self.pipeline_running = False
             return ("-", 0.0, "-", 0.0, "-", 0.0)
+        
+        finally:
+            self.pipeline_running = False
 
     def run(self):
 		# ====================================
@@ -724,6 +830,140 @@ class MainApp:
             prediction_horizon=horizon
         )
     
+    def _set_all_seeds(self, seed: int):
+        """Set all RNGs and remember the current run seed."""
+        used = Utils.set_seed(seed, deterministic=self.args.deterministic)
+        self.current_seed = int(used)  # keep a 32-bit-ish int around for logs
+        self.logger.info(f"[AutoTest] Using seed={self.current_seed} (deterministic={self.args.deterministic})")
+    
+    def _seed_worker(self, worker_id: int):
+        """Ensure each DataLoader worker has a distinct, reproducible seed."""
+        worker_seed = (self.current_seed + worker_id) % (2**32)
+        np.random.seed(worker_seed)
+        import random as _random
+        _random.seed(worker_seed)
+
+    def run_experiments(self):
+        # Wait until background loader built raw_feature_dfs and bound the UI
+        self.data_ready.wait()
+
+        rewiring_options = [True, False]
+        max_k_values = [2]
+        seq_len_values = [2]
+        repetitions = 2
+
+        param_grid = list(itertools.product(rewiring_options, max_k_values, seq_len_values))
+
+        os.makedirs(self.args.results_dir, exist_ok=True)
+        all_results = []
+
+        for (rewire, k, seq_len) in param_grid:
+            exp_name = f"{self.args.experiment_name}_rewire-{int(rewire)}_k-{k}_seq-{seq_len}"
+            csv_path = os.path.join(self.args.results_dir, f"{exp_name}.csv")
+            self.logger.info(f"[AutoTest] Starting config: rewiring={rewire}, max_k={k}, seq_len={seq_len}")
+
+            for stock in self.args.tickers:
+                stock_results = []
+                self.logger.info(f"[AutoTest] Running stock: {stock}")
+
+                # Reset to base for each stock
+                stock_base_seed = int(self.args.base_seed) % (2**32)
+
+                for rep in range(repetitions):
+                    # 1) Apply config for this run
+                    cfg = copy.deepcopy(self.args)
+                    cfg.rewiring = rewire
+                    cfg.max_k = k
+                    cfg.seq_len = seq_len
+                    self.args = cfg
+
+                    # 2) Increment seed per repetition and set it everywhere
+                    run_seed = (stock_base_seed + rep) % (2**32)
+                    self._set_all_seeds(run_seed)
+
+                    stop_event = threading.Event()
+                    start_time = time.time()
+
+                    try:
+                        self.logger.info(f"[AutoTest] Run {rep+1}/{repetitions} for {stock}")
+
+                        # Avoid double-counting from earlier runs
+                        self.results_log = []
+
+                        # Inline pipeline run (deterministic knobs already set in startPipeline)
+                        self.startPipeline(gui_window="1d", stock=stock, stop_event=stop_event)
+
+                        # Stamp metadata including the seed used
+                        for entry in self.results_log:
+                            entry.update({
+                                "rewiring": rewire,
+                                "max_k": k,
+                                "seq_len": seq_len,
+                                "ticker": stock,
+                                "runtime_sec": round(time.time() - start_time, 2),
+                                "rep": rep + 1,
+                                "seed": self.current_seed,
+                            })
+                            stock_results.append(entry)
+
+                    except Exception as e:
+                        self.logger.error(f"[AutoTest] {stock} rep {rep+1} failed: {e}")
+                        stock_results.append({
+                            "ticker": stock,
+                            "rewiring": rewire,
+                            "max_k": k,
+                            "seq_len": seq_len,
+                            "rep": rep + 1,
+                            "seed": getattr(self, "current_seed", None),
+                            "error": str(e)
+                        })
+
+                    finally:
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            torch.cuda.ipc_collect()
+
+                # ---- append per-config results to <exp_name>.csv ----
+                if stock_results:
+                    df = pd.DataFrame(stock_results)
+
+                    # compute "mean" row as before for the summary list
+                    numeric_cols = df.select_dtypes(include='number').columns
+                    mean_row = df[numeric_cols].mean(numeric_only=True)
+                    mean_row["ticker"] = stock
+                    mean_row["rewiring"] = rewire
+                    mean_row["max_k"] = k
+                    mean_row["seq_len"] = seq_len
+                    mean_row["rep"] = "mean"
+                    all_results.append(mean_row.to_dict())
+
+                    # append (create file and header if first time)
+                    write_header = (not os.path.exists(csv_path)) or os.path.getsize(csv_path) == 0
+                    df.to_csv(csv_path, mode="a", header=write_header, index=False)
+                    self.logger.info(f"[AutoTest] Appended {len(df)} entries for {stock} → {csv_path}")
+
+        # ---- append (or create) summary CSV ----
+        summary_path = os.path.join(self.args.results_dir, f"{self.args.experiment_name}_summary.csv")
+        df_summary = pd.DataFrame(all_results)
+        write_header = (not os.path.exists(summary_path)) or os.path.getsize(summary_path) == 0
+        df_summary.to_csv(summary_path, mode="a", header=write_header, index=False)
+        self.logger.info(f"[AutoTest] Summary appended: {len(df_summary)} rows → {summary_path}")
+
+
 if __name__ == "__main__":
     app = MainApp()
-    app.run()
+    if getattr(app.args, "save_results", False):
+        # Start the loader; it will set data_ready when finished
+        threading.Thread(target=app._load_data_and_start_gui, daemon=True).start()
+
+        # Launch experiments from a background thread once Tk is up
+        def start_tests():
+            threading.Thread(target=app.run_experiments, daemon=True).start()
+        app.frontendApp.root.after(0, start_tests)
+
+        # Enter Tk mainloop on the main thread
+        app.frontendApp.root.mainloop()
+    else:
+        app.run()
+        

@@ -34,16 +34,20 @@ class Utils:
 
         raise ValueError(f"Unknown time unit: {unit}")
     
-    def set_seed(seed: int = 2):
-        # ====================================
-		# === Helper to enforce reproducibility
+    def set_seed(seed: int, deterministic: bool = False) -> int:
+        """
+        Seed Python, NumPy, and PyTorch RNGs. Returns the seed used.
+        """
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark     = False
+        torch.cuda.manual_seed_all(seed)
+
+        # Optional determinism controls
+        torch.backends.cudnn.deterministic = deterministic
+        torch.backends.cudnn.benchmark = not deterministic
+
+        return seed
             
     def compute_pos_weight(dataset):
         # ====================================

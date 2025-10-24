@@ -54,6 +54,11 @@ class Trainer:
         # ------------------------------------
         self._init_energy_monitoring()
         total_energy_Wh = 0.0
+        total_train_seconds = 0.0
+        self.energy_epochs_Wh = []
+        self.total_energy_Wh = 0.0 
+        self.total_train_seconds = 0.0
+        self.avg_power_W = 0.0
 
 		# === STEP 2: Training Loop ===
         # ------------------------------------
@@ -62,6 +67,7 @@ class Trainer:
             self.model.train()
             epoch_losses = []
             epoch_start_time = time.time()
+            power_samples = []
 
             #   2. Sample initial power reading
             power_samples = []
@@ -88,8 +94,8 @@ class Trainer:
                     # === STEP 5: Progress Tracking ===
             	    # ------------------------------------
                     progress = ((epoch * len(dataloader)) + batch_idx + 1) / (num_epochs * len(dataloader))
-                    self.frontend.updateProgress(progress)
-
+                    if self.frontend is not None:
+                        self.frontend.updateProgress(progress)
 		            # === STEP 6: Check Termination ===
             	    # ------------------------------------
                     if stop_event and stop_event.is_set():
@@ -108,9 +114,11 @@ class Trainer:
             # ------------------------------------
             epoch_time = time.time() - epoch_start_time
             avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
-            avg_power = sum(power_samples) / max(len(power_samples), 1)  # watts
-            energy_Wh = avg_power * (epoch_time / 3600)  # watt-hours
+            total_train_seconds += epoch_time
+            avg_power = sum(power_samples) / max(len(power_samples), 1)
+            energy_Wh = avg_power * (epoch_time / 3600.0)
             total_energy_Wh += energy_Wh
+            self.energy_epochs_Wh.append(energy_Wh)
 
             print(f"[Epoch {epoch}] Avg Loss = {avg_loss:.4f}")
             print(f"[Epoch {epoch}] Duration = {epoch_time:.2f}s | Avg Power = {avg_power:.2f} W | Energy = {energy_Wh:.4f} Wh")
@@ -134,10 +142,15 @@ class Trainer:
                 val_g=[v["loss"] for v in self.evaluator.get_validation_loss("GRU")],
             )
 
-		# === STEP 9: Terminate Memeory Tracking ===
+		# === STEP 9: Terminate Memory Tracking ===
         # ------------------------------------
-        print(f"[Training Summary] Total energy used: {total_energy_Wh:.4f} Wh")
+        self.total_energy_Wh = float(total_energy_Wh)
+        self.total_train_seconds = float(total_train_seconds)
+        self.avg_power_W = (self.total_energy_Wh * 3600.0 / self.total_train_seconds) if self.total_train_seconds > 0 else 0.0
+
+        print(f"[Training Summary] Total energy used: {self.total_energy_Wh:.4f} Wh")
         self._finalise_energy_monitoring()
+        return self.total_energy_Wh  # optional, but convenient
     
     def evaluate_rolling(self, val_dataset):
 		# === STEP 1: Evaluation Mode ===
@@ -257,14 +270,24 @@ class Trainer:
         )
             
     def _unpack_batch(self, batch):
-        # === STEP 1: GeoBatch Handling (STGNN) ===
-        # ------------------------------------
         if isinstance(batch, GeoBatch):
             x = batch.x.view(batch.num_graphs, len(self.tickers), batch.x.size(1), batch.x.size(2))
             y = batch.y.view(batch.num_graphs, -1)
             edge_index = batch.edge_index
-            edge_attr = getattr(batch, 'edge_attr', None)
-            return x.to(self.device), y.to(self.device), edge_index.to(self.device), (edge_attr.to(self.device) if edge_attr is not None else None)
+            edge_attr  = getattr(batch, 'edge_attr', None)
+
+            # — safety: dtype + shape
+            edge_index = edge_index.to(self.device)
+            if edge_index.dtype != torch.long:
+                edge_index = edge_index.to(torch.long)
+            if edge_index.dim() == 1:
+                assert edge_index.numel() % 2 == 0, "edge_index 1-D length must be even"
+                edge_index = edge_index.view(2, -1).contiguous()
+            elif edge_index.dim() == 2 and edge_index.size(0) != 2:
+                edge_index = edge_index.t().contiguous()
+
+            edge_attr = (edge_attr.to(self.device) if edge_attr is not None else None)
+            return x.to(self.device), y.to(self.device), edge_index, edge_attr
 
         # === STEP 2: Non-GeoBatch Handling (LSTM) ===
         # ------------------------------------

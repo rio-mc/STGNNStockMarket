@@ -84,8 +84,9 @@ class STGNNDataset(Dataset):
 
         #   3. Graph initialisation
         self.graph_builder = graph_builder
-        self.edge_index = edge_index
-        self.edge_attr = self.graph_builder.build_edge_weight_tensor(edge_index)
+        self.edge_index = edge_index.detach().clone().cpu().to(torch.long)          # [2, E] long
+        self.edge_attr  = self.graph_builder.build_edge_weight_tensor(self.edge_index)
+        self.edge_attr  = self.edge_attr.detach().clone().cpu().to(torch.float32)   # [E, F]
 
         # === STEP 2: Feature Tensors And Labels ===
         # ------------------------------------
@@ -111,10 +112,10 @@ class STGNNDataset(Dataset):
         # ====================================
         # === Helper to get data
         return Data(
-            x=self.x_list[idx].clone().detach().float(),      # [N, T, F]
-            edge_index=self.edge_index.clone(),               # [2, E]
-            y=self.y_list[idx].clone().detach().float(),      # [1]
-            edge_attr=self.edge_attr.clone()                  # [E, edge_feat_dim]
+            x=self.x_list[idx].clone().detach().float(),                   # [N, T, F]
+            edge_index=self.edge_index.clone().contiguous(),               # [2, E] long, CPU
+            y=self.y_list[idx].clone().detach().float(),                   # [1]
+            edge_attr=self.edge_attr.clone().contiguous()                  # [E, F] float, CPU
         )
 
     def get_timestamp(self, idx):
