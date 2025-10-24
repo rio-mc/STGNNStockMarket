@@ -115,6 +115,9 @@ class ConfigManager:
         # === Experiment Running
         parser.add_argument("--results_dir", default="./results", help="Directory to save experiment results")
         parser.add_argument("--experiment_name", default="benchmark_run", help="Experiment name for CSV output")
+
+        # ====================================
+        # === Result Saving === Toggle to False for main interactive build
         parser.add_argument("--save_results", action="store_true", default=True, help="Save metrics to CSV")
 
         return parser.parse_args([])
