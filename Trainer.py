@@ -1,6 +1,7 @@
 import time
 import torch
 import torch.nn as nn
+import numpy as np
 from torch.utils.data import DataLoader
 from torch_geometric.data import Batch as GeoBatch, Data
 import pandas as pd
@@ -18,7 +19,7 @@ class Trainer:
                  frontend=None, evaluator=None,
                  prediction_horizon = None,
                  seq_len = None,
-                 model_name = None
+                 model_name = None, weight_decay=None
                  ):
 		# === STEP 1: Configuration Setup ===
         # ------------------------------------
@@ -48,7 +49,8 @@ class Trainer:
         self.model.edge_index = self.edge_index
         self.model.target_node_index = self.targetIdx
         self.model_name = model_name
-    
+        self.weight_decay = float(weight_decay) if weight_decay is not None else 0.0
+
     def train(self, dataloader, num_epochs, stop_event=None):
         # === STEP 1: Start Memory Tracking ===
         # ------------------------------------
@@ -59,6 +61,9 @@ class Trainer:
         self.total_energy_Wh = 0.0 
         self.total_train_seconds = 0.0
         self.avg_power_W = 0.0
+
+        if self.weight_decay and self.weight_decay > 0:
+            self._apply_weight_decay(self.weight_decay, exclude_norm_bias=True)
 
 		# === STEP 2: Training Loop ===
         # ------------------------------------
@@ -153,111 +158,114 @@ class Trainer:
         return self.total_energy_Wh  # optional, but convenient
     
     def evaluate_rolling(self, val_dataset):
-		# === STEP 1: Evaluation Mode ===
+        # === STEP 1: Evaluation Mode ===
         # ------------------------------------
         self.model.eval()
 
         # === STEP 2: Evaluation Set-up ===
         # ------------------------------------
-        y_true_all, y_pred_all, probs_all = [], [], []
-        prediction_dates = []
         total_samples = len(val_dataset)
 
-        # === STEP 3: Evaluation Loop ===
+        y_true_all, y_pred_all, probs_all, prediction_dates = [], [], [], []
+        losses = []
+
+        # === STEP 3: Evaluation Loop (dense) ===
         # ------------------------------------
-        for i in range(0, total_samples, self.prediction_horizon):
-            try:
-                #   1. Collect sample from validation set
-                sample = val_dataset[i]
-                timestamp = None
+        with torch.no_grad():
+            for i in range(0, total_samples, 1):
+                try:
+                    # 1) Fetch sample
+                    sample = val_dataset[i]
+                    timestamp = None
 
-                #   2. STGNN evaluation
-                if isinstance(sample, Data):
-                    x = sample.x.unsqueeze(0).to(self.device)
-                    y = sample.y.unsqueeze(0).to(self.device)
-                    edge_index = sample.edge_index.to(self.device)
-                    edge_attr = getattr(sample, 'edge_attr', None)
-                    if edge_attr is not None:
-                        edge_attr = edge_attr.to(self.device)
+                    # 2) Prepare inputs per model type
+                    edge_index = None
+                    edge_attr = None
 
-                #   3. LSTM evaluation
-                elif isinstance(sample, tuple):
-                    x, y = sample
-                    x = x.unsqueeze(0).to(self.device)
-                    y = y.unsqueeze(0).to(self.device)
-                    
-                else:
-                    print(f"[WARNING] Unrecognised sample format at index={i}, skipping.")
+                    # STGNN case: torch_geometric.data.Data
+                    if isinstance(sample, Data):
+                        x = sample.x.unsqueeze(0).to(self.device)
+                        y = sample.y.unsqueeze(0).to(self.device)
+                        edge_index = sample.edge_index.to(self.device)
+                        if hasattr(sample, "edge_attr") and sample.edge_attr is not None:
+                            edge_attr = sample.edge_attr.to(self.device)
+
+                    # LSTM / GRU case: tuple (x, y)
+                    elif isinstance(sample, tuple):
+                        x, y = sample
+                        x = x.unsqueeze(0).to(self.device)
+                        y = y.unsqueeze(0).to(self.device)
+
+                    else:
+                        print(f"[WARNING] Unrecognised sample format at index={i}, skipping.")
+                        continue
+
+                    # 3) Timestamp
+                    timestamp = val_dataset.get_timestamp(i)
+                    if timestamp:
+                        timestamp = pd.Timestamp(timestamp).tz_localize(None)
+                        prediction_dates.append(timestamp)
+                    else:
+                        print(f"[DEBUG] No timestamp found at index={i}")
+
+                    # 4) Forward pass
+                    if self.graphBuilder:
+                        logits = self.model(
+                            x,
+                            edge_index=edge_index,
+                            edge_attr=edge_attr,
+                            target_node_index=self.targetIdx
+                        )
+                    else:
+                        logits = self.model(x)
+
+                    prob = torch.sigmoid(logits).item()
+                    pred = int(prob >= 0.5)
+                    truth = int(y.item())
+
+                    # 5) Bookkeeping
+                    y_pred_all.append(pred)
+                    y_true_all.append(truth)
+                    probs_all.append(prob)
+
+                    # 6) Loss (ensure shapes match)
+                    if y.shape != logits.shape:
+                        y = y.view_as(logits)
+                    loss = self.criterion(logits, y)
+                    losses.append(loss.item())
+
+                    # 7) Record point loss for plotting over time
+                    self.evaluator.record_validation_loss(self.model_name, loss.item(), timestamp)
+
+                except Exception as e:
+                    print(f"[ERROR] Skipping sample index={i} due to: {e}")
                     continue
 
-                # === STEP 4: Timestamping ===
-            	# ------------------------------------
-
-                #   1. Collect timestamp
-                timestamp = val_dataset.get_timestamp(i)
-
-                #   2. Format timestamp
-                if timestamp:
-                    timestamp = pd.Timestamp(timestamp).tz_localize(None)
-                    #   3. Add timestamp to prediction dates for chronological plotting
-                    prediction_dates.append(timestamp)
-                else:
-                    print(f"[DEBUG] No timestamp found at index={i}")
-
-                # === STEP 5: Forward Pass ===
-            	# ------------------------------------
-
-                #   1. Collect raw output
-                logits = (
-                    self.model(x, edge_index=edge_index, edge_attr=edge_attr, target_node_index=self.targetIdx)
-                    if self.graphBuilder else self.model(x)
-                )
-
-                #   2. Sigmoid for normalised output
-                prob = torch.sigmoid(logits).detach().cpu().item()
-                
-                #   3. Establish directional prediction (>=0.5 is upwards)
-                pred = int(prob >= 0.5)
-                truth = int(y.item())
-
-                #   4. Store predictions and truths for plotting
-                y_pred_all.append(pred)
-                y_true_all.append(truth)
-                probs_all.append(prob)
-
-                #   5. Compute validation loss
-                if y.shape != logits.shape:
-                    y = y.view_as(logits)
-                loss = self.criterion(logits, y)
-
-                #   6. Record losses
-                model_key = self.model_name
-                self.evaluator.record_validation_loss(model_key, loss.item(), timestamp)
-
-            except Exception as e:
-                print(f"[ERROR] Skipping sample index={i} due to: {e}")
-                continue
-
-        print(f"[EVAL][SUMMARY] {len(prediction_dates)} predictions made.")
+        # === STEP 4: Summary ===
+        # ------------------------------------
+        mean_val_loss = float(np.mean(losses)) if losses else float("nan")
+        print(f"[EVAL][SUMMARY] total_samples={total_samples}, predictions={len(prediction_dates)}")
         print(f"[EVAL] Predicted 1s: {sum(y_pred_all)}, 0s: {len(y_pred_all) - sum(y_pred_all)}")
         print(f"[EVAL] True 1s: {sum(y_true_all)}, 0s: {len(y_true_all) - sum(y_true_all)}")
+        print(f"[EVAL] Mean validation loss (dense): {mean_val_loss:.6f}")
 
-		# === STEP 6: Evaluation Plotting ===
+        # === STEP 5: Plotting (train vs val for all models) ===
         # ------------------------------------
-
-        #   1. Collect model losses
         val_l = [v["loss"] for v in self.evaluator.get_validation_loss("LSTM")]
+        val_g = [v["loss"] for v in self.evaluator.get_validation_loss("GRU")]
         val_s = [v["loss"] for v in self.evaluator.get_validation_loss("STGNN")]
 
-        #   2. Plot losses
         self.evaluator.plot_loss(
             hist_l=self.evaluator.get_training_loss("LSTM"),
+            hist_g=self.evaluator.get_training_loss("GRU"),
             hist_s=self.evaluator.get_training_loss("STGNN"),
             val_l=val_l,
+            val_g=val_g,
             val_s=val_s
         )
 
-        #   3. Store evaluation for modularity
+        # === STEP 6: Return evaluation artefacts ===
+        # ------------------------------------
         return EvaluationResult(
             y_true=y_true_all,
             y_pred=y_pred_all,
@@ -268,7 +276,52 @@ class Trainer:
             horizon=self.prediction_horizon,
             model_name=self.model_name
         )
-            
+
+        
+    def _apply_weight_decay(self, weight_decay: float, exclude_norm_bias: bool = True):
+        """
+        Rebuild optimiser param groups to apply weight decay only to appropriate parameters.
+        Excludes biases and normalisation layers if exclude_norm_bias is True.
+        Safe to call before any optimiser steps.
+        """
+        model = self.model
+        opt = self.optimiser
+
+        # Collect names to exclude
+        no_decay_names = set()
+
+        if exclude_norm_bias:
+            # Exclude all LayerNorm/BatchNorm params
+            norm_types = (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)
+            for module_name, module in model.named_modules():
+                if isinstance(module, norm_types):
+                    for pname, _ in module.named_parameters(recurse=False):
+                        no_decay_names.add(f"{module_name}.{pname}" if module_name else pname)
+
+            # Exclude all *bias parameters
+            for name, _ in model.named_parameters():
+                if name.endswith(".bias") or name == "bias":
+                    no_decay_names.add(name)
+
+        # Split parameters
+        named_params = dict(model.named_parameters())
+        decay_params = [p for n, p in named_params.items() if n not in no_decay_names and p.requires_grad]
+        nodecay_params = [p for n, p in named_params.items() if n in no_decay_names and p.requires_grad]
+
+        if not decay_params:  # nothing to do
+            return
+
+        # Base hyperparameters from the first param group
+        base = {k: v for k, v in opt.param_groups[0].items() if k != "params"}
+
+        # Rebuild groups; this resets any previous per-param state, so do it before training steps.
+        opt.param_groups.clear()
+        opt.add_param_group({**base, "params": decay_params, "weight_decay": weight_decay})
+        if nodecay_params:
+            opt.add_param_group({**base, "params": nodecay_params, "weight_decay": 0.0})
+
+        print(f"[Trainer] Applied weight decay={weight_decay} (excluded {len(nodecay_params)} params).")
+
     def _unpack_batch(self, batch):
         if isinstance(batch, GeoBatch):
             x = batch.x.view(batch.num_graphs, len(self.tickers), batch.x.size(1), batch.x.size(2))

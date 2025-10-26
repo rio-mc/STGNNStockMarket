@@ -29,7 +29,7 @@ class ConfigManager:
             "GS", "ABT", "MCD", "MRK", "MU",
             "TMO", "LIN", "PEP", "DIS", "NOW"
         ]
-        test_limit = 5
+        test_limit = 20
         tickers_for_test = [ALL_TICKERS[i] for i in range(min(test_limit, len(ALL_TICKERS)))]
 
         parser.add_argument(
@@ -38,24 +38,7 @@ class ConfigManager:
         )
 
         # ====================================
-        # === Sampling interval (so you can change it from CLI if wanted)
-        parser.add_argument("--interval", default="1h", help="Data sampling interval (e.g., 1h, 30m, 1d)")
-
-        # ====================================
-        # === Sequence Length
-        parser.add_argument(
-            "--seq-len", type=int, default=3,
-            help="Number of past timesteps to use as temporal lookback window."
-        )
-
-        # ====================================
-        # === Generic Training
-        parser.add_argument("--batch_size", type=int, default=512, help="Mini-batch size for training")
-        parser.add_argument("--dropout", type=float, default=0.25, help="Dropout rate")
-        epoch_count = 50
-        lr = 1e-4
-
-        # Determinism & seeds
+        # === Determinism & seeds
         parser.add_argument("--deterministic", action="store_true",
                             help="Use deterministic CUDA kernels and raise on non-deterministic ops.")
         parser.add_argument("--no-deterministic", dest="deterministic", action="store_false")
@@ -63,10 +46,43 @@ class ConfigManager:
         parser.add_argument("--base-seed", type=int, default=42,
                             help="Base RNG seed. Experiments increment this per repetition.")
 
-        # (Optional) DataLoader workers—set to 0 if you want simpler determinism
         parser.add_argument("--num-workers", type=int, default=0,
                             help="Number of worker processes for DataLoaders.")
+        
+        # ====================================
+        # === Sampling interval
+        parser.add_argument("--interval", default="1h", help="Data sampling interval (e.g., 1h, 30m, 1d)")
 
+        # ====================================
+        # === Sequence Length
+        parser.add_argument(
+            "--seq-len", type=int, default=10,
+            help="Number of past timesteps to use as temporal lookback window."
+        )
+
+        # ====================================
+        # === Graph Construction
+        parser.add_argument("--max_k", type=int, default=5, help="Number of edges to retain per node (KNN)")
+        
+        # ====================================
+        # === Graph Rewiring
+        parser.add_argument("--rewiring", action="store_true",
+                            help="Enable post-training graph rewiring after STGNN training.")
+        parser.add_argument("--no-rewiring", dest="rewiring", action="store_false",
+                            help="Disable post-training graph rewiring.")
+        parser.set_defaults(rewiring=False)
+
+        # ====================================
+        # === Generic Training
+        parser.add_argument("--batch_size", type=int, default=256, help="Mini-batch size for training")
+        parser.add_argument("--dropout", type=float, default=0.15, help="Dropout rate")
+        epoch_count = 50
+        lr = 1e-3
+
+        # === Regularisation
+        parser.add_argument("--weight_decay", type=float, default=1e-4,
+                            help="Global L2 weight decay")
+        
         # ====================================
         # === LSTM Training
         parser.add_argument("--lstm_lr", type=float, default=lr, help="Learning rate for LSTM")
@@ -76,7 +92,7 @@ class ConfigManager:
 
         # ====================================
         # === LSTM Architecture
-        parser.add_argument("--lstm_hidden", type=int, default=24, help="Hidden dimension of LSTM layers")
+        parser.add_argument("--lstm_hidden", type=int, default=64, help="Hidden dimension of LSTM layers")
         parser.add_argument("--lstm_layers", type=int, default=2, help="Number of LSTM layers")
         parser.add_argument("--bidirectional", action="store_true", help="Use bidirectional LSTM")
 
@@ -89,27 +105,10 @@ class ConfigManager:
 
         # ====================================
         # === STGNN Architecture
-        parser.add_argument("--stgnn_blocks", type=int, default=3, help="Number of ST Blocks")
-        parser.add_argument("--tcn_channels", type=int, default=24, help="Channels in TCN layer")
-        parser.add_argument("--tcn_kernel_size", type=int, default=1, help="Kernel size in TCN layer")
-        parser.add_argument("--gcn_hidden", type=int, default=16, help="Hidden dimension in GCN")
-
-        # ====================================
-        # === Graph Construction
-        parser.add_argument("--max_k", type=int, default=5, help="Number of edges to retain per node (KNN)")
-
-        # ====================================
-        # === Graph Rewiring
-        parser.add_argument("--rewiring", action="store_true",
-                            help="Enable post-training graph rewiring after STGNN training.")
-        parser.add_argument("--no-rewiring", dest="rewiring", action="store_false",
-                            help="Disable post-training graph rewiring.")
-        parser.set_defaults(rewiring=False)
-
-        # ====================================
-        # === Sequence Length Horizon (keep if you still use it)
-        parser.add_argument("--lookback", type=int, default=20,
-                            help="Number of time steps to use as temporal lookback (sequence length).")
+        parser.add_argument("--stgnn_blocks", type=int, default=2, help="Number of ST Blocks")
+        parser.add_argument("--tcn_channels", type=int, default=32, help="Channels in TCN layer")
+        parser.add_argument("--tcn_kernel_size", type=int, default=2, help="Kernel size in TCN layer")
+        parser.add_argument("--gcn_hidden", type=int, default=32, help="Hidden dimension in GCN")
 
         # ====================================
         # === Experiment Running
@@ -118,6 +117,6 @@ class ConfigManager:
 
         # ====================================
         # === Result Saving === Toggle to False for main interactive build
-        parser.add_argument("--save_results", action="store_true", default=True, help="Save metrics to CSV")
+        parser.add_argument("--save_results", action="store_true", default=False, help="Save metrics to CSV")
 
         return parser.parse_args([])

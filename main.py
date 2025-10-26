@@ -180,18 +180,16 @@ class MainApp:
             shared_index = set.intersection(*(set(df.index) for df in self.raw_feature_dfs.values()))
             shared_index = sorted(shared_index)
 
-            cutoff_idx = int(0.7 * len(shared_index))
+            cutoff_idx  = int(0.7 * len(shared_index))
             cutoff_date = shared_index[cutoff_idx]
 
-            #   2. Split raw data on calendar
-            train_raw_map = {
-                t: df[df.index < cutoff_date].copy()
-                for t, df in self.raw_feature_dfs.items()
-            }
-            val_raw_map = {
-                t: df[df.index >= cutoff_date].copy()
-                for t, df in self.raw_feature_dfs.items()
-            }
+            embargo_bars   = max(1, int(self.horizon))  # at least 1 bar embargo
+            train_end_idx  = max(0, cutoff_idx - embargo_bars)
+            train_end_date = shared_index[train_end_idx]
+
+            # split
+            train_raw_map = {t: df[df.index < train_end_date].copy()  for t, df in self.raw_feature_dfs.items()}
+            val_raw_map   = {t: df[df.index >= cutoff_date].copy()    for t, df in self.raw_feature_dfs.items()}
 
             #   3. Check stop_event
             self._check_stop(stop_event)
@@ -293,6 +291,8 @@ class MainApp:
             #   10. Check stop_event
             self._check_stop(stop_event)
 
+            wd = self.args.weight_decay
+
             # === MISC: per-run seeded DataLoader ===
             dl_gen = torch.Generator(device="cpu")
             # self.current_seed was set by self._set_all_seeds(run_seed) in run_experiments()
@@ -358,7 +358,8 @@ class MainApp:
                 evaluator=evaluator,
                 prediction_horizon=self.horizon,
                 seq_len=self.seq_len,
-                model_name="LSTM"
+                model_name="LSTM",
+                weight_decay=wd
             )
 
             #   6. Train LSTM model (with efficiency tracking)
@@ -454,7 +455,8 @@ class MainApp:
                 evaluator=evaluator,
                 prediction_horizon=self.horizon,
                 seq_len=self.seq_len,
-                model_name="GRU"
+                model_name="GRU",
+                weight_decay=wd
             )
 
             trainer_gru.train(dl_gru_train, self.args.lstm_epochs, stop_event=stop_event)
@@ -573,7 +575,8 @@ class MainApp:
                 evaluator,
                 prediction_horizon=self.horizon,
                 seq_len=self.seq_len,
-                model_name="STGNN"
+                model_name="STGNN",
+                weight_decay=wd
             )
             
             #   6. Train STGNN model (with efficiency tracking)
@@ -729,39 +732,40 @@ class MainApp:
             
             # === STEP 20: Log results for auto-test ===
             # ------------------------------------
-            self.results_log = getattr(self, "results_log", [])
-            self.results_log.extend([
-                {
-                    **metrics_lstm,
-                    "ticker": stock,
-                    "horizon": gui_window,
-                    "seed": self.current_seed,
-                    "energy_Wh": lstm_energy_Wh,
-                    "train_seconds": lstm_train_secs,
-                    "avg_power_W": lstm_avg_power_W,
-                    "model": "LSTM",
-                },
-                {
-                    **metrics_gru,
-                    "ticker": stock,
-                    "horizon": gui_window,
-                    "seed": self.current_seed,
-                    "energy_Wh": gru_energy_Wh,
-                    "train_seconds": gru_train_secs,
-                    "avg_power_W": gru_avg_power_W,
-                    "model": "GRU",
-                },
-                {
-                    **metrics_stgnn,
-                    "ticker": stock,
-                    "horizon": gui_window,
-                    "seed": self.current_seed,
-                    "energy_Wh": stgnn_energy_Wh,
-                    "train_seconds": stgnn_train_secs,
-                    "avg_power_W": stgnn_avg_power_W,
-                    "model": "STGNN",
-                },
-            ])
+            if getattr(app.args, "save_results", True):
+                self.results_log = getattr(self, "results_log", [])
+                self.results_log.extend([
+                    {
+                        **metrics_lstm,
+                        "ticker": stock,
+                        "horizon": gui_window,
+                        "seed": self.current_seed,
+                        "energy_Wh": lstm_energy_Wh,
+                        "train_seconds": lstm_train_secs,
+                        "avg_power_W": lstm_avg_power_W,
+                        "model": "LSTM",
+                    },
+                    {
+                        **metrics_gru,
+                        "ticker": stock,
+                        "horizon": gui_window,
+                        "seed": self.current_seed,
+                        "energy_Wh": gru_energy_Wh,
+                        "train_seconds": gru_train_secs,
+                        "avg_power_W": gru_avg_power_W,
+                        "model": "GRU",
+                    },
+                    {
+                        **metrics_stgnn,
+                        "ticker": stock,
+                        "horizon": gui_window,
+                        "seed": self.current_seed,
+                        "energy_Wh": stgnn_energy_Wh,
+                        "train_seconds": stgnn_train_secs,
+                        "avg_power_W": stgnn_avg_power_W,
+                        "model": "STGNN",
+                    },
+                ])
 
             return (
                 f"{dir_l} (Next {horizon//bars_per_day}d)", conf_l,
@@ -928,20 +932,32 @@ class MainApp:
                 if stock_results:
                     df = pd.DataFrame(stock_results)
 
-                    # compute "mean" row as before for the summary list
+                    # keep raw rows
+                    write_header = (not os.path.exists(csv_path)) or os.path.getsize(csv_path) == 0
+                    df.to_csv(csv_path, mode="a", header=write_header, index=False)
+                    self.logger.info(f"[AutoTest] Appended {len(df)} entries for {stock} → {csv_path}")
+
+                    # ---- compute mean and std summary rows across repetitions ----
                     numeric_cols = df.select_dtypes(include='number').columns
+
+                    # mean across repetitions
                     mean_row = df[numeric_cols].mean(numeric_only=True)
                     mean_row["ticker"] = stock
                     mean_row["rewiring"] = rewire
                     mean_row["max_k"] = k
                     mean_row["seq_len"] = seq_len
-                    mean_row["rep"] = "mean"
+                    mean_row["rep"] = "mean"    # summary marker
                     all_results.append(mean_row.to_dict())
 
-                    # append (create file and header if first time)
-                    write_header = (not os.path.exists(csv_path)) or os.path.getsize(csv_path) == 0
-                    df.to_csv(csv_path, mode="a", header=write_header, index=False)
-                    self.logger.info(f"[AutoTest] Appended {len(df)} entries for {stock} → {csv_path}")
+                    # std across repetitions (sample std, ddof=1)
+                    std_series = df[numeric_cols].std(numeric_only=True, ddof=1)
+                    std_row = std_series.copy()
+                    std_row["ticker"] = stock
+                    std_row["rewiring"] = rewire
+                    std_row["max_k"] = k
+                    std_row["seq_len"] = seq_len
+                    std_row["rep"] = "std"      # summary marker
+                    all_results.append(std_row.to_dict())
 
         # ---- append (or create) summary CSV ----
         summary_path = os.path.join(self.args.results_dir, f"{self.args.experiment_name}_summary.csv")
@@ -949,7 +965,6 @@ class MainApp:
         write_header = (not os.path.exists(summary_path)) or os.path.getsize(summary_path) == 0
         df_summary.to_csv(summary_path, mode="a", header=write_header, index=False)
         self.logger.info(f"[AutoTest] Summary appended: {len(df_summary)} rows → {summary_path}")
-
 
 if __name__ == "__main__":
     app = MainApp()

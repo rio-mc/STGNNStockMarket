@@ -72,6 +72,12 @@ class EvaluationMethods:
         self.val_loss_history_gru = []
         self.val_loss_history_stgnn = []
 
+        self.colour_map = {
+            "LSTM":  "tab:blue",
+            "GRU":   "tab:green",
+            "STGNN": "tab:orange",
+        }
+
     def evaluate(
         self,
         model_name: str,
@@ -84,93 +90,110 @@ class EvaluationMethods:
             print(f"[{model_name} Evaluation] No predictions to evaluate.")
             return
 
-		# === STEP 2: Compute Accuracy, Precision, Recall, F1-Score ===
+        # === STEP 2: Compute Accuracy, Precision, Recall, F1-Score ===
         # ------------------------------------
-        
-        #   1. Accuracy and F1-score
         acc = accuracy_score(result.y_true, result.y_pred)
         f1 = precision_recall_fscore_support(result.y_true, result.y_pred, average="binary")[2]
         print(f"[{model_name} Evaluation] Accuracy = {acc:.3f} | F1 = {f1:.3f}")
 
-        #   2. Confusion Matrix
+        # Confusion Matrix / ROC-PR / Threshold
         self.frontend.root.after(0, lambda: self.plot_confusion_matrix(result.y_true, result.y_pred, model_name))
-
-        #   3. ROC & PR
         self.frontend.root.after(0, lambda: self.plot_roc_and_pr(result.y_true, result.probs, model_name))
-
-        #   4. Threshold Curve
         if model_name.upper() == "LSTM":
             threshold_pane = self.lstm_threshold_pane
         elif model_name.upper() == "GRU":
             threshold_pane = self.gru_threshold_pane
         else:
             threshold_pane = self.stgnn_threshold_pane
-
         self.frontend.root.after(0, lambda: self.plot_recall_threshold(
-            truths=result.y_true,
-            probs=result.probs,
-            pane=threshold_pane,
-            model_name=model_name
+            truths=result.y_true, probs=result.probs, pane=threshold_pane, model_name=model_name
         ))
 
-        # === STEP 3: Backtesting And Equity Curve ===
+        # === STEP 3: Backtesting and Equity Curve (non-overlapping trades) ===
         # ------------------------------------
+        sharpe = None
         if result.prediction_dates and result.horizon:
-            #   1. Initialise equity with baseline of 1.0
-            equity = [1.0]
+            # 0) Config
+            H = int(result.horizon)              # holding period in bars (e.g., 24 for 24h on 1h data)
+            tc_per_side = 0.0                    # 5 bps per side (example); set 0.0 if you want no costs
+            rf_annual = 0.0                      # annual risk-free (e.g., 0.03). If >0, excess will subtract per-period rf.
 
-            #   2. Prepare labels
-            x_labels = result.prediction_dates
+            # 1) Prepare price series and labels
             price_series = price_df["close"].copy()
             price_series.index = price_series.index.tz_localize(None)
 
-            #   3. Iterate over each prediction
-            for i, date in enumerate(result.prediction_dates):
-                date = pd.Timestamp(date).tz_localize(None)
+            # If prediction_dates are hourly stamps, we can infer the bar duration later
+            pred_dates = [pd.Timestamp(d).tz_localize(None) for d in result.prediction_dates]
+            equity = [1.0]
+            trade_returns = []
+            trade_times = []
 
+            # 2) Walk through signals without allowing overlap
+            i = 0
+            while i < len(pred_dates):
+                date = pred_dates[i]
                 if date not in price_series.index:
-                    equity.append(equity[-1])
+                    i += 1
                     continue
-                #   4. Entry price at prediction date
+
                 try:
-                    entry_price = price_series.loc[date]
-                    exit_idx = price_series.index.get_loc(date) + result.horizon
-                    #   5. Carry equity forward if exit index exceeds series length (weekends, bank holidays, etc.)
+                    entry_idx = price_series.index.get_loc(date)
+                    exit_idx  = entry_idx + H
                     if exit_idx >= len(price_series):
-                        equity.append(equity[-1])
-                        continue
-                    #   6. Exit price 
-                    exit_price = price_series.iloc[exit_idx]
-                    ret = (exit_price - entry_price) / entry_price
+                        break  # cannot complete trade
 
-                    #   7. Apply trade direction based on prediction
+                    entry = price_series.iloc[entry_idx]
+                    exit_ = price_series.iloc[exit_idx]
+                    raw_ret = (exit_ - entry) / entry
+
                     direction = 1 if result.y_pred[i] == 1 else -1
-                    equity.append(equity[-1] * (1 + direction * ret))
+                    r_gross = direction * raw_ret
 
+                    # round-trip transaction cost
+                    r_net = r_gross - 2.0 * tc_per_side
+
+                    # update equity on a per-trade basis
+                    equity.append(equity[-1] * (1.0 + r_net))
+                    trade_returns.append(r_net)
+                    trade_times.append(date)
+
+                    # jump forward by holding period -> no overlap
+                    i += H
                 except Exception as e:
                     print(f"[EQUITY] Failed at {date}: {e}")
-                    equity.append(equity[-1])
+                    i += 1
+                    continue
 
-            # === STEP 4: Compute Sharpe ratio from equity curve ===
-            # ------------------------------------
-            returns = np.diff(equity) / equity[:-1]
-            sharpe = np.mean(returns) / np.std(returns) if np.std(returns) > 0 else 0.0
+            # 3) Annualised excess Sharpe from per-trade returns
+            if len(trade_returns) > 1:
+                # infer trade interval (median gap)
+                if len(trade_times) > 1:
+                    dt = np.median(np.diff(pd.to_datetime(trade_times)).astype('timedelta64[s]').astype(float))
+                    secs_per_period = max(dt, 1.0)
+                else:
+                    secs_per_period = 3600.0  # fallback: one hour
 
-            # === STEP 5: Plot Equity Curve ===
-            # ------------------------------------
-            pane = self.backtest_lstm_pane if model_name.upper() == "LSTM" \
-            else self.backtest_gru_pane if model_name.upper() == "GRU" \
-            else self.backtest_stgnn_pane
+                periods_per_year = (365.25 * 24 * 3600) / secs_per_period
 
+                r = np.array(trade_returns, dtype=float)
+                # convert annual rf to per-period rf
+                rf_per_period = (1.0 + rf_annual) ** (1.0 / periods_per_year) - 1.0 if rf_annual != 0.0 else 0.0
+                excess = r - rf_per_period
+                sd = np.std(excess, ddof=1)
+                sharpe = (excess.mean() / (sd + 1e-12)) * np.sqrt(periods_per_year)
+            else:
+                sharpe = 0.0
+
+            # 4) Plot Equity Curve with dates (use prediction dates for x-axis)
+            x_labels = trade_times if trade_times else result.prediction_dates
+            pane = (self.backtest_lstm_pane if model_name.upper() == "LSTM"
+                    else self.backtest_gru_pane if model_name.upper() == "GRU"
+                    else self.backtest_stgnn_pane)
             self.frontend.root.after(0, lambda: self.plot_equity_curve(
-                equity=equity,
-                pane=pane,
-                label=model_name,
-                sharpe=sharpe,
-                x_labels=x_labels
+                equity=equity, pane=pane, label=model_name, sharpe=sharpe, x_labels=x_labels
             ))
 
-        # === STEP 6: Plot Losses ===
+        # === STEP 4: Plot Losses (unchanged) ===
         # ------------------------------------
         if model_name.upper() == "LSTM":
             self._val_lstm = [v["loss"] for v in result.val_lstm] if result.val_lstm else []
@@ -182,18 +205,17 @@ class EvaluationMethods:
             self._val_stgnn = [v["loss"] for v in result.val_stgnn] if result.val_stgnn else []
             self._hist_stgnn = result.hist_stgnn or []
 
-        # === STEP 7: Return summary dictionary ===
-        # -----------------------------------------
+        # === STEP 5: Return summary ===
+        # ------------------------------------
         return {
             "model": model_name,
             "accuracy": acc,
             "f1": f1,
-            "sharpe": sharpe if 'sharpe' in locals() else None,
+            "sharpe": sharpe,
             "ticker": price_df.columns[0] if hasattr(price_df, "columns") else None,
             "n_predictions": len(result.y_pred),
             "horizon": result.horizon,
         }
-
 
     def plot_loss(
         self,
@@ -222,11 +244,14 @@ class EvaluationMethods:
         # ------------------------------------
         epochs = list(range(1, max(len(hist_l), len(hist_s), len(hist_g)) + 1))
         if hist_l:
-            self.ax_train.plot(epochs[:len(hist_l)], hist_l, label='LSTM Train', linewidth=1.5)
+            self.ax_train.plot(epochs[:len(hist_l)], hist_l, label='LSTM Train',
+                            linewidth=1.5, color=self.colour_map["LSTM"])
         if hist_s:
-            self.ax_train.plot(epochs[:len(hist_s)], hist_s, label='STGNN Train', linewidth=1.5)
+            self.ax_train.plot(epochs[:len(hist_s)], hist_s, label='STGNN Train',
+                            linewidth=1.5, color=self.colour_map["STGNN"])
         if hist_g:
-            self.ax_train.plot(epochs[:len(hist_g)], hist_g, label='GRU Train', linewidth=1.5)
+            self.ax_train.plot(epochs[:len(hist_g)], hist_g, label='GRU Train',
+                            linewidth=1.5, color=self.colour_map["GRU"])
         max_ticks = 10
         if len(epochs) > max_ticks:
             step = max(1, len(epochs) // max_ticks)
@@ -244,27 +269,9 @@ class EvaluationMethods:
 
         # === STEP 4: Validation Plot And Formatting ===
         # ------------------------------------
-        self._plot_validation_series(
-            self.ax_val,
-            self.val_loss_history_lstm,
-            'LSTM',
-            '--',
-            'tab:blue'
-        )
-        self._plot_validation_series(
-            self.ax_val,
-            self.val_loss_history_gru,
-            'GRU',
-            '-.',
-            'tab:green'
-        )
-        self._plot_validation_series(
-            self.ax_val,
-            self.val_loss_history_stgnn,
-            'STGNN',
-            ':',
-            'tab:orange'
-        )
+        self._plot_validation_series(self.ax_val, self.val_loss_history_lstm, 'LSTM', '--', self.colour_map["LSTM"])
+        self._plot_validation_series(self.ax_val, self.val_loss_history_gru,  'GRU',  '-.', self.colour_map["GRU"])
+        self._plot_validation_series(self.ax_val, self.val_loss_history_stgnn,'STGNN',':',  self.colour_map["STGNN"])
         self.ax_val.set_title('Validation Loss')
         self.ax_val.set_xlabel('Date')
         self.ax_val.set_ylabel('Loss')
@@ -451,7 +458,8 @@ class EvaluationMethods:
         ax.plot(x_labels if x_labels else range(len(equity)),
                 equity,
                 label=f'{label} (Sharpe: {sharpe:.2f})',
-                linewidth=1.5)
+                linewidth=1.5,
+                color=self.colour_map.get(label.upper(), None))
 
         # === STEP 4: Formatting ===
         # ------------------------------------
@@ -511,25 +519,22 @@ class EvaluationMethods:
             return self.val_loss_history_stgnn
     
     def _plot_validation_series(self, ax, loss_history, label_prefix, line_style, colour):
-        # ====================================
-		# === Helper to plot validation loss (with date)
-
-        #   1. Match predictions to date
         if not loss_history:
             return
         dates = [entry['date'] for entry in loss_history]
         y = np.array([entry['loss'] for entry in loss_history])
         avg = y.mean()
-        label = f'{label_prefix} Val (μ={avg:.2f})'
-        ax.plot(dates, y, line_style, label=label, linewidth=1.5)
+        label = f'{label_prefix} Val (\u03BC={avg:.2f})'
 
-        #   2. Trend line
+        # main series: give it the colour so legend matches
+        ax.plot(dates, y, line_style, label=label, linewidth=1.5, color=colour)
+
+        # trend line in the same colour, thinner, and hidden from legend
         trend = np.polyfit(mdates.date2num(dates), y, 1)
         ax.plot(
             dates,
             np.polyval(trend, mdates.date2num(dates)),
-            color=colour,
-            linewidth=1
+            color=colour, linewidth=1, alpha=0.85, label='_nolegend_'
         )
 
     def reset_histories(self):
