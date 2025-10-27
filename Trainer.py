@@ -49,7 +49,12 @@ class Trainer:
         self.model.edge_index = self.edge_index
         self.model.target_node_index = self.targetIdx
         self.model_name = model_name
+
+        #   4. Weight decay & gradient clipping
         self.weight_decay = float(weight_decay) if weight_decay is not None else 0.0
+        self.clip_max_norm = 1.0          # default on; set to None or <=0 to disable
+        self._clip_activations = 0        # counter for diagnostics
+        self.decision_threshold = 0.5
 
     def train(self, dataloader, num_epochs, stop_event=None):
         # === STEP 1: Start Memory Tracking ===
@@ -64,6 +69,8 @@ class Trainer:
 
         if self.weight_decay and self.weight_decay > 0:
             self._apply_weight_decay(self.weight_decay, exclude_norm_bias=True)
+
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimiser, factor=0.5, patience=5, verbose=True)
 
 		# === STEP 2: Training Loop ===
         # ------------------------------------
@@ -92,6 +99,7 @@ class Trainer:
             	    # ------------------------------------
                     loss = self._forward_and_loss(x, y, edge_index, edge_attr)
                     loss.backward()
+                    self._clip_grads()
                     self.optimiser.step()
                     self.optimiser.zero_grad()
                     epoch_losses.append(loss.item())
@@ -127,6 +135,8 @@ class Trainer:
 
             print(f"[Epoch {epoch}] Avg Loss = {avg_loss:.4f}")
             print(f"[Epoch {epoch}] Duration = {epoch_time:.2f}s | Avg Power = {avg_power:.2f} W | Energy = {energy_Wh:.4f} Wh")
+            
+            scheduler.step(avg_loss)
 
             # === STEP 8: Live Tracking ===
             # ------------------------------------
@@ -154,6 +164,9 @@ class Trainer:
         self.avg_power_W = (self.total_energy_Wh * 3600.0 / self.total_train_seconds) if self.total_train_seconds > 0 else 0.0
 
         print(f"[Training Summary] Total energy used: {self.total_energy_Wh:.4f} Wh")
+        print(f"[Training Summary] Total energy used: {self.total_energy_Wh:.4f} Wh")
+        print(f"[Training Summary] Batches with gradient clipping: {self._clip_activations}")
+
         self._finalise_energy_monitoring()
         return self.total_energy_Wh  # optional, but convenient
     
@@ -220,7 +233,7 @@ class Trainer:
                         logits = self.model(x)
 
                     prob = torch.sigmoid(logits).item()
-                    pred = int(prob >= 0.5)
+                    pred = int(prob >= self.decision_threshold)
                     truth = int(y.item())
 
                     # 5) Bookkeeping
@@ -277,7 +290,53 @@ class Trainer:
             model_name=self.model_name
         )
 
-        
+    def calibrate_threshold_from_eval(self, eval_result, method: str = "f1"):
+        """
+        Calibrate the decision threshold from validation predictions.
+        method: "f1" (default) or "youden".
+        Returns (best_threshold, best_score).
+        """
+        y = np.asarray(eval_result.y_true, dtype=np.int32)
+        p = np.asarray(eval_result.probs, dtype=np.float64)
+        if y.size == 0:
+            raise ValueError("No validation data to calibrate threshold.")
+
+        # Sort unique candidate thresholds (skip 0.0/1.0 extremes to avoid degenerate splits)
+        thresholds = np.unique(p)
+        thresholds = thresholds[(thresholds > 0.0) & (thresholds < 1.0)]
+        if thresholds.size == 0:
+            return self.decision_threshold, 0.0
+
+        best_thr, best_score = self.decision_threshold, -1.0
+        for thr in thresholds:
+            pred = (p >= thr).astype(np.int32)
+
+            tp = int(((pred == 1) & (y == 1)).sum())
+            fp = int(((pred == 1) & (y == 0)).sum())
+            fn = int(((pred == 0) & (y == 1)).sum())
+            tn = int(((pred == 0) & (y == 0)).sum())
+
+            if method == "youden":
+                # TPR - FPR
+                tpr = tp / max(tp + fn, 1)
+                fpr = fp / max(fp + tn, 1)
+                score = tpr - fpr
+            else:
+                # default: F1
+                precision = tp / max(tp + fp, 1)
+                recall    = tp / max(tp + fn, 1)
+                score = (2 * precision * recall) / max(precision + recall, 1e-12)
+
+            if score > best_score:
+                best_score, best_thr = score, float(thr)
+
+        self.decision_threshold = float(best_thr)
+        print(f"[CALIBRATION] Set decision_threshold={self.decision_threshold:.4f} via method={method} (score={best_score:.4f})")
+        return self.decision_threshold, best_score
+    
+    def set_threshold(self, thr: float):
+        self.decision_threshold = float(thr)
+
     def _apply_weight_decay(self, weight_decay: float, exclude_norm_bias: bool = True):
         """
         Rebuild optimiser param groups to apply weight decay only to appropriate parameters.
@@ -395,3 +454,17 @@ class Trainer:
         # ====================================
 		# === Helper to terminate energy tracking
         nvmlShutdown()
+
+    def _clip_grads(self):
+        """Clip parameter gradients by global norm; return unclipped total norm."""
+        if not self.clip_max_norm or self.clip_max_norm <= 0:
+            return 0.0
+        total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_max_norm)
+        # Count only when clipping actually engaged
+        try:
+            engaged = float(total_norm) > float(self.clip_max_norm)
+        except Exception:
+            engaged = False
+        if engaged:
+            self._clip_activations += 1
+        return float(total_norm)
