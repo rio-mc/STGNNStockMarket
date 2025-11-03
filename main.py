@@ -358,8 +358,7 @@ class MainApp:
                 evaluator=evaluator,
                 prediction_horizon=self.horizon,
                 seq_len=self.seq_len,
-                model_name="LSTM",
-                weight_decay=wd
+                model_name="LSTM"
             )
 
             #   6. Train LSTM model (with efficiency tracking)
@@ -386,8 +385,6 @@ class MainApp:
             trainer_lstm.prediction_horizon = self.horizon
             eval_result_lstm = trainer_lstm.evaluate_rolling(lstm_val_ds)
 
-            trainer_lstm.calibrate_threshold_from_eval(eval_result_lstm, method="f1")
-
             #   2. Update front-end
             metrics_lstm = evaluator.evaluate(
                 model_name="LSTM",
@@ -407,13 +404,15 @@ class MainApp:
             arr_l = torch.tensor(live_l, dtype=torch.float32, device=self.device).unsqueeze(0)
 
             #   2. Predict directional confidence
-            prob_l = torch.sigmoid(lstm_model(arr_l)[0]).item()
-            thr_l = getattr(trainer_lstm, "decision_threshold", 0.5)
-            dir_l, conf_l = (
-                ("Upwards", (prob_l - thr_l) / max(1 - thr_l, 1e-12) * 100.0)
-                if prob_l >= thr_l else
-                ("Downwards", (thr_l - prob_l) / max(thr_l, 1e-12) * 100.0)
-            )
+            with torch.no_grad():
+                prob_l = torch.sigmoid(lstm_model(arr_l)[0]).item()
+                thr_l = 0.5
+                if prob_l >= thr_l:
+                    dir_l = "Upwards"
+                    conf_l = prob_l * 100.0          # chosen-class probability
+                else:
+                    dir_l = "Downwards"
+                    conf_l = (1.0 - prob_l) * 100.0  # chosen-class probability
 
             #   3. Update front-end
             self.logger.info(f"[startPipeline] LSTM={dir_l} ({conf_l:.1f}%)")
@@ -462,8 +461,7 @@ class MainApp:
                 evaluator=evaluator,
                 prediction_horizon=self.horizon,
                 seq_len=self.seq_len,
-                model_name="GRU",
-                weight_decay=wd
+                model_name="GRU"
             )
 
             trainer_gru.train(dl_gru_train, self.args.lstm_epochs, stop_event=stop_event)
@@ -478,7 +476,6 @@ class MainApp:
             self.frontendApp.set_status("Evaluating GRU...")
 
             eval_result_gru = trainer_gru.evaluate_rolling(lstm_val_ds)
-            trainer_gru.calibrate_threshold_from_eval(eval_result_gru, method="f1")
 
             metrics_gru = evaluator.evaluate(
                 "GRU", 
@@ -497,12 +494,14 @@ class MainApp:
             #   2. Predict directional confidence
             with torch.no_grad():
                 prob_g = torch.sigmoid(gru_model(arr_g)[0]).item()
-            thr_g = getattr(trainer_gru, "decision_threshold", 0.5)  # NEW
-            dir_g, conf_g = (
-                ("Upwards", (prob_g - thr_g) / max(1 - thr_g, 1e-12) * 100.0)
-                if prob_g >= thr_g else
-                ("Downwards", (thr_g - prob_g) / max(thr_g, 1e-12) * 100.0)
-            )
+                thr_g = 0.5
+                if prob_g >= thr_g:
+                    dir_g = "Upwards"
+                    conf_g = prob_g * 100.0
+                else:
+                    dir_g = "Downwards"
+                    conf_g = (1.0 - prob_g) * 100.0
+
 
             #   3. Log and optionally update the GUI immediately
             self.logger.info(f"[startPipeline] GRU={dir_g} ({conf_g:.1f}%)")
@@ -588,8 +587,7 @@ class MainApp:
                 evaluator,
                 prediction_horizon=self.horizon,
                 seq_len=self.seq_len,
-                model_name="STGNN",
-                weight_decay=wd
+                model_name="STGNN"
             )
             
             #   6. Train STGNN model (with efficiency tracking)
@@ -680,7 +678,6 @@ class MainApp:
             #   1. Perform post-training evaluation
             trainer_stgnn.prediction_horizon = self.horizon
             eval_result_stgnn = trainer_stgnn.evaluate_rolling(stgnn_val_ds)
-            trainer_stgnn.calibrate_threshold_from_eval(eval_result_stgnn, method="f1")
 
             #   2. Update front-end
             metrics_stgnn = evaluator.evaluate(
@@ -721,14 +718,16 @@ class MainApp:
             arr_s = torch.cat([X_all, label_channel], dim=-1)
 
             #   6. Predict direction with STGNN
-            logits = stgnn_model(arr_s, self.init_edge_index.to(self.device), edge_attr=edge_attr, target_node_index=stock_idx)
-            prob_s = torch.sigmoid(logits[0]).item()
-            thr_s = getattr(trainer_stgnn, "decision_threshold", 0.5)
-            dir_s_str, conf_s = (
-                ("Upwards", (prob_s - thr_s) / max(1 - thr_s, 1e-12) * 100.0)
-                if prob_s >= thr_s else
-                ("Downwards", (thr_s - prob_s) / max(thr_s, 1e-12) * 100.0)
-            )
+            with torch.no_grad():
+                logits = stgnn_model(arr_s, self.init_edge_index.to(self.device), edge_attr=edge_attr, target_node_index=stock_idx)
+                prob_s = torch.sigmoid(logits[0]).item()
+                thr_s = 0.5
+                if prob_s >= thr_s:
+                    dir_s_str = "Upwards"
+                    conf_s = prob_s * 100.0
+                else:
+                    dir_s_str = "Downwards"
+                    conf_s = (1.0 - prob_s) * 100.0
 
 		    # === STEP 19: Final front-end update ===
             # ------------------------------------
