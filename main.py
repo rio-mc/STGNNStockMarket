@@ -150,15 +150,25 @@ class MainApp:
 
             # === STEP 3: Front-end updates for chosen stock and prediction horizon ===
             # ------------------------------------
+            sector_map_path = "tickers.csv"
+            ticker_to_sector = Utils.load_ticker_to_sector(sector_map_path)
+
+            self.frontendApp.set_sector_map(ticker_to_sector)
+
+            # Optional sanity check
+            missing = [t for t in self.args.tickers if t not in ticker_to_sector]
+            if missing:
+                self.logger.warning(
+                    "[SectorMap] %d tickers missing sector labels: %s",
+                    len(missing), missing[:5]
+                )
 
             #   1. Clear UI state
             self.frontendApp.root.after_idle(self.frontendApp._reset_ui)
             self.frontendApp.set_status("Starting...")
 
             #   2. Initialise trainer and evaluator
-            evaluator = EvaluationMethods(
-                self.frontendApp
-            )
+            evaluator = self.frontendApp.evaluator
             evaluator.reset_histories()
 
             #   3. Establish data from chosen stock
@@ -253,33 +263,49 @@ class MainApp:
             # -----------------------------------------------------
             self.frontendApp.set_status("Build the graph...")
 
-            #   1. Set up graph building
-            self.graph_builder = None
             graph_builder = GraphBuilder(
                 dfFeats=train_feats,
                 max_k=self.get_max_k(),
-                n_pca=3
+                n_pca=3,
+                ticker_to_sector=ticker_to_sector
             )
             self.graphBuilder = graph_builder
- 
-            #   2. Build graph (for STGNN) using all train features
+
+            # Build graph (for STGNN) using all train features
             tickers, coords3d, pruned, mst = graph_builder.getLightGraph()
             G = graph_builder.buildNetworkX(tickers, coords3d, pruned)
 
-            #   3. Send graph to front-end
+            mode = getattr(self.args, "graph_ablation", "none")
+            num_nodes = len(tickers)
+
+            # --- Plot graph: hide cross-asset edges for identity/empty so UI matches ablation ---
+            pruned_for_plot = pruned
+            mst_for_plot = mst
+            if mode in ("identity", "empty"):
+                pruned_for_plot = []
+                mst_for_plot = []
+
             self.frontendApp.root.after(0, lambda: self.frontendApp.plot3d_on_ax(
                 tickers=tickers,
                 coords=coords3d,
-                pruned_edges=pruned,
-                mst_edges=mst
+                pruned_edges=pruned_for_plot,
+                mst_edges=mst_for_plot
             ))
 
-            #   4. Extract (src, dst) pairs and format as 2×E tensor for PyG.
-            edge_index = None
+            # --- Build edge_index for PyG from pruned edges, then apply ablation to MODEL graph ---
             edge_index = torch.tensor(
                 [(i, j) for i, j, _ in pruned],
                 dtype=torch.long
             ).t().contiguous()
+
+            edge_index = Utils.apply_graph_ablation(edge_index, num_nodes=num_nodes, mode=mode)
+
+            # Optional: sanity log (highly recommended)
+            self.logger.info(
+                f"[AblationCheck] mode={mode} | V={num_nodes} | E={edge_index.size(1)} | "
+                f"self_loops={(edge_index.size(1) > 0 and (edge_index[0] == edge_index[1]).all().item())}"
+            )
+
 
             #   5. Apply optional graph ablation (none / identity / empty)
             requested_k = self.get_max_k()
@@ -711,38 +737,60 @@ class MainApp:
             if rebuild_graph:
                 self.frontendApp.set_status("Rebuilding graph...")
 
-                #   1. Use the same features used to generate the latent node embeddings.
+                mode = getattr(self.args, "graph_ablation", "none")
+
+                # 1. Use the same features used to generate the latent node embeddings.
                 graph_builder_refreshed = GraphBuilder(
                     dfFeats=train_feats,
                     max_k=self.get_max_k(),
-                    n_pca=3
+                    n_pca=3,
+                    ticker_to_sector=ticker_to_sector  # keep sector metadata consistent
                 )
 
-                #   2. Update the back-end graph
+                # 2. Update the back-end graph
                 graph_builder_refreshed.set_node_embeddings(latent_embeddings)
                 tickers_new, coords_new, pruned_new, mst_new = graph_builder_refreshed.getLightGraph()
-                Utils.log_graph_memory(G, coords3d, edge_index, tag="Post-training")
 
-                #   3. Update the front-end graph
+                # 3. Update UI graph (hide cross-asset edges if identity/empty)
+                pruned_new_for_plot = pruned_new
+                mst_new_for_plot = mst_new
+                if mode in ("identity", "empty"):
+                    pruned_new_for_plot = []
+                    mst_new_for_plot = []
+
                 self.frontendApp.root.after(0, lambda: self.frontendApp.plot3d_on_ax(
                     tickers=tickers_new,
                     coords=coords_new,
-                    pruned_edges=pruned_new,
-                    mst_edges=mst_new
+                    pruned_edges=pruned_new_for_plot,
+                    mst_edges=mst_new_for_plot
                 ))
 
-                #   4. Update model and trainer with new graph
+                # 4. Update model and trainer with new graph, THEN re-apply ablation
                 edge_index_new = torch.tensor(
                     [(i, j) for i, j, _ in pruned_new],
                     dtype=torch.long
                 ).t().contiguous()
-                # ALSO: keep the refreshed builder as the active one
-                self.graphBuilder = graph_builder_refreshed
-                self.init_edge_index = edge_index_new.clone()  # frozen graph for validation phase
 
-                trainer_stgnn.graphBuilder = graph_builder_refreshed
+                num_nodes_new = len(tickers_new)
+                edge_index_new = Utils.apply_graph_ablation(edge_index_new, num_nodes=num_nodes_new, mode=mode)
+
+                # (Optional) memory logging (now uses the updated edge_index_new)
+                try:
+                    Utils.log_graph_memory(G, coords3d, edge_index_new, tag="Post-training")
+                except Exception as e:
+                    self.logger.warning(f"[GraphMemory] Skipped due to error: {e}")
+
+                # Keep init_edge_index and trainer/model in sync
+                self.init_edge_index = edge_index_new.clone()
                 trainer_stgnn.edge_index = edge_index_new.clone()
                 trainer_stgnn.model.edge_index = edge_index_new
+
+                # Optional: sanity log
+                self.logger.info(
+                    f"[AblationCheck-Rewire] mode={mode} | V={num_nodes_new} | E={edge_index_new.size(1)} | "
+                    f"self_loops={(edge_index_new.size(1) > 0 and (edge_index_new[0] == edge_index_new[1]).all().item())}"
+                )
+
 
             # === STEP 17: STGNN Evaluation Phase ===
             # --------------------------------------
@@ -956,29 +1004,46 @@ class MainApp:
         self.data_ready.wait()
 
         rewiring_options = [False]  # comparative paper: keep fixed by default
-        graph_ablation_options = ["none", "identity", "empty"]
+
+        # Main suite: identity is the key ablation; keep "empty" optional
+        graph_ablation_options = ["none", "identity"]
+        if bool(getattr(self.args, "include_empty_ablation", False)):
+            graph_ablation_options.append("empty")
+
         max_k_values = [1, 2, 4, 8]  # sparsity sweep; adjust as needed
         seq_len_values = [2]
-        repetitions = 2
 
-        param_grid = list(itertools.product(rewiring_options, graph_ablation_options, max_k_values, seq_len_values))
+        # Multi-seed controls (repetitions == number of seeds)
+        num_seeds = int(getattr(self.args, "num_seeds", 2))
+        explicit_seeds = getattr(self.args, "seeds", None)
+
+        param_grid = list(itertools.product(
+            rewiring_options, graph_ablation_options, max_k_values, seq_len_values
+        ))
 
         os.makedirs(self.args.results_dir, exist_ok=True)
         all_results = []
 
         for (rewire, abl, k, seq_len) in param_grid:
-            exp_name = f"{self.args.experiment_name}_rewire-{int(rewire)}_k-{k}_seq-{seq_len}"
+            exp_name = f"{self.args.experiment_name}_rewire-{int(rewire)}_abl-{abl}_k-{k}_seq-{seq_len}"
             csv_path = os.path.join(self.args.results_dir, f"{exp_name}.csv")
-            self.logger.info(f"[AutoTest] Starting config: rewiring={rewire}, max_k={k}, seq_len={seq_len}")
+            self.logger.info(f"[AutoTest] Starting config: rewiring={rewire}, ablation={abl}, max_k={k}, seq_len={seq_len}")
 
             for stock in self.args.tickers:
                 stock_results = []
                 self.logger.info(f"[AutoTest] Running stock: {stock}")
 
-                # Reset to base for each stock
                 stock_base_seed = int(self.args.base_seed) % (2**32)
 
-                for rep in range(repetitions):
+                # Seeds for this stock/config (aligned across models/ablations)
+                if explicit_seeds is not None and len(explicit_seeds) > 0:
+                    seeds = [int(s) % (2**32) for s in explicit_seeds]
+                else:
+                    seeds = [(stock_base_seed + i) % (2**32) for i in range(num_seeds)]
+
+                num_reps = len(seeds)
+
+                for rep, run_seed in enumerate(seeds):
                     # 1) Apply config for this run
                     cfg = copy.deepcopy(self.args)
                     cfg.rewiring = rewire
@@ -987,20 +1052,20 @@ class MainApp:
                     cfg.seq_len = seq_len
                     self.args = cfg
 
-                    # 2) Increment seed per repetition and set it everywhere
-                    run_seed = (stock_base_seed + rep) % (2**32)
+                    # 2) Set seed and stamp it
                     self._set_all_seeds(run_seed)
+                    self.current_seed = run_seed
 
                     stop_event = threading.Event()
                     start_time = time.time()
 
                     try:
-                        self.logger.info(f"[AutoTest] Run {rep+1}/{repetitions} for {stock}")
+                        self.logger.info(f"[AutoTest] Run {rep+1}/{num_reps} for {stock} (seed={run_seed})")
 
                         # Avoid double-counting from earlier runs
                         self.results_log = []
 
-                        # Inline pipeline run (deterministic knobs already set in startPipeline)
+                        # Inline pipeline run
                         self.startPipeline(gui_window="1d", stock=stock, stop_event=stop_event)
 
                         # Stamp metadata including the seed used
@@ -1045,49 +1110,63 @@ class MainApp:
                     df.to_csv(csv_path, mode="a", header=write_header, index=False)
                     self.logger.info(f"[AutoTest] Appended {len(df)} entries for {stock} → {csv_path}")
 
-                    # ---- compute mean and std summary rows across repetitions ----
-                    numeric_cols = df.select_dtypes(include='number').columns
+                    # ---- compute mean and std summary rows across seeds (PER MODEL) ----
+                    numeric_cols = df.select_dtypes(include="number").columns
 
-                    # mean across repetitions
-                    mean_row = df[numeric_cols].mean(numeric_only=True)
-                    mean_row["ticker"] = stock
-                    mean_row["rewiring"] = rewire
-                    mean_row["graph_ablation"] = abl
-                    mean_row["max_k"] = k
-                    mean_row["seq_len"] = seq_len
-                    mean_row["rep"] = "mean"
+                    if "model" in df.columns:
+                        grouped = df.groupby("model")
+                    elif "model_name" in df.columns:
+                        grouped = df.groupby("model_name")
+                    else:
+                        grouped = [(None, df)]  # fallback (not ideal but won't crash)
 
-                    # carry non-numeric identifiers that should NOT be averaged
-                    # (these are constant within stock_results if you log correctly)
-                    for col in ["model_name", "model", "params"]:
-                        if col in df.columns:
-                            mean_row[col] = df[col].iloc[0]
+                    for model_key, gdf in grouped:
+                        # mean row
+                        mean_row = gdf[numeric_cols].mean(numeric_only=True)
+                        mean_row["ticker"] = stock
+                        mean_row["rewiring"] = rewire
+                        mean_row["graph_ablation"] = abl
+                        mean_row["max_k"] = k
+                        mean_row["seq_len"] = seq_len
+                        mean_row["rep"] = "mean"
+                        if model_key is not None:
+                            # preserve model label
+                            if "model" in df.columns:
+                                mean_row["model"] = model_key
+                            else:
+                                mean_row["model_name"] = model_key
 
-                    # num_edges is numeric but constant per config; copy explicitly (prevents averaging bugs if ever mixed)
-                    if "num_edges" in df.columns:
-                        mean_row["num_edges"] = int(df["num_edges"].iloc[0])
+                        # carry identifiers that should not be averaged
+                        for col in ["model_name", "model", "params"]:
+                            if col in gdf.columns:
+                                mean_row[col] = gdf[col].iloc[0]
+                        if "num_edges" in gdf.columns:
+                            mean_row["num_edges"] = int(gdf["num_edges"].iloc[0])
 
-                    all_results.append(mean_row.to_dict())
+                        all_results.append(mean_row.to_dict())
 
-                    # std across repetitions (sample std, ddof=1)
-                    std_series = df[numeric_cols].std(numeric_only=True, ddof=1)
-                    std_row = std_series.copy()
-                    std_row["ticker"] = stock
-                    std_row["rewiring"] = rewire
-                    std_row["graph_ablation"] = abl
-                    std_row["max_k"] = k
-                    std_row["seq_len"] = seq_len
-                    std_row["rep"] = "std"
+                        # std row (sample std)
+                        std_series = gdf[numeric_cols].std(numeric_only=True, ddof=1)
+                        std_row = std_series.copy()
+                        std_row["ticker"] = stock
+                        std_row["rewiring"] = rewire
+                        std_row["graph_ablation"] = abl
+                        std_row["max_k"] = k
+                        std_row["seq_len"] = seq_len
+                        std_row["rep"] = "std"
+                        if model_key is not None:
+                            if "model" in df.columns:
+                                std_row["model"] = model_key
+                            else:
+                                std_row["model_name"] = model_key
 
-                    # carry identifiers again
-                    for col in ["model_name", "model", "params"]:
-                        if col in df.columns:
-                            std_row[col] = df[col].iloc[0]
+                        for col in ["model_name", "model", "params"]:
+                            if col in gdf.columns:
+                                std_row[col] = gdf[col].iloc[0]
+                        if "num_edges" in gdf.columns:
+                            std_row["num_edges"] = int(gdf["num_edges"].iloc[0])
 
-                    if "num_edges" in df.columns:
-                        std_row["num_edges"] = int(df["num_edges"].iloc[0])
-
-                    all_results.append(std_row.to_dict())
+                        all_results.append(std_row.to_dict())
 
         # ---- append (or create) summary CSV ----
         summary_path = os.path.join(self.args.results_dir, f"{self.args.experiment_name}_summary.csv")

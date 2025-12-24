@@ -8,6 +8,9 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import numpy as np
 import pandas as pd
 from matplotlib.figure import Figure
+from matplotlib.patches import Patch
+import matplotlib.cm as cm
+from EvaluationMethods import EvaluationMethods
 
 class Cancelled(Exception):
     """Raised when training is aborted by user."""
@@ -126,26 +129,48 @@ class FrontEnd:
         #   7. Bottom pane: graph + feature table
         self.bottom_pane = tk.PanedWindow(self.mainTab, orient=tk.VERTICAL)
         self.bottom_pane.pack(fill=tk.BOTH, expand=True)
+
+        # ===== Graph frame (top of bottom pane)
         self.graphFrame = tk.LabelFrame(self.bottom_pane, text="Graph Output")
         self.bottom_pane.add(self.graphFrame, minsize=200)
+
+        # Side-by-side container for (graph canvas | legend panel)
+        self.graph_container = tk.Frame(self.graphFrame)
+        self.graph_container.pack(fill=tk.BOTH, expand=True)
+
+        # LEFT: matplotlib canvas frame
+        self.graph_canvas_frame = tk.Frame(self.graph_container)
+        self.graph_canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
         self.graphFig = Figure(figsize=(6, 4), dpi=100)
-        self.graphAx = self.graphFig.add_subplot(111, projection='3d')
-        self.graphCanvas = FigureCanvasTkAgg(self.graphFig, master=self.graphFrame)
+        self.graphAx = self.graphFig.add_subplot(111, projection="3d")
+        self.graphCanvas = FigureCanvasTkAgg(self.graphFig, master=self.graph_canvas_frame)
         self.graphCanvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # RIGHT: sector legend frame (outside the plot)
+        self.legend_frame = tk.LabelFrame(self.graph_container, text="Sector Legend", padx=8, pady=8)
+        self.legend_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=10, pady=10)
+        tk.Label(self.legend_frame, text="(sector map not loaded)").pack(anchor="w")
+
+        # ===== Table pane (bottom of bottom pane)
         self.table_pane = tk.Frame(self.bottom_pane, height=150)
         self.bottom_pane.add(self.table_pane, minsize=150)
+
         cols = ("Stock", "Return", "Volatility", "Volume", "Momentum")
         self.table = ttk.Treeview(self.table_pane, columns=cols, show="headings")
         for c in cols:
             self.table.heading(c, text=c)
             self.table.column(c, width=100, anchor=tk.CENTER)
+
         self.table.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
         self.table.bind("<<TreeviewSelect>>", self._on_table_select)
-        ttk.Scrollbar(self.table_pane, orient=tk.VERTICAL, command=self.table.yview).pack(side=tk.RIGHT, fill=tk.Y)
-        self.table.configure(yscrollcommand=lambda *args: None)
+
+        scroll = ttk.Scrollbar(self.table_pane, orient=tk.VERTICAL, command=self.table.yview)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.table.configure(yscrollcommand=scroll.set)
+
 
         #   8. Evaluation tab
-        self.evaluator = None
         self.evalTab = tk.Frame(self.notebook)
         self.notebook.add(self.evalTab, text="Evaluation")
         self.eval_vertical_pane = tk.PanedWindow(self.evalTab, orient=tk.VERTICAL)
@@ -220,6 +245,10 @@ class FrontEnd:
         self._trainers = {}
         self.priceHistory = {}
         self.currentWindowIdx = 0
+
+        #   12. Evaluation logic (must come AFTER panes exist)
+        self.evaluator = EvaluationMethods(self)
+        self.evaluator.reset_histories()
 
     def bindMainApp(self, main_app):
         # ====================================
@@ -547,9 +576,23 @@ class FrontEnd:
 
         #   4. Clear & scatter
         ax.clear()
-        ax.scatter(xs, ys, zs, s=50, depthshade=True)
+
+        # Sector-based colouring
+        ticker_to_sector = getattr(self, "ticker_to_sector", {}) or {}
+        sectors = [ticker_to_sector.get(t, "Unknown") for t in tickers]
+
+        # single source of truth for this draw
+        self._sector_to_colour = self._sector_palette(sectors)
+
+        node_colours = [self._sector_to_colour.get(s, (0.6, 0.6, 0.6, 1.0)) for s in sectors]
+        ax.scatter(xs, ys, zs, s=75, depthshade=False, c=node_colours, alpha=1.0)
+
+        # keep legend synced with *current* palette
+        self.update_sector_legend()
+
+        # labels
         for i, tkr in enumerate(tickers):
-            ax.text(xs[i], ys[i], zs[i], tkr, size=6)
+            ax.text(xs[i], ys[i], zs[i], tkr, size=6, alpha=0.95)
 
         # 5. Draw edges (pruned & MST)
         self._last_edge_labels = []  # reset cache
@@ -758,18 +801,25 @@ class FrontEnd:
                 )
 
         # 6. Scatter all nodes unchanged
+        ticker_to_sector = getattr(self, "ticker_to_sector", {}) or {}
+        sector_to_colour = getattr(self, "_sector_to_colour", {}) or {}
+
         for i, t in enumerate(tickers):
-            colour = "red" if t == ticker else "grey"
-            size = 70 if t == ticker else 40
+            sector = ticker_to_sector.get(t, "Unknown")
+            base_colour = sector_to_colour.get(sector, (0.5, 0.5, 0.5, 1.0))
+
+            is_sel = (t == ticker)
+            size = 90 if is_sel else 45
+
             ax.scatter(
                 [xs[i]], [ys[i]], [zs[i]],
                 s=size,
                 depthshade=True,
-                alpha=1.0,
-                edgecolors=colour,
-                linewidths=1.0,
-                facecolors="none" if t != ticker else "red",
-                zorder=5 if t == ticker else 3
+                alpha=0.98,
+                facecolors=[base_colour],
+                edgecolors="red" if is_sel else "black",
+                linewidths=2.0 if is_sel else 0.6,
+                zorder=6 if is_sel else 3
             )
             ax.text(xs[i], ys[i], zs[i], t, size=6, alpha=1.0)
 
@@ -836,7 +886,6 @@ class FrontEnd:
             self.lstm_eval_pane,
             self.gru_eval_pane,
             self.stgnn_eval_pane,
-            self.loss_pane,
             self.backtest_lstm_pane,
             self.backtest_gru_pane,
             self.backtest_stgnn_pane,
@@ -916,3 +965,60 @@ class FrontEnd:
                 print("Warning: Failed to rebalance panes:", e)
 
         self.root.after_idle(_rebalance)
+
+    def set_sector_map(self, ticker_to_sector: dict):
+        """
+        Optional: set mapping {ticker -> sector}. If not set, nodes default to 'Unknown'.
+        Also refreshes the external legend panel.
+        """
+        self.ticker_to_sector = ticker_to_sector or {}
+        self.update_sector_legend()
+
+
+    def _sector_palette(self, sectors: List[str]):
+        """
+        Deterministic palette for sectors present in current plot.
+        """
+        sectors = sorted(set(sectors))
+        # tab20 supports up to 20 distinct colours reasonably well
+        cmap = cm.get_cmap("tab20", max(len(sectors), 1))
+        return {s: cmap(i) for i, s in enumerate(sectors)}
+
+    def update_sector_legend(self):
+        """
+        Render the sector legend in the dedicated Tkinter panel (not inside matplotlib).
+        """
+        if not hasattr(self, "legend_frame"):
+            return
+
+        # Clear previous legend widgets
+        for w in self.legend_frame.winfo_children():
+            w.destroy()
+
+        ticker_to_sector = getattr(self, "ticker_to_sector", {}) or {}
+        if not ticker_to_sector:
+            tk.Label(self.legend_frame, text="No sector data").pack(anchor="w")
+            return
+
+        sector_to_colour = getattr(self, "_sector_to_colour", None)
+        if not sector_to_colour:
+            tk.Label(self.legend_frame, text="No graph drawn yet").pack(anchor="w")
+            return
+
+        sectors = sorted(sector_to_colour.keys())
+
+        for sector in sectors:
+            row = tk.Frame(self.legend_frame)
+            row.pack(anchor="w", pady=2)
+
+            rgba = sector_to_colour[sector]
+            hex_colour = "#{:02x}{:02x}{:02x}".format(
+                int(rgba[0] * 255),
+                int(rgba[1] * 255),
+                int(rgba[2] * 255),
+            )
+
+            swatch = tk.Canvas(row, width=14, height=14, bg=hex_colour, highlightthickness=1)
+            swatch.pack(side=tk.LEFT, padx=(0, 6))
+
+            tk.Label(row, text=sector).pack(side=tk.LEFT)

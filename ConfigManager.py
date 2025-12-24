@@ -1,5 +1,6 @@
 import argparse
-from pathlib import Path  # optional but handy
+from pathlib import Path
+import pandas as pd
 
 class ConfigManager:
     @staticmethod
@@ -10,28 +11,37 @@ class ConfigManager:
         parser = argparse.ArgumentParser("Spatio-Temporal Forecasting")
 
         # ====================================
+        # === Result Saving === Toggle to False for main interactive build
+        parser.add_argument("--save_results", action="store_true", default=False, help="Save metrics to CSV")
+
+        # ====================================
         # === Raw Data
         parser.add_argument("--mode", choices=["csv", "yfinance", "av"], default="yfinance")
         parser.add_argument("--data_dir", default="./data")
         parser.add_argument("--av_key", default=None)
 
         # ====================================
-        # === Stock Tickers
-        ALL_TICKERS = [
-            "NVDA", "MSFT", "AAPL", "AMZN", "META",
-            "AVGO", "GOOGL", "GOOG", "BRK-B", "TSLA",
-            "JPM", "WMT", "ORCL", "LLY", "V",
-            "MA", "NFLX", "XOM", "COST", "JNJ",
-            "PLTR", "ABBV", "HD", "BAC", "AMD",
-            "PG", "UNH", "GE", "CVX", "KO",
-            "CSCO", "IBM", "WFC", "TMUS", "MS",
-            "CRM", "AXP", "PM", "CAT", "RTX",
-            "GS", "ABT", "MCD", "MRK", "MU",
-            "TMO", "LIN", "PEP", "DIS", "NOW"
-        ]
-        test_limit = 20
-        tickers_for_test = [ALL_TICKERS[i] for i in range(min(test_limit, len(ALL_TICKERS)))]
+        # === Stock Tickers (from sector CSV)
+        sector_map_path = "tickers.csv"
 
+        sector_df = pd.read_csv(sector_map_path)
+
+        # canonical ticker universe
+        ALL_TICKERS = (
+            sector_df["ticker"]
+            .astype(str)
+            .str.upper()
+            .unique()
+            .tolist()
+        )
+
+        # optional deterministic ordering
+        ALL_TICKERS = sorted(ALL_TICKERS)
+
+        # test subset
+        test_limit = 20
+        tickers_for_test = ALL_TICKERS[:min(test_limit, len(ALL_TICKERS))]
+        
         parser.add_argument(
             "--tickers", nargs="+", default=tickers_for_test,
             help="List of stock tickers to include in analysis."
@@ -48,6 +58,8 @@ class ConfigManager:
 
         parser.add_argument("--num-workers", type=int, default=0,
                             help="Number of worker processes for DataLoaders.")
+        parser.add_argument("--num-seeds", type=int, default=5,
+                    help="Number of random seeds to run per (ticker, config).")
         
         # ====================================
         # === Sampling interval
@@ -114,9 +126,9 @@ class ConfigManager:
             "--graph_ablation",
             type=str,
             default="none",
-            choices=["none", "identity", "empty"],
+            choices=["none", "identity"],
             help="Graph ablation for STGNN: none=use learned sparse graph; "
-                "identity=self-loops only; empty=no edges."
+                "identity=self-loops only."
         )
 
 
@@ -124,9 +136,5 @@ class ConfigManager:
         # === Experiment Running
         parser.add_argument("--results_dir", default="./results", help="Directory to save experiment results")
         parser.add_argument("--experiment_name", default="benchmark_run", help="Experiment name for CSV output")
-
-        # ====================================
-        # === Result Saving === Toggle to False for main interactive build
-        parser.add_argument("--save_results", action="store_true", default=False, help="Save metrics to CSV")
 
         return parser.parse_args([])

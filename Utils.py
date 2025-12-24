@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import networkx as nx
 from pympler import asizeof
+import pandas as pd
 
 class Utils:
 
@@ -180,3 +181,14 @@ class Utils:
             return torch.stack([idx, idx], dim=0)
 
         raise ValueError(f"Unknown graph ablation mode: {mode}")
+    
+    def load_ticker_to_sector(csv_path: str) -> dict:
+        df = pd.read_csv(csv_path)
+
+        assert "ticker" in df.columns and "sector" in df.columns, \
+            "CSV must contain 'ticker' and 'sector' columns"
+
+        return {
+            str(row["ticker"]).upper(): str(row["sector"])
+            for _, row in df.iterrows()
+        }

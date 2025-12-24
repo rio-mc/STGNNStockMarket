@@ -95,6 +95,13 @@ class EvaluationMethods:
         acc = accuracy_score(result.y_true, result.y_pred)
         f1 = precision_recall_fscore_support(result.y_true, result.y_pred, average="binary")[2]
         print(f"[{model_name} Evaluation] Accuracy = {acc:.3f} | F1 = {f1:.3f}")
+        # after acc/f1
+        roc_auc = None
+        ap = None
+        if result.probs is not None and len(result.probs) == len(result.y_true):
+            fpr, tpr, _ = roc_curve(result.y_true, result.probs, pos_label=1)
+            roc_auc = auc(fpr, tpr)
+            ap = average_precision_score(result.y_true, result.probs, pos_label=1)
 
         # Confusion Matrix / ROC-PR / Threshold
         self.frontend.root.after(0, lambda: self.plot_confusion_matrix(result.y_true, result.y_pred, model_name))
@@ -211,6 +218,8 @@ class EvaluationMethods:
             "model": model_name,
             "accuracy": acc,
             "f1": f1,
+            "roc_auc": roc_auc,
+            "ap": ap,
             "sharpe": sharpe,
             "ticker": price_df.columns[0] if hasattr(price_df, "columns") else None,
             "n_predictions": len(result.y_pred),
@@ -403,6 +412,11 @@ class EvaluationMethods:
         canvas.get_tk_widget().pack(fill='both', expand=True)
         canvas.draw()
         plt.close(fig if probs is not None else axes.figure)
+        
+        return {
+            "roc_auc": roc_auc,
+            "ap": ap_score
+        }
 
     def plot_recall_threshold(
         self,

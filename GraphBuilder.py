@@ -15,13 +15,20 @@ class GraphBuilder:
     Builds a graph between stocks using scalar statistical features or learned embeddings.
     Outputs a lightweight, pruned similarity graph for downstream STGNN processing.
     """
-    def __init__(self, dfFeats: Dict[str, pd.DataFrame], max_k: int, n_pca: int = 3):
+    def __init__(self, 
+                 dfFeats: Dict[str, pd.DataFrame], 
+                 max_k: int, 
+                 n_pca: int = 3,
+                 ticker_to_sector: Optional[Dict[str, str]] = None
+                 ):
+    
         # === STEP 1: Initialise Configuration ===
         # ------------------------------------
         self.dfFeats = dfFeats
         self.max_k = max_k
         self.n_pca = n_pca
         self._embeddings: Optional[np.ndarray] = None
+        self.ticker_to_sector: Dict[str, str] = ticker_to_sector or {}
         self._update_tickers()
     
     def _compute_scalars(self):
@@ -227,6 +234,7 @@ class GraphBuilder:
 		# === Helper to build graph
         G = nx.Graph()
         for i, t in enumerate(tickers):
+            sector = self.ticker_to_sector.get(t, "Unknown")
             G.add_node(t, pos=tuple(coords[i]))
         for i, j, w in edges:
             G.add_edge(tickers[i], tickers[j], weight=round(w, 2))
@@ -282,3 +290,7 @@ class GraphBuilder:
         # ====================================
 		# === Helper to get max-k (for graph efficiency)
         return self.max_k
+    
+    def set_sector_map(self, ticker_to_sector: Dict[str, str]) -> None:
+        self.ticker_to_sector = ticker_to_sector or {}
+        logging.info("[GraphBuilder] Sector map set for %d tickers", len(self.ticker_to_sector))
