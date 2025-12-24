@@ -157,3 +157,26 @@ class Utils:
             print(f"[sanity_check_features] {ticker} volatility check: mean abs error = {mean_abs_error:.6f}, max abs error = {max_abs_error:.6f}")
             if max_abs_error > 1e-3:
                 raise ValueError(f"[sanity_check_features] Feature leakage suspected in {ticker}: volatility mismatch exceeds tolerance")
+
+    def count_parameters(model):
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    def apply_graph_ablation(edge_index: torch.Tensor, num_nodes: int, mode: str) -> torch.Tensor:
+        """
+        Returns an edge_index shaped [2, E] for a chosen ablation mode.
+        - none: keep as-is
+        - identity: only self-loops (i,i)
+        - empty: no edges
+        """
+        mode = (mode or "none").lower()
+        if mode == "none":
+            return edge_index
+
+        if mode == "empty":
+            return torch.empty((2, 0), dtype=torch.long, device=edge_index.device)
+
+        if mode == "identity":
+            idx = torch.arange(num_nodes, dtype=torch.long, device=edge_index.device)
+            return torch.stack([idx, idx], dim=0)
+
+        raise ValueError(f"Unknown graph ablation mode: {mode}")

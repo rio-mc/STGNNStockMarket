@@ -145,6 +145,7 @@ class FrontEnd:
         self.table.configure(yscrollcommand=lambda *args: None)
 
         #   8. Evaluation tab
+        self.evaluator = None
         self.evalTab = tk.Frame(self.notebook)
         self.notebook.add(self.evalTab, text="Evaluation")
         self.eval_vertical_pane = tk.PanedWindow(self.evalTab, orient=tk.VERTICAL)

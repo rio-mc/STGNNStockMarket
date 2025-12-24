@@ -109,6 +109,16 @@ class ConfigManager:
         parser.add_argument("--tcn_channels", type=int, default=32, help="Channels in TCN layer")
         parser.add_argument("--tcn_kernel_size", type=int, default=2, help="Kernel size in TCN layer")
         parser.add_argument("--gcn_hidden", type=int, default=32, help="Hidden dimension in GCN")
+        
+        parser.add_argument(
+            "--graph_ablation",
+            type=str,
+            default="none",
+            choices=["none", "identity", "empty"],
+            help="Graph ablation for STGNN: none=use learned sparse graph; "
+                "identity=self-loops only; empty=no edges."
+        )
+
 
         # ====================================
         # === Experiment Running

@@ -81,31 +81,35 @@ class GraphBuilder:
         return proj
 
     def _prune_cosine_graph(self, coords: np.ndarray) -> List[Tuple[int, int, float]]:
-        # === STEP 1: Establish Cosine Similarity from vectors ===
-        # ------------------------------------
         sim = cosine_similarity(coords)
         np.fill_diagonal(sim, -1)  # prevent self-loops
-        print("[DEBUG] Cosine similarity stats: min=%.4f, max=%.4f, mean=%.4f" %
-      (np.nanmin(sim), np.nanmax(sim), np.nanmean(sim)))
-        
-        # === STEP 2: Set Up Max-k ===
-        # ------------------------------------
+
+        # Effective k actually used
         k = min(self.max_k, sim.shape[0] - 1)
+        self.effective_k = k  # <--- add this so we can log it outside
+
         edge_set = set()
 
-        # === STEP 3: Contain Only Max-k Edges ===
-        # ------------------------------------
         for i in range(sim.shape[0]):
-            topk = np.argpartition(-sim[i], self.max_k)[:self.max_k]
+            # IMPORTANT: use k, not self.max_k
+            topk = np.argpartition(-sim[i], k)[:k]
             for j in topk:
                 if sim[i, j] > 0:
                     a, b = sorted((i, j))
                     edge_set.add((a, b, float(sim[i, j])))
 
-        # === STEP 4: Return Max-k Edges ===
-        # ------------------------------------
         edges = list(edge_set)
-        logging.info("[GraphBuilder] Pruned to %d edges using top-%d cosine similarity", len(edges), k)
+
+        # Extra graph stats for defensibility
+        n = sim.shape[0]
+        possible_undirected = n * (n - 1) / 2
+        density = (len(edges) / possible_undirected) if possible_undirected > 0 else 0.0
+
+        logging.info(
+            "[GraphBuilder] Pruned graph: requested_k=%d effective_k=%d edges=%d density=%.6f",
+            self.max_k, k, len(edges), density
+        )
+
         return edges
 
     # Prune -> MST

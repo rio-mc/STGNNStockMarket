@@ -12,6 +12,7 @@ import gc
 from torch_geometric.loader import DataLoader as GeoDataLoader
 import os
 import itertools
+import platform
 
 # cuBLAS determinism (PyTorch will raise without this when deterministic=True on CUDA >= 10.2)
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -118,6 +119,13 @@ class MainApp:
         threading.Thread(target=background_task).start()
 
     def startPipeline(self, gui_window: str, stock: str, stop_event: threading.Event):
+        self.logger.info(f"[Env] Python={platform.python_version()}")
+        self.logger.info(f"[Env] PyTorch={torch.__version__}")
+        self.logger.info(f"[Env] CUDA available={torch.cuda.is_available()}")
+        self.logger.info(f"[Env] CUDA version={torch.version.cuda}")
+        self.logger.info(f"[Env] cuDNN={torch.backends.cudnn.version()}")
+        self.logger.info(f"[Env] NumPy={np.__version__}")
+        
 		# === STEP 1: Ensure stop_event initialisation is correct ===
         # ------------------------------------
         if self.pipeline_running:
@@ -199,12 +207,23 @@ class MainApp:
             self.frontendApp.set_status("Extracting engineered features...")
 
             #   1. Build training features
-            feat_ext_train = FeatureExtractor(train_raw_map, rollingVolWindow=self.seq_len)
+            feat_ext_train = FeatureExtractor(
+                train_raw_map,
+                rollingVolWindow=self.seq_len,
+                norm_stats=None,
+                fit_normaliser=True,
+            )
             feat_ext_train.buildFeatureDfs()
             train_feats = feat_ext_train.dfFeats
+            train_norm_stats = feat_ext_train.get_norm_stats()
 
             #   2. Build validation features
-            feat_ext_val = FeatureExtractor(val_raw_map, rollingVolWindow=self.seq_len)
+            feat_ext_val = FeatureExtractor(
+                val_raw_map,
+                rollingVolWindow=self.seq_len,
+                norm_stats=train_norm_stats,
+                fit_normaliser=False,
+            )
             feat_ext_val.buildFeatureDfs()
             val_feats = feat_ext_val.dfFeats
 
@@ -262,10 +281,30 @@ class MainApp:
                 dtype=torch.long
             ).t().contiguous()
 
-            #   5. Keep CPU copy for later, make GOU copy for training
-            self.init_edge_index = edge_index.clone()      # keep a CPU copy
+            #   5. Apply optional graph ablation (none / identity / empty)
+            requested_k = self.get_max_k()
+            effective_k = getattr(graph_builder, "effective_k", requested_k)
+
+            mode = getattr(self.args, "graph_ablation", "none")
+            num_nodes = len(self.args.tickers)
+
+            # --- apply ablation here ---
+            edge_index = Utils.apply_graph_ablation(edge_index, num_nodes=num_nodes, mode=mode)
+
+            # freeze this graph for datasets/training
+            self.init_edge_index = edge_index.clone()
             self.graphBuilder.edge_index = self.init_edge_index
-            self.graphBuilder.edge_index = self.init_edge_index
+
+            # log AFTER ablation
+            num_edges = edge_index.size(1)
+            possible_undirected = num_nodes * (num_nodes - 1) / 2
+            graph_density = (num_edges / possible_undirected) if possible_undirected > 0 else 0.0
+
+            self.logger.info(
+                f"[Graph] ablation={mode} requested_k={requested_k} effective_k={effective_k} "
+                f"|V|={num_nodes} |E|={num_edges} density={graph_density:.6f}"
+            )
+
 
             #   6. Track memory of graph components
             Utils.log_graph_memory(G, coords3d, edge_index, tag="Initial")
@@ -343,6 +382,8 @@ class MainApp:
                 bidirectional=self.args.bidirectional,
                 dropout=self.args.dropout
             ).to(self.device)
+            lstm_params = Utils.count_parameters(lstm_model)
+            self.logger.info(f"LSTM parameters: {lstm_params:,}")
 
             #   5. Build LSTM trainer
             trainer_lstm = Trainer(
@@ -369,6 +410,11 @@ class MainApp:
                 stop_event=stop_event,
             )
             lstm_energy_Wh = getattr(trainer_lstm, "total_energy_Wh", None)
+            lstm_energy_per_sample_Wh = getattr(trainer_lstm, "energy_per_sample_Wh", None)
+            lstm_energy_epochs_Wh = getattr(trainer_lstm, "energy_epochs_Wh", None)
+            lstm_energy_per_sample_epochs_Wh = getattr(trainer_lstm, "energy_per_sample_epochs_Wh", None)
+            lstm_samples_per_epoch = getattr(trainer_lstm, "samples_per_epoch", None)
+
             lstm_train_secs = getattr(trainer_lstm, "total_train_seconds", None)
             lstm_avg_power_W = getattr(trainer_lstm, "avg_power_W", None)
             self.logger.info(f"[startPipeline] LSTM training completed in {time.time() - l_start:.2f}s")
@@ -446,6 +492,8 @@ class MainApp:
                 bidirectional=self.args.bidirectional,
                 dropout=self.args.dropout
             ).to(self.device)
+            gru_params  = Utils.count_parameters(gru_model)
+            self.logger.info(f"GRU parameters: {gru_params:,}")
 
             g_start = time.time()
             trainer_gru = Trainer(
@@ -468,6 +516,10 @@ class MainApp:
             gru_energy_Wh = getattr(trainer_gru, "total_energy_Wh", None)
             gru_train_secs = getattr(trainer_gru, "total_train_seconds", None)
             gru_avg_power_W = getattr(trainer_gru, "avg_power_W", None)
+            gru_energy_per_sample_Wh = getattr(trainer_gru, "energy_per_sample_Wh", None)
+            gru_energy_epochs_Wh = getattr(trainer_gru, "energy_epochs_Wh", None)
+            gru_energy_per_sample_epochs_Wh = getattr(trainer_gru, "energy_per_sample_epochs_Wh", None)
+            gru_samples_per_epoch = getattr(trainer_gru, "samples_per_epoch", None)
 
             self.logger.info(f"[startPipeline] GRU training completed in {time.time() - g_start:.2f}s")
             Utils.log_gpu_memory("After GRU")
@@ -528,7 +580,7 @@ class MainApp:
 
             #   1. Use full train set of all tickers and the fixed graph from earlier.
             stgnn_model = STGNNClassifier(
-                edge_index     = edge_index,
+                edge_index     = self.init_edge_index,
                 num_nodes      = len(self.args.tickers),
                 feature_dim    = len(self.raw_feature_cols) + 1,  # +1 for the target‐node flag
                 tcn_channels   = self.args.tcn_channels,
@@ -538,9 +590,21 @@ class MainApp:
                 out_dim        = 1,
                 dropout        = self.args.dropout
             ).to(self.device)
+            stgnn_params = Utils.count_parameters(stgnn_model)
+            self.logger.info(f"STGNN parameters: {stgnn_params:,}")
 
             #   2. Compute edge weights
-            edge_attr = self.graphBuilder.build_edge_weight_tensor(self.init_edge_index).to(self.device)
+            mode = getattr(self.args, "graph_ablation", "none")
+            num_nodes = len(self.args.tickers)
+
+            if mode == "empty":
+                edge_attr = None
+            elif mode == "identity":
+                # one scalar feature per self-loop edge
+                edge_attr = torch.ones((num_nodes, 1), dtype=torch.float32, device=self.device)
+            else:
+                edge_attr = self.graphBuilder.build_edge_weight_tensor(self.init_edge_index).to(self.device)
+
             stgnn_model.edge_attr = edge_attr
 
             #   3. Create STGNN trainer dataset and dataloader
@@ -601,6 +665,11 @@ class MainApp:
             stgnn_energy_Wh = getattr(trainer_stgnn, "total_energy_Wh", None)
             stgnn_train_secs = getattr(trainer_stgnn, "total_train_seconds", None)
             stgnn_avg_power_W = getattr(trainer_stgnn, "avg_power_W", None)
+            stgnn_energy_per_sample_Wh = getattr(trainer_stgnn, "energy_per_sample_Wh", None)
+            stgnn_energy_epochs_Wh = getattr(trainer_stgnn, "energy_epochs_Wh", None)
+            stgnn_energy_per_sample_epochs_Wh = getattr(trainer_stgnn, "energy_per_sample_epochs_Wh", None)
+            stgnn_samples_per_epoch = getattr(trainer_stgnn, "samples_per_epoch", None)
+
             self.logger.info(f"[startPipeline] STGNN training completed in {time.time() - s_start:.2f}s")
             Utils.log_gpu_memory("After STGNN")
 
@@ -664,9 +733,13 @@ class MainApp:
 
                 #   4. Update model and trainer with new graph
                 edge_index_new = torch.tensor(
-                    [(i, j) for i, j, _ in pruned],
+                    [(i, j) for i, j, _ in pruned_new],
                     dtype=torch.long
                 ).t().contiguous()
+                # ALSO: keep the refreshed builder as the active one
+                self.graphBuilder = graph_builder_refreshed
+                self.init_edge_index = edge_index_new.clone()  # frozen graph for validation phase
+
                 trainer_stgnn.graphBuilder = graph_builder_refreshed
                 trainer_stgnn.edge_index = edge_index_new.clone()
                 trainer_stgnn.model.edge_index = edge_index_new
@@ -760,6 +833,10 @@ class MainApp:
                         "energy_Wh": lstm_energy_Wh,
                         "train_seconds": lstm_train_secs,
                         "avg_power_W": lstm_avg_power_W,
+                        "energy_per_sample_Wh": lstm_energy_per_sample_Wh,
+                        "energy_epochs_Wh": lstm_energy_epochs_Wh,
+                        "energy_per_sample_epochs_Wh": lstm_energy_per_sample_epochs_Wh,
+                        "samples_per_epoch": lstm_samples_per_epoch,
                         "model": "LSTM",
                     },
                     {
@@ -770,6 +847,10 @@ class MainApp:
                         "energy_Wh": gru_energy_Wh,
                         "train_seconds": gru_train_secs,
                         "avg_power_W": gru_avg_power_W,
+                        "energy_per_sample_Wh": gru_energy_per_sample_Wh,
+                        "energy_epochs_Wh": gru_energy_epochs_Wh,
+                        "energy_per_sample_epochs_Wh": gru_energy_per_sample_epochs_Wh,
+                        "samples_per_epoch": gru_samples_per_epoch,
                         "model": "GRU",
                     },
                     {
@@ -780,7 +861,13 @@ class MainApp:
                         "energy_Wh": stgnn_energy_Wh,
                         "train_seconds": stgnn_train_secs,
                         "avg_power_W": stgnn_avg_power_W,
+                        "energy_per_sample_Wh": stgnn_energy_per_sample_Wh,
+                        "energy_epochs_Wh": stgnn_energy_epochs_Wh,
+                        "energy_per_sample_epochs_Wh": stgnn_energy_per_sample_epochs_Wh,
+                        "samples_per_epoch": stgnn_samples_per_epoch,
                         "model": "STGNN",
+                        "graph_ablation": getattr(self.args, "graph_ablation", "none"),
+                        "num_edges": int(self.init_edge_index.size(1)),
                     },
                 ])
 
@@ -868,17 +955,18 @@ class MainApp:
         # Wait until background loader built raw_feature_dfs and bound the UI
         self.data_ready.wait()
 
-        rewiring_options = [True, False]
-        max_k_values = [2]
+        rewiring_options = [False]  # comparative paper: keep fixed by default
+        graph_ablation_options = ["none", "identity", "empty"]
+        max_k_values = [1, 2, 4, 8]  # sparsity sweep; adjust as needed
         seq_len_values = [2]
         repetitions = 2
 
-        param_grid = list(itertools.product(rewiring_options, max_k_values, seq_len_values))
+        param_grid = list(itertools.product(rewiring_options, graph_ablation_options, max_k_values, seq_len_values))
 
         os.makedirs(self.args.results_dir, exist_ok=True)
         all_results = []
 
-        for (rewire, k, seq_len) in param_grid:
+        for (rewire, abl, k, seq_len) in param_grid:
             exp_name = f"{self.args.experiment_name}_rewire-{int(rewire)}_k-{k}_seq-{seq_len}"
             csv_path = os.path.join(self.args.results_dir, f"{exp_name}.csv")
             self.logger.info(f"[AutoTest] Starting config: rewiring={rewire}, max_k={k}, seq_len={seq_len}")
@@ -894,6 +982,7 @@ class MainApp:
                     # 1) Apply config for this run
                     cfg = copy.deepcopy(self.args)
                     cfg.rewiring = rewire
+                    cfg.graph_ablation = abl
                     cfg.max_k = k
                     cfg.seq_len = seq_len
                     self.args = cfg
@@ -918,6 +1007,7 @@ class MainApp:
                         for entry in self.results_log:
                             entry.update({
                                 "rewiring": rewire,
+                                "graph_ablation": abl,
                                 "max_k": k,
                                 "seq_len": seq_len,
                                 "ticker": stock,
@@ -932,6 +1022,7 @@ class MainApp:
                         stock_results.append({
                             "ticker": stock,
                             "rewiring": rewire,
+                            "graph_ablation": abl,
                             "max_k": k,
                             "seq_len": seq_len,
                             "rep": rep + 1,
@@ -961,9 +1052,21 @@ class MainApp:
                     mean_row = df[numeric_cols].mean(numeric_only=True)
                     mean_row["ticker"] = stock
                     mean_row["rewiring"] = rewire
+                    mean_row["graph_ablation"] = abl
                     mean_row["max_k"] = k
                     mean_row["seq_len"] = seq_len
-                    mean_row["rep"] = "mean"    # summary marker
+                    mean_row["rep"] = "mean"
+
+                    # carry non-numeric identifiers that should NOT be averaged
+                    # (these are constant within stock_results if you log correctly)
+                    for col in ["model_name", "model", "params"]:
+                        if col in df.columns:
+                            mean_row[col] = df[col].iloc[0]
+
+                    # num_edges is numeric but constant per config; copy explicitly (prevents averaging bugs if ever mixed)
+                    if "num_edges" in df.columns:
+                        mean_row["num_edges"] = int(df["num_edges"].iloc[0])
+
                     all_results.append(mean_row.to_dict())
 
                     # std across repetitions (sample std, ddof=1)
@@ -971,9 +1074,19 @@ class MainApp:
                     std_row = std_series.copy()
                     std_row["ticker"] = stock
                     std_row["rewiring"] = rewire
+                    std_row["graph_ablation"] = abl
                     std_row["max_k"] = k
                     std_row["seq_len"] = seq_len
-                    std_row["rep"] = "std"      # summary marker
+                    std_row["rep"] = "std"
+
+                    # carry identifiers again
+                    for col in ["model_name", "model", "params"]:
+                        if col in df.columns:
+                            std_row[col] = df[col].iloc[0]
+
+                    if "num_edges" in df.columns:
+                        std_row["num_edges"] = int(df["num_edges"].iloc[0])
+
                     all_results.append(std_row.to_dict())
 
         # ---- append (or create) summary CSV ----

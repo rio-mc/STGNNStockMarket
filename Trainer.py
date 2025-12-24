@@ -63,6 +63,9 @@ class Trainer:
         total_energy_Wh = 0.0
         total_train_seconds = 0.0
         self.energy_epochs_Wh = []
+        self.energy_per_sample_epochs_Wh = []
+        self.samples_per_epoch = []
+        total_samples = 0
         self.total_energy_Wh = 0.0 
         self.total_train_seconds = 0.0
         self.avg_power_W = 0.0
@@ -70,12 +73,17 @@ class Trainer:
         if self.weight_decay and self.weight_decay > 0:
             self._apply_weight_decay(self.weight_decay, exclude_norm_bias=True)
 
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimiser, factor=0.5, patience=5, verbose=True)
-
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimiser,
+            factor=0.5,
+            patience=5
+        )
+        
 		# === STEP 2: Training Loop ===
         # ------------------------------------
         for epoch in range(num_epochs):
             #   1. Training mode
+            epoch_samples = 0
             self.model.train()
             epoch_losses = []
             epoch_start_time = time.time()
@@ -94,6 +102,10 @@ class Trainer:
     		        # === STEP 3: Batch Handling ===
             	    # ------------------------------------
                     x, y, edge_index, edge_attr = self._unpack_batch(batch)
+
+                    # Robust batch-size detection
+                    batch_size = x.shape[0] if hasattr(x, "shape") and len(x.shape) > 0 else 1
+                    epoch_samples += int(batch_size)
 
                     # === STEP 4: Compute Loss ===
             	    # ------------------------------------
@@ -132,6 +144,12 @@ class Trainer:
             energy_Wh = avg_power * (epoch_time / 3600.0)
             total_energy_Wh += energy_Wh
             self.energy_epochs_Wh.append(energy_Wh)
+            total_samples += epoch_samples
+            self.samples_per_epoch.append(epoch_samples)
+
+            energy_per_sample_Wh = (energy_Wh / epoch_samples) if epoch_samples > 0 else 0.0
+            self.energy_per_sample_epochs_Wh.append(energy_per_sample_Wh)
+
 
             print(f"[Epoch {epoch}] Avg Loss = {avg_loss:.4f}")
             print(f"[Epoch {epoch}] Duration = {epoch_time:.2f}s | Avg Power = {avg_power:.2f} W | Energy = {energy_Wh:.4f} Wh")
@@ -159,9 +177,12 @@ class Trainer:
 
 		# === STEP 9: Terminate Memory Tracking ===
         # ------------------------------------
-        self.total_energy_Wh = float(total_energy_Wh)
-        self.total_train_seconds = float(total_train_seconds)
-        self.avg_power_W = (self.total_energy_Wh * 3600.0 / self.total_train_seconds) if self.total_train_seconds > 0 else 0.0
+        self.total_energy_Wh = total_energy_Wh
+        self.total_train_seconds = total_train_seconds
+        self.avg_power_W = (total_energy_Wh * 3600.0 / total_train_seconds) if total_train_seconds > 0 else 0.0
+
+        self.total_samples = total_samples
+        self.energy_per_sample_Wh = (total_energy_Wh / total_samples) if total_samples > 0 else 0.0
 
         print(f"[Training Summary] Total energy used: {self.total_energy_Wh:.4f} Wh")
         print(f"[Training Summary] Total energy used: {self.total_energy_Wh:.4f} Wh")
