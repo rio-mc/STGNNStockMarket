@@ -79,7 +79,20 @@ class MainApp:
     def _load_data_and_start_gui(self):
         # === STEP 1: Establish feature columns ===
         # ------------------------------------
-        self.raw_feature_cols = ["close", "volatility", "momentum", "return"]
+        # Engineered feature pool
+        engineered = ["return", "volatility", "momentum"]
+
+        # Remove exactly one if ablation is enabled
+        if self.args.ablate_feature != "none":
+            engineered = [f for f in engineered if f != self.args.ablate_feature]
+
+        # Final node input cols always include close
+        self.raw_feature_cols = ["close"] + engineered
+
+        self.logger.info(
+            f"[Ablation] ablate_feature={self.args.ablate_feature} | "
+            f"node_raw_feature_cols={self.raw_feature_cols}"
+        )
 
         def background_task():
             # === STEP 2: Gather all valid stock price histories ===
@@ -222,7 +235,9 @@ class MainApp:
                 rollingVolWindow=self.seq_len,
                 norm_stats=None,
                 fit_normaliser=True,
+                ablate_feature=self.args.ablate_feature,
             )
+
             feat_ext_train.buildFeatureDfs()
             train_feats = feat_ext_train.dfFeats
             train_norm_stats = feat_ext_train.get_norm_stats()
@@ -233,7 +248,9 @@ class MainApp:
                 rollingVolWindow=self.seq_len,
                 norm_stats=train_norm_stats,
                 fit_normaliser=False,
+                ablate_feature=self.args.ablate_feature,
             )
+
             feat_ext_val.buildFeatureDfs()
             val_feats = feat_ext_val.dfFeats
 
@@ -267,8 +284,16 @@ class MainApp:
                 dfFeats=train_feats,
                 max_k=self.get_max_k(),
                 n_pca=3,
-                ticker_to_sector=ticker_to_sector
+                ticker_to_sector=ticker_to_sector,
+                graph_embed=self.args.graph_embed,
+                ablate_feature=self.args.ablate_feature,
             )
+
+            self.logger.info(
+                f"[Ablation] graph_embed={self.args.graph_embed} | "
+                f"ablate_feature={self.args.ablate_feature}"
+            )
+
             self.graphBuilder = graph_builder
 
             # Build graph (for STGNN) using all train features
@@ -1005,10 +1030,15 @@ class MainApp:
 
         rewiring_options = [False]  # comparative paper: keep fixed by default
 
-        # Main suite: identity is the key ablation; keep "empty" optional
+        # Main suite: identity is the key self-loop ablation; keep "empty" optional
         graph_ablation_options = ["none", "identity"]
         if bool(getattr(self.args, "include_empty_ablation", False)):
             graph_ablation_options.append("empty")
+
+        # NEW: ablated condition (none | pca | one engineered feature)
+        # "pca" means: remove PCA -> graph_embed="raw"
+        # feature means: remove exactly that engineered feature everywhere -> ablate_feature=<feature>
+        ablated_options = ["none", "pca", "return", "volatility", "momentum"]
 
         max_k_values = [1, 2, 4, 8]  # sparsity sweep; adjust as needed
         seq_len_values = [2]
@@ -1018,16 +1048,26 @@ class MainApp:
         explicit_seeds = getattr(self.args, "seeds", None)
 
         param_grid = list(itertools.product(
-            rewiring_options, graph_ablation_options, max_k_values, seq_len_values
+            rewiring_options, graph_ablation_options, ablated_options, max_k_values, seq_len_values
         ))
 
         os.makedirs(self.args.results_dir, exist_ok=True)
         all_results = []
 
-        for (rewire, abl, k, seq_len) in param_grid:
-            exp_name = f"{self.args.experiment_name}_rewire-{int(rewire)}_abl-{abl}_k-{k}_seq-{seq_len}"
+        for (rewire, graph_abl, ablated, k, seq_len) in param_grid:
+            exp_name = (
+                f"{self.args.experiment_name}"
+                f"_rewire-{int(rewire)}"
+                f"_graphabl-{graph_abl}"
+                f"_ablated-{ablated}"
+                f"_k-{k}"
+                f"_seq-{seq_len}"
+            )
             csv_path = os.path.join(self.args.results_dir, f"{exp_name}.csv")
-            self.logger.info(f"[AutoTest] Starting config: rewiring={rewire}, ablation={abl}, max_k={k}, seq_len={seq_len}")
+            self.logger.info(
+                f"[AutoTest] Starting config: rewiring={rewire}, graph_ablation={graph_abl}, "
+                f"ablated={ablated}, max_k={k}, seq_len={seq_len}"
+            )
 
             for stock in self.args.tickers:
                 stock_results = []
@@ -1047,9 +1087,28 @@ class MainApp:
                     # 1) Apply config for this run
                     cfg = copy.deepcopy(self.args)
                     cfg.rewiring = rewire
-                    cfg.graph_ablation = abl
+                    cfg.graph_ablation = graph_abl
                     cfg.max_k = k
                     cfg.seq_len = seq_len
+
+                    # Map "ablated" -> graph_embed + ablate_feature
+                    # Defaults
+                    cfg.graph_embed = getattr(cfg, "graph_embed", "pca")
+                    cfg.ablate_feature = getattr(cfg, "ablate_feature", "none")
+
+                    if ablated == "pca":
+                        # PCA ablation: remove PCA by switching embedding to "raw"
+                        cfg.graph_embed = "raw"
+                        cfg.ablate_feature = "none"
+                    elif ablated in ("return", "volatility", "momentum"):
+                        # Feature ablation: remove one engineered feature everywhere
+                        cfg.graph_embed = "pca"  # keep PCA in place unless explicitly ablated
+                        cfg.ablate_feature = ablated
+                    else:
+                        # "none"
+                        cfg.graph_embed = "pca"
+                        cfg.ablate_feature = "none"
+
                     self.args = cfg
 
                     # 2) Set seed and stamp it
@@ -1060,7 +1119,10 @@ class MainApp:
                     start_time = time.time()
 
                     try:
-                        self.logger.info(f"[AutoTest] Run {rep+1}/{num_reps} for {stock} (seed={run_seed})")
+                        self.logger.info(
+                            f"[AutoTest] Run {rep+1}/{num_reps} for {stock} (seed={run_seed}) | "
+                            f"graph_embed={self.args.graph_embed} | ablate_feature={self.args.ablate_feature}"
+                        )
 
                         # Avoid double-counting from earlier runs
                         self.results_log = []
@@ -1072,7 +1134,10 @@ class MainApp:
                         for entry in self.results_log:
                             entry.update({
                                 "rewiring": rewire,
-                                "graph_ablation": abl,
+                                "graph_ablation": graph_abl,
+                                "ablated": ablated,                 # NEW CSV COLUMN
+                                "graph_embed": self.args.graph_embed,  # optional but helpful
+                                "ablate_feature": self.args.ablate_feature,  # optional but helpful
                                 "max_k": k,
                                 "seq_len": seq_len,
                                 "ticker": stock,
@@ -1087,7 +1152,10 @@ class MainApp:
                         stock_results.append({
                             "ticker": stock,
                             "rewiring": rewire,
-                            "graph_ablation": abl,
+                            "graph_ablation": graph_abl,
+                            "ablated": ablated,                 # NEW
+                            "graph_embed": getattr(self.args, "graph_embed", None),
+                            "ablate_feature": getattr(self.args, "ablate_feature", None),
                             "max_k": k,
                             "seq_len": seq_len,
                             "rep": rep + 1,
@@ -1125,12 +1193,14 @@ class MainApp:
                         mean_row = gdf[numeric_cols].mean(numeric_only=True)
                         mean_row["ticker"] = stock
                         mean_row["rewiring"] = rewire
-                        mean_row["graph_ablation"] = abl
+                        mean_row["graph_ablation"] = graph_abl
+                        mean_row["ablated"] = ablated                 # NEW
+                        mean_row["graph_embed"] = getattr(self.args, "graph_embed", None)
+                        mean_row["ablate_feature"] = getattr(self.args, "ablate_feature", None)
                         mean_row["max_k"] = k
                         mean_row["seq_len"] = seq_len
                         mean_row["rep"] = "mean"
                         if model_key is not None:
-                            # preserve model label
                             if "model" in df.columns:
                                 mean_row["model"] = model_key
                             else:
@@ -1150,7 +1220,10 @@ class MainApp:
                         std_row = std_series.copy()
                         std_row["ticker"] = stock
                         std_row["rewiring"] = rewire
-                        std_row["graph_ablation"] = abl
+                        std_row["graph_ablation"] = graph_abl
+                        std_row["ablated"] = ablated                  # NEW
+                        std_row["graph_embed"] = getattr(self.args, "graph_embed", None)
+                        std_row["ablate_feature"] = getattr(self.args, "ablate_feature", None)
                         std_row["max_k"] = k
                         std_row["seq_len"] = seq_len
                         std_row["rep"] = "std"

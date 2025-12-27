@@ -131,6 +131,24 @@ class ConfigManager:
                 "identity=self-loops only."
         )
 
+        # ====================================
+        # === Feature Ablations
+        parser.add_argument(
+            "--ablate_feature",
+            type=str,
+            default="none",
+            choices=["none", "return", "volatility", "momentum"],
+            help="Ablation: remove exactly one engineered feature everywhere (node inputs + graph scalars)."
+        )
+
+        # === PCA ablation for graph embedding ===
+        parser.add_argument(
+            "--graph_embed",
+            type=str,
+            default="pca",
+            choices=["pca", "raw"],
+            help="Graph scalar embedding: pca=StandardScaler+PCA; raw=StandardScaler only (no PCA)."
+        )
 
         # ====================================
         # === Experiment Running

@@ -10,6 +10,7 @@ class FeatureExtractor:
         rollingVolWindow: int = 5,
         norm_stats: Optional[Dict[str, Dict[str, Tuple[float, float]]]] = None,
         fit_normaliser: bool = True,
+        ablate_feature: str = "none",
     ):
         self.rawData = rawData
         self.rollingVolWindow = rollingVolWindow
@@ -21,6 +22,7 @@ class FeatureExtractor:
         # If provided, we reuse these (no leakage in val/test)
         self.norm_stats: Dict[str, Dict[str, Tuple[float, float]]] = norm_stats or {}
         self.fit_normaliser = fit_normaliser
+        self.ablate_feature = ablate_feature
 
     def buildFeatureDfs(self) -> None:
         """
@@ -33,7 +35,11 @@ class FeatureExtractor:
         featureDfs: Dict[str, pd.DataFrame] = {}
 
         normalise_cols = ['open', 'high', 'low', 'close', 'volume',
-                          'return', 'volatility', 'momentum']
+                        'return', 'volatility', 'momentum']
+
+        # Remove exactly one engineered feature from normalisation if ablated
+        if self.ablate_feature in ("return", "volatility", "momentum"):
+            normalise_cols = [c for c in normalise_cols if c != self.ablate_feature]
 
         for tkr, df in self.rawData.items():
             if df.empty or "close" not in df.columns:
@@ -51,6 +57,11 @@ class FeatureExtractor:
             dfFeat["return"]     = dfFeat["close"].pct_change()
             dfFeat["volatility"] = dfFeat["close"].rolling(self.rollingVolWindow).std().shift(1)
             dfFeat["momentum"]   = dfFeat["close"].pct_change(periods=self.rollingVolWindow)
+
+            # Drop the ablated engineered feature (everywhere)
+            if self.ablate_feature in ("return", "volatility", "momentum"):
+                if self.ablate_feature in dfFeat.columns:
+                    dfFeat.drop(columns=[self.ablate_feature], inplace=True)
 
             dfFeat.dropna(inplace=True)
             dfFeat = dfFeat.replace([np.inf, -np.inf], np.nan).dropna()

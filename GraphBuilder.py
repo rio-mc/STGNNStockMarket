@@ -15,12 +15,13 @@ class GraphBuilder:
     Builds a graph between stocks using scalar statistical features or learned embeddings.
     Outputs a lightweight, pruned similarity graph for downstream STGNN processing.
     """
-    def __init__(self, 
-                 dfFeats: Dict[str, pd.DataFrame], 
-                 max_k: int, 
-                 n_pca: int = 3,
-                 ticker_to_sector: Optional[Dict[str, str]] = None
-                 ):
+    def __init__(self,
+                dfFeats: Dict[str, pd.DataFrame],
+                max_k: int,
+                n_pca: int = 3,
+                ticker_to_sector: Optional[Dict[str, str]] = None,
+                graph_embed: str = "pca",
+                ablate_feature: str = "none"):
     
         # === STEP 1: Initialise Configuration ===
         # ------------------------------------
@@ -29,6 +30,8 @@ class GraphBuilder:
         self.n_pca = n_pca
         self._embeddings: Optional[np.ndarray] = None
         self.ticker_to_sector: Dict[str, str] = ticker_to_sector or {}
+        self.graph_embed = graph_embed
+        self.ablate_feature = ablate_feature
         self._update_tickers()
     
     def _compute_scalars(self):
@@ -44,9 +47,20 @@ class GraphBuilder:
             df = self.dfFeats[t]
             try:
                 #   2. Store individual scalars
-                ret = df['return'].iloc[-1]
-                vol = df['volatility'].iloc[-1]
-                mom = df.get('momentum', pd.Series([0], index=[df.index[-1]])).iloc[-1]
+                #   Default: read values if present (some may be missing due to ablation)
+                ret = float(df["return"].iloc[-1]) if "return" in df.columns else 0.0
+                vol = float(df["volatility"].iloc[-1]) if "volatility" in df.columns else 0.0
+                mom = float(df["momentum"].iloc[-1]) if "momentum" in df.columns else 0.0
+
+                # Ablate exactly one feature by zeroing it out (keeps 3D geometry consistent)
+                if self.ablate_feature == "return":
+                    ret = 0.0
+                elif self.ablate_feature == "volatility":
+                    vol = 0.0
+                elif self.ablate_feature == "momentum":
+                    mom = 0.0
+
+                vectors.append([ret, vol, mom])
 
                 #   3. Create and store vector from scalars
                 vectors.append([ret, vol, mom])
@@ -63,28 +77,47 @@ class GraphBuilder:
         return valid_tickers, mat
 
     def _embed_pca(self, mat: np.ndarray) -> np.ndarray:
-		# === STEP 1: Normalisation ===
-        # ------------------------------------
+        """
+        Embeds the scalar matrix into a coordinate space used for similarity.
+
+        Modes (controlled by self.graph_embed):
+        - "pca": StandardScaler + PCA(n_components=min(self.n_pca, n_samples, n_features))
+        - "raw": StandardScaler only (no PCA), padded to self.n_pca dims if needed
+
+        NOTE: We intentionally keep this method name for backward compatibility.
+        """
+
+        # === STEP 1: Normalisation ===
         scaler = StandardScaler()
         mat_scaled = scaler.fit_transform(mat)
 
         # === STEP 2: Component Counting ===
-        # ------------------------------------
         n_samples, n_features = mat_scaled.shape
         n_comp = min(self.n_pca, n_samples, n_features)
 
-        # === STEP 3: PCA Projection ===
-        # ------------------------------------
+        # === STEP 3: PCA Projection OR RAW ablation ===
+        if getattr(self, "graph_embed", "pca") == "raw":
+            # RAW ablation: no PCA, just use scaled scalars
+            proj = mat_scaled
 
-        #   1. Establish dimension size (should be 3)
+            # force consistent dimensionality for downstream (e.g., cosine in fixed dim)
+            if proj.shape[1] < self.n_pca:
+                pad = np.zeros((proj.shape[0], self.n_pca - proj.shape[1]))
+                proj = np.hstack([proj, pad])
+
+            logging.info("[GraphBuilder] graph_embed=raw (StandardScaler only), dims=%s", proj.shape)
+            return proj
+
+        # Default: PCA path
         pca = PCA(n_components=n_comp)
         proj = pca.fit_transform(mat_scaled)
-        logging.info("[GraphBuilder] PCA variance explained: %s", pca.explained_variance_ratio_)
+        logging.info("[GraphBuilder] graph_embed=pca | PCA variance explained: %s", pca.explained_variance_ratio_)
 
-        #   2. Force 3 dimensions if less than 3 scalars passed
+        # force consistent dimensionality if PCA returns fewer comps
         if proj.shape[1] < self.n_pca:
             pad = np.zeros((proj.shape[0], self.n_pca - proj.shape[1]))
             proj = np.hstack([proj, pad])
+
         return proj
 
     def _prune_cosine_graph(self, coords: np.ndarray) -> List[Tuple[int, int, float]]:
