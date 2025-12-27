@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from SharedHead import SharedClassifierHead
 
 class LSTMClassifier(nn.Module):
     def __init__(
@@ -43,33 +44,13 @@ class LSTMClassifier(nn.Module):
         # ------------------------------------
         self.norm = nn.LayerNorm(hidden_dim * self.num_directions)
 
-        # === STEP 4: LSTM Classifier ===
-        # ------------------------------------
-        
-        #    1. Fully-connected projection & non-linearity stack
-        #      Applies an expand–contract pattern ("hourglass") to increase feature capacity,
-        #      then compress to retain only the most salient information before the final output.
-        self.classifier = nn.Sequential(
-
-            #   2. Project from LSTM/STGNN output size to a larger intermediate space
-            #      Expanding hidden_dim → hidden_dim*2 gives the network room to form richer,
-            #      more separable feature combinations before narrowing back down.
-            nn.Linear(hidden_dim * self.num_directions, hidden_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-
-            #   3. Reduce dimensionality while retaining non-linear capacity
-            #      Forces the network to compress features into a smaller space,
-            #      acting as a bottleneck to encourage generalisable representations.
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-
-            #   4. Final projection to output space (e.g., 1 for binary classification)
-            #      Converts the compressed representation to task-specific outputs.
-            nn.Linear(hidden_dim, out_channels)
+        in_dim = hidden_dim * self.num_directions
+        self.classifier = SharedClassifierHead(
+            in_dim=in_dim,
+            base_hidden=hidden_dim,
+            out_channels=out_channels,
+            dropout=dropout
         )
-
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # ====================================

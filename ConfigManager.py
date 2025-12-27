@@ -104,7 +104,7 @@ class ConfigManager:
 
         # ====================================
         # === LSTM Architecture
-        parser.add_argument("--lstm_hidden", type=int, default=64, help="Hidden dimension of LSTM layers")
+        parser.add_argument("--lstm_hidden", type=int, default=32, help="Hidden dimension of LSTM layers")
         parser.add_argument("--lstm_layers", type=int, default=2, help="Number of LSTM layers")
         parser.add_argument("--bidirectional", action="store_true", help="Use bidirectional LSTM")
 
@@ -122,6 +122,8 @@ class ConfigManager:
         parser.add_argument("--tcn_kernel_size", type=int, default=2, help="Kernel size in TCN layer")
         parser.add_argument("--gcn_hidden", type=int, default=32, help="Hidden dimension in GCN")
         
+        # ====================================
+        # === Feature Ablations
         parser.add_argument(
             "--graph_ablation",
             type=str,
@@ -131,8 +133,6 @@ class ConfigManager:
                 "identity=self-loops only."
         )
 
-        # ====================================
-        # === Feature Ablations
         parser.add_argument(
             "--ablate_feature",
             type=str,

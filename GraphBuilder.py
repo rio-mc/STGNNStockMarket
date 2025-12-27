@@ -60,8 +60,6 @@ class GraphBuilder:
                 elif self.ablate_feature == "momentum":
                     mom = 0.0
 
-                vectors.append([ret, vol, mom])
-
                 #   3. Create and store vector from scalars
                 vectors.append([ret, vol, mom])
                 valid_tickers.append(t)

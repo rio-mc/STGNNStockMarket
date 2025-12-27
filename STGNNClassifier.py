@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import NNConv
 from typing import Optional
+from SharedHead import SharedClassifierHead
 
 class STBlock(nn.Module):
     def __init__(self, in_channels, tcn_channels, gcn_hidden, tcn_kernel, dropout):
@@ -132,9 +133,16 @@ class STGNNClassifier(nn.Module):
                 )
             )
 
-		# === STEP 3: target + context -> logits ===
+        # === STEP 3: target + context -> logits (shared head) ===
         # ------------------------------------
-        self.fc_out    = nn.Linear(gcn_hidden * 2, out_dim)
+        self.head_norm = nn.LayerNorm(gcn_hidden * 2)  # normalize combined rep like other models
+        self.classifier = SharedClassifierHead(
+            in_dim=gcn_hidden * 2,
+            base_hidden=gcn_hidden,
+            out_channels=out_dim,
+            dropout=dropout
+        )
+
         self.bottleneck = nn.Linear(gcn_hidden, 3)  # used in embed()
         self.norm      = nn.LayerNorm(gcn_hidden)
         self.dropout   = nn.Dropout(dropout)
@@ -203,9 +211,10 @@ class STGNNClassifier(nn.Module):
         context_h = (att @ K).squeeze(1)                           # [B, H]
 
         # 7. Combine target + context, classify
-        combined = torch.cat([target_h, context_h], dim=-1)
+        combined = torch.cat([target_h, context_h], dim=-1)  # [B, 2H]
+        combined = self.head_norm(combined)
         combined = self.dropout(combined)
-        logits = self.fc_out(combined)
+        logits = self.classifier(combined)
         return logits
 
     def embed(self, x: torch.Tensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.Tensor] = None) -> torch.Tensor:

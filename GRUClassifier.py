@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from SharedHead import SharedClassifierHead
 
 class GRUClassifier(nn.Module):
     def __init__(
@@ -30,14 +31,13 @@ class GRUClassifier(nn.Module):
 
         # === STEP 2: Normalisation + Classifier ===
         self.norm = nn.LayerNorm(hidden_dim * self.num_directions)
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim * self.num_directions, hidden_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, out_channels)
+
+        in_dim = hidden_dim * self.num_directions
+        self.classifier = SharedClassifierHead(
+            in_dim=in_dim,
+            base_hidden=hidden_dim,
+            out_channels=out_channels,
+            dropout=dropout
         )
 
         # === STEP 3: Weight Initialisation ===
