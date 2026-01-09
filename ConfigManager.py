@@ -89,7 +89,7 @@ class ConfigManager:
         parser.add_argument("--batch_size", type=int, default=256, help="Mini-batch size for training")
         parser.add_argument("--dropout", type=float, default=0.15, help="Dropout rate")
         epoch_count = 50
-        lr = 1e-3
+        lr = 1e-4
 
         # === Regularisation
         parser.add_argument("--weight_decay", type=float, default=1e-4,
@@ -104,7 +104,7 @@ class ConfigManager:
 
         # ====================================
         # === LSTM Architecture
-        parser.add_argument("--lstm_hidden", type=int, default=32, help="Hidden dimension of LSTM layers")
+        parser.add_argument("--lstm_hidden", type=int, default=16, help="Hidden dimension of LSTM layers")
         parser.add_argument("--lstm_layers", type=int, default=2, help="Number of LSTM layers")
         parser.add_argument("--bidirectional", action="store_true", help="Use bidirectional LSTM")
 
@@ -118,9 +118,9 @@ class ConfigManager:
         # ====================================
         # === STGNN Architecture
         parser.add_argument("--stgnn_blocks", type=int, default=2, help="Number of ST Blocks")
-        parser.add_argument("--tcn_channels", type=int, default=32, help="Channels in TCN layer")
+        parser.add_argument("--tcn_channels", type=int, default=16, help="Channels in TCN layer")
         parser.add_argument("--tcn_kernel_size", type=int, default=2, help="Kernel size in TCN layer")
-        parser.add_argument("--gcn_hidden", type=int, default=32, help="Hidden dimension in GCN")
+        parser.add_argument("--gcn_hidden", type=int, default=16, help="Hidden dimension in GCN")
         
         # ====================================
         # === Feature Ablations
@@ -149,6 +149,14 @@ class ConfigManager:
             choices=["pca", "raw"],
             help="Graph scalar embedding: pca=StandardScaler+PCA; raw=StandardScaler only (no PCA)."
         )
+
+        # ====================================
+        # === Shared Representation + Head (ALL MODELS)
+        parser.add_argument("--rep_dim", type=int, default=128,
+                            help="Common representation dim fed into the shared classifier head")
+        parser.add_argument("--head_hidden", type=int, default=128,
+                            help="Hidden width inside the shared classifier head (same for all models)")
+
 
         # ====================================
         # === Experiment Running

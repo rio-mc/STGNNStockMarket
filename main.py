@@ -431,8 +431,11 @@ class MainApp:
                 num_layers=self.args.lstm_layers,
                 out_channels=1,
                 bidirectional=self.args.bidirectional,
-                dropout=self.args.dropout
+                dropout=self.args.dropout,
+                rep_dim=self.args.rep_dim,
+                head_hidden=self.args.head_hidden
             ).to(self.device)
+            print(f"dropout={self.args.dropout}, rep_dim={self.args.rep_dim}, head_hidden={self.args.head_hidden}")
             lstm_params = Utils.count_parameters(lstm_model)
             self.logger.info(f"LSTM parameters: {lstm_params:,}")
 
@@ -541,7 +544,9 @@ class MainApp:
                 num_layers=self.args.lstm_layers,
                 out_channels=1,
                 bidirectional=self.args.bidirectional,
-                dropout=self.args.dropout
+                dropout=self.args.dropout,
+                rep_dim=self.args.rep_dim,
+                head_hidden=self.args.head_hidden
             ).to(self.device)
             gru_params  = Utils.count_parameters(gru_model)
             self.logger.info(f"GRU parameters: {gru_params:,}")
@@ -631,16 +636,19 @@ class MainApp:
 
             #   1. Use full train set of all tickers and the fixed graph from earlier.
             stgnn_model = STGNNClassifier(
-                edge_index     = self.init_edge_index,
-                num_nodes      = len(self.args.tickers),
-                feature_dim    = len(self.raw_feature_cols) + 1,  # +1 for the target‐node flag
-                tcn_channels   = self.args.tcn_channels,
-                tcn_kernel     = self.args.tcn_kernel_size,
-                gcn_hidden     = self.args.gcn_hidden,
-                stgnn_blocks     = self.args.stgnn_blocks,
-                out_dim        = 1,
-                dropout        = self.args.dropout
+                edge_index      = self.init_edge_index,
+                num_nodes       = len(self.args.tickers),
+                feature_dim     = len(self.raw_feature_cols) + 1,  # +1 for the target‐node flag
+                tcn_channels    = self.args.tcn_channels,
+                tcn_kernel      = self.args.tcn_kernel_size,
+                gcn_hidden      = self.args.gcn_hidden,
+                stgnn_blocks    = self.args.stgnn_blocks,
+                out_dim         = 1,
+                dropout         = self.args.dropout,
+                rep_dim         = self.args.rep_dim,
+                head_hidden     = self.args.head_hidden
             ).to(self.device)
+
             stgnn_params = Utils.count_parameters(stgnn_model)
             self.logger.info(f"STGNN parameters: {stgnn_params:,}")
 

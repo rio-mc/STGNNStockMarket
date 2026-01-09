@@ -102,7 +102,9 @@ class STGNNClassifier(nn.Module):
         gcn_hidden: int = 32,
         stgnn_blocks: int = 2,
         out_dim: int = 1,
-        dropout: float = 0.3
+        dropout: float = 0.3,
+        rep_dim: int = 128,
+        head_hidden: int = 128
     ):
         # === STEP 1: Initialisation ===
         # ------------------------------------
@@ -135,10 +137,14 @@ class STGNNClassifier(nn.Module):
 
         # === STEP 3: target + context -> logits (shared head) ===
         # ------------------------------------
-        self.head_norm = nn.LayerNorm(gcn_hidden * 2)  # normalize combined rep like other models
+        self.head_norm = nn.LayerNorm(gcn_hidden * 2)   # keep: stabilizes combined vector
+        self.rep_proj  = nn.Linear(gcn_hidden * 2, rep_dim)
+        self.rep_norm  = nn.LayerNorm(rep_dim)
+
+        # === Shared classifier head (identical across all models) ===
         self.classifier = SharedClassifierHead(
-            in_dim=gcn_hidden * 2,
-            base_hidden=gcn_hidden,
+            in_dim=rep_dim,
+            base_hidden=head_hidden,
             out_channels=out_dim,
             dropout=dropout
         )
@@ -213,8 +219,9 @@ class STGNNClassifier(nn.Module):
         # 7. Combine target + context, classify
         combined = torch.cat([target_h, context_h], dim=-1)  # [B, 2H]
         combined = self.head_norm(combined)
-        combined = self.dropout(combined)
-        logits = self.classifier(combined)
+        rep = self.rep_norm(self.rep_proj(combined))         # [B, rep_dim]
+        rep = self.dropout(rep)
+        logits = self.classifier(rep)
         return logits
 
     def embed(self, x: torch.Tensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.Tensor] = None) -> torch.Tensor:

@@ -10,7 +10,9 @@ class LSTMClassifier(nn.Module):
         num_layers: int = 2,
         out_channels: int = 1,
         bidirectional: bool = True,
-        dropout: float = 0.3
+        dropout: float = 0.3,
+        rep_dim: int = 128,
+        head_hidden: int = 128
     ):
         # === STEP 1: Initialisation ===
         # ------------------------------------
@@ -37,20 +39,24 @@ class LSTMClassifier(nn.Module):
             batch_first=True
         )
 
-        #   2. Weight normalisation
-        self._init_weights()
-
         # === STEP 3: Input Normalisation ===
         # ------------------------------------
-        self.norm = nn.LayerNorm(hidden_dim * self.num_directions)
+        enc_dim = hidden_dim * self.num_directions
+        self.norm = nn.LayerNorm(enc_dim)
 
-        in_dim = hidden_dim * self.num_directions
+        # === Shared representation adapter  ===
+        self.rep_proj = nn.Linear(enc_dim, rep_dim)
+        self.rep_norm = nn.LayerNorm(rep_dim)
+
+        # === Shared classifier head ===
         self.classifier = SharedClassifierHead(
-            in_dim=in_dim,
-            base_hidden=hidden_dim,
+            in_dim=rep_dim,
+            base_hidden=head_hidden,
             out_channels=out_channels,
             dropout=dropout
         )
+
+        self._init_weights()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # ====================================
@@ -66,7 +72,9 @@ class LSTMClassifier(nn.Module):
         last_hidden = self.norm(last_hidden)
 
         #   4. Classify
-        logits = self.classifier(last_hidden)
+        rep = self.rep_norm(self.rep_proj(last_hidden))
+        logits = self.classifier(rep)
+
         return logits
 
     def _init_weights(self):

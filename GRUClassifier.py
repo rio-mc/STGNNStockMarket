@@ -10,7 +10,9 @@ class GRUClassifier(nn.Module):
         num_layers: int = 2,
         out_channels: int = 1,
         bidirectional: bool = True,
-        dropout: float = 0.3
+        dropout: float = 0.3,
+        rep_dim: int = 128,
+        head_hidden: int = 128
     ):
         super().__init__()
         
@@ -30,12 +32,15 @@ class GRUClassifier(nn.Module):
         )
 
         # === STEP 2: Normalisation + Classifier ===
-        self.norm = nn.LayerNorm(hidden_dim * self.num_directions)
+        enc_dim = hidden_dim * self.num_directions
+        self.norm = nn.LayerNorm(enc_dim)
 
-        in_dim = hidden_dim * self.num_directions
+        self.rep_proj = nn.Linear(enc_dim, rep_dim)
+        self.rep_norm = nn.LayerNorm(rep_dim)
+
         self.classifier = SharedClassifierHead(
-            in_dim=in_dim,
-            base_hidden=hidden_dim,
+            in_dim=rep_dim,
+            base_hidden=head_hidden,
             out_channels=out_channels,
             dropout=dropout
         )
@@ -48,7 +53,10 @@ class GRUClassifier(nn.Module):
         output, _ = self.gru(x)
         last_hidden = output[:, -1, :]
         last_hidden = self.norm(last_hidden)
-        logits = self.classifier(last_hidden)
+
+        rep = self.rep_norm(self.rep_proj(last_hidden))
+        logits = self.classifier(rep)
+        
         return logits
 
     def _init_weights(self):
