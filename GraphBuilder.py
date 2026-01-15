@@ -259,18 +259,89 @@ class GraphBuilder:
 
         return self.tickers, coords, combined_edges, mst_edges
         """
-    
-    def buildNetworkX(self, tickers: List[str], coords: np.ndarray, edges: List[Tuple[int, int, float]]) -> nx.Graph:
-        # ====================================
-		# === Helper to build graph
+        
+    def buildNetworkX(self, tickers, coords, edges):
         G = nx.Graph()
         for i, t in enumerate(tickers):
             sector = self.ticker_to_sector.get(t, "Unknown")
-            G.add_node(t, pos=tuple(coords[i]))
+            G.add_node(t, pos=tuple(coords[i]), sector=sector)  # <-- store sector
         for i, j, w in edges:
             G.add_edge(tickers[i], tickers[j], weight=round(w, 2))
         return G
-    
+
+    def sector_homophily_from_edges(
+        self,
+        tickers: List[str],
+        edges: List[Tuple[int, int, float]],
+        ignore_unknown: bool = True,
+        ignore_self_loops: bool = True,
+    ) -> float:
+        """
+        Fraction of (undirected) edges whose endpoints share the same sector.
+        Computed post-hoc; not used in training.
+
+        edges: list of (i, j, w) with i/j indexing into tickers.
+        """
+        if not edges:
+            return float("nan")
+
+        # dedupe undirected edges
+        undirected = set()
+        for i, j, _ in edges:
+            a, b = (i, j) if i <= j else (j, i)
+            undirected.add((a, b))
+
+        same = 0
+        total = 0
+        for i, j in undirected:
+            if ignore_self_loops and i == j:
+                continue
+            si = self.ticker_to_sector.get(tickers[i], "Unknown")
+            sj = self.ticker_to_sector.get(tickers[j], "Unknown")
+            if ignore_unknown and ("Unknown" in (si, sj) or si is None or sj is None):
+                continue
+            total += 1
+            if si == sj:
+                same += 1
+
+        return (same / total) if total > 0 else float("nan")
+
+    def sector_homophily_from_edge_index(
+        self,
+        tickers: List[str],
+        edge_index: torch.Tensor,
+        ignore_unknown: bool = True,
+        ignore_self_loops: bool = True,
+    ) -> float:
+        """
+        Same as above, but computed from a PyG edge_index (2 x E).
+        Treats edges as undirected by canonicalizing (min,max).
+        """
+        if edge_index is None or edge_index.numel() == 0:
+            return float("nan")
+
+        edges = set()
+        ei = edge_index.detach().cpu()
+        for src, dst in ei.t().tolist():
+            a, b = (src, dst) if src <= dst else (dst, src)
+            edges.add((a, b))
+
+        same = 0
+        total = 0
+        for i, j in edges:
+            if ignore_self_loops and i == j:
+                continue
+            si = self.ticker_to_sector.get(tickers[i], "Unknown")
+            sj = self.ticker_to_sector.get(tickers[j], "Unknown")
+            if ignore_unknown and ("Unknown" in (si, sj) or si is None or sj is None):
+                continue
+            total += 1
+            if si == sj:
+                same += 1
+
+        return (same / total) if total > 0 else float("nan")
+
+
     def build_edge_weight_tensor(self, edge_index: torch.Tensor) -> torch.Tensor:
         # ====================================
 		# === Helper to build tensor from edge weights

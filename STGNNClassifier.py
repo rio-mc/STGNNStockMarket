@@ -183,7 +183,8 @@ class STGNNClassifier(nn.Module):
             edge_index = self.edge_index
 
         # 3. Node-wise sequences: [B*N, T, F]
-        h = x.permute(0, 1, 3, 2).reshape(B * N, T, F_in)
+        # x is [B, N, T, F] -> flatten nodes without mixing time/features
+        h = x.contiguous().view(B * N, T, F_in)
 
         # 4. ST blocks (+ residual if shapes match)
         for block in self.blocks:
@@ -230,7 +231,9 @@ class STGNNClassifier(nn.Module):
         self.eval()
         with torch.no_grad():
             B, N, T, F_in = x.shape
-            h = x.permute(0, 1, 3, 2).reshape(B * N, T, F_in)
+            # x is [B, N, T, F] -> flatten nodes without mixing time/features
+            h = x.contiguous().view(B * N, T, F_in)
+
             for block in self.blocks:
                 h = block(h, edge_index, edge_attr)
             h_final = h.mean(dim=1).view(B, N, self.gcn_hidden)

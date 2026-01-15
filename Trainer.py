@@ -69,10 +69,7 @@ class Trainer:
         self.total_energy_Wh = 0.0 
         self.total_train_seconds = 0.0
         self.avg_power_W = 0.0
-
-        if self.weight_decay and self.weight_decay > 0:
-            self._apply_weight_decay(self.weight_decay, exclude_norm_bias=True)
-
+        
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimiser,
             factor=0.5,
@@ -382,8 +379,12 @@ class Trainer:
 
     def _finalise_energy_monitoring(self):
         # ====================================
-		# === Helper to terminate energy tracking
-        nvmlShutdown()
+        # === Helper to terminate energy tracking
+        try:
+            if getattr(self, 'handle', None) is not None:
+                nvmlShutdown()
+        except Exception:
+            pass
 
     def _clip_grads(self):
         """Clip parameter gradients by global norm; return unclipped total norm."""

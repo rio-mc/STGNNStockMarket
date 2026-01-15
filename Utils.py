@@ -5,6 +5,7 @@ import torch
 import networkx as nx
 from pympler import asizeof
 import pandas as pd
+from torch.optim import AdamW
 
 class Utils:
 
@@ -192,3 +193,27 @@ class Utils:
             str(row["ticker"]).upper(): str(row["sector"])
             for _, row in df.iterrows()
         }
+    
+    def make_adamw(model, lr, weight_decay):
+        """
+        Paper-defensible optimiser:
+        - AdamW (decoupled weight decay)
+        - exclude bias and norm parameters from weight decay (common practice)
+        """
+        decay, no_decay = [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            n = name.lower()
+            if n.endswith("bias") or "norm" in n or "layernorm" in n:
+                no_decay.append(p)
+            else:
+                decay.append(p)
+
+        param_groups = []
+        if decay:
+            param_groups.append({"params": decay, "weight_decay": float(weight_decay)})
+        if no_decay:
+            param_groups.append({"params": no_decay, "weight_decay": 0.0})
+
+        return AdamW(param_groups, lr=float(lr))

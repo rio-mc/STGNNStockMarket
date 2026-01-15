@@ -5,7 +5,6 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.nn import BCEWithLogitsLoss
-from torch.optim import Adam
 import logging
 import time
 import gc    
@@ -48,6 +47,8 @@ class MainApp:
         self.args.base_seed = getattr(self.args, "base_seed", 42)
         self.args.deterministic = getattr(self.args, "deterministic", False)
         Utils.set_seed(self.args.base_seed, deterministic=self.args.deterministic)
+
+        self.graph_homophily = float("nan")
 
         self.pipeline_running = False
         self.data_ready = threading.Event()
@@ -130,7 +131,7 @@ class MainApp:
         # === STEP 5: Run loading on new thread for performance ===
         # ------------------------------------
         threading.Thread(target=background_task).start()
-
+    
     def startPipeline(self, gui_window: str, stock: str, stop_event: threading.Event):
         self.logger.info(f"[Env] Python={platform.python_version()}")
         self.logger.info(f"[Env] PyTorch={torch.__version__}")
@@ -258,10 +259,16 @@ class MainApp:
             min_train_len = min(len(df) for df in train_feats.values())
             min_val_len   = min(len(df) for df in val_feats.values())
 
+            # === Align time windows across ALL models ===
+            # Truncate every ticker to the same contiguous window within each split.
+            # Use the tail so the window ends at the split boundary (most recent info).
+            train_feats = {t: df.iloc[-min_train_len:].copy() for t, df in train_feats.items()}
+            val_feats   = {t: df.iloc[-min_val_len:].copy()   for t, df in val_feats.items()}
+
             #   4. Set single stock features for LSTM
             train_df_stock = train_feats[stock].iloc[-min_train_len:]
             val_df_stock   = val_feats[stock].iloc[-min_val_len:]
-            
+
             #   5. Check stop_event
             self._check_stop(stop_event)
 
@@ -317,45 +324,67 @@ class MainApp:
                 mst_edges=mst_for_plot
             ))
 
-            # --- Build edge_index for PyG from pruned edges, then apply ablation to MODEL graph ---
+            # --- Build edge_index for PyG from pruned edges ---
             edge_index = torch.tensor(
                 [(i, j) for i, j, _ in pruned],
                 dtype=torch.long
             ).t().contiguous()
 
+            # IMPORTANT: use the SAME node count as the graph builder output
+            mode = getattr(self.args, "graph_ablation", "none")
+            num_nodes = len(tickers)
+
+            # Make edge_index undirected for PyG message passing (cosine similarity is symmetric)
+            if edge_index.numel() > 0:
+                rev = edge_index[[1, 0], :]
+                edge_index = torch.cat([edge_index, rev], dim=1)
+
+                # Dedupe + stable sort by (src, dst)
+                key = edge_index[0] * num_nodes + edge_index[1]
+                uniq = torch.unique(key, sorted=True)
+                edge_index = torch.stack([uniq // num_nodes, uniq % num_nodes], dim=0)
+
+            # Apply optional graph ablation (none / identity / empty) ONCE, after finalisation
             edge_index = Utils.apply_graph_ablation(edge_index, num_nodes=num_nodes, mode=mode)
 
-            # Optional: sanity log (highly recommended)
+            # Optional: sanity log (now truthful for identity/empty)
             self.logger.info(
                 f"[AblationCheck] mode={mode} | V={num_nodes} | E={edge_index.size(1)} | "
-                f"self_loops={(edge_index.size(1) > 0 and (edge_index[0] == edge_index[1]).all().item())}"
+                f"all_self_loops={(edge_index.size(1) > 0 and (edge_index[0] == edge_index[1]).all().item())}"
             )
 
-
-            #   5. Apply optional graph ablation (none / identity / empty)
             requested_k = self.get_max_k()
             effective_k = getattr(graph_builder, "effective_k", requested_k)
 
-            mode = getattr(self.args, "graph_ablation", "none")
-            num_nodes = len(self.args.tickers)
-
-            # --- apply ablation here ---
-            edge_index = Utils.apply_graph_ablation(edge_index, num_nodes=num_nodes, mode=mode)
-
-            # freeze this graph for datasets/training
+            # Freeze this graph for datasets/training
             self.init_edge_index = edge_index.clone()
             self.graphBuilder.edge_index = self.init_edge_index
 
-            # log AFTER ablation
+            # --- Post-hoc graph interpretability metric (NOT used in training) ---
+            try:
+                self.graph_homophily = graph_builder.sector_homophily_from_edge_index(
+                    tickers=tickers,
+                    edge_index=self.init_edge_index,
+                    ignore_unknown=True,
+                    ignore_self_loops=True,
+                )
+                self.logger.info(
+                    f"[Graph] sector_homophily={self.graph_homophily:.4f} "
+                    "(ignore_unknown=True, ignore_self_loops=True)"
+                )
+            except Exception as e:
+                self.logger.warning(f"[Graph] homophily computation failed: {e}")
+                self.graph_homophily = float("nan")
+
+            # Log AFTER ablation
             num_edges = edge_index.size(1)
-            possible_undirected = num_nodes * (num_nodes - 1) / 2
-            graph_density = (num_edges / possible_undirected) if possible_undirected > 0 else 0.0
+            possible_directed_no_self = num_nodes * (num_nodes - 1)
+            graph_density = (num_edges / possible_directed_no_self) if possible_directed_no_self > 0 else 0.0
 
             self.logger.info(
                 f"[Graph] ablation={mode} requested_k={requested_k} effective_k={effective_k} "
                 f"|V|={num_nodes} |E|={num_edges} density={graph_density:.6f}"
             )
-
 
             #   6. Track memory of graph components
             Utils.log_graph_memory(G, coords3d, edge_index, tag="Initial")
@@ -442,7 +471,7 @@ class MainApp:
             #   5. Build LSTM trainer
             trainer_lstm = Trainer(
                 lstm_model,
-                Adam(lstm_model.parameters(), lr=self.args.lstm_lr),
+                Utils.make_adamw(lstm_model, lr=self.args.lstm_lr, weight_decay=self.args.weight_decay),
                 BCEWithLogitsLoss(),
                 self.device,
                 graphBuilder=None,
@@ -484,6 +513,10 @@ class MainApp:
             #   1. Perform post-training evaluation
             trainer_lstm.prediction_horizon = self.horizon
             eval_result_lstm = trainer_lstm.evaluate_rolling(lstm_val_ds)
+
+            # Post-hoc calibration for fair comparison (doesn't change predicted class at 0.5)
+            if hasattr(lstm_model, "classifier") and hasattr(lstm_model.classifier, "set_temperature"):
+                lstm_model.classifier.set_temperature(self.args.head_temperature)
 
             #   2. Update front-end
             metrics_lstm = evaluator.evaluate(
@@ -554,7 +587,7 @@ class MainApp:
             g_start = time.time()
             trainer_gru = Trainer(
                 gru_model,
-                Adam(gru_model.parameters(), lr=self.args.lstm_lr),
+                Utils.make_adamw(gru_model, lr=self.args.lstm_lr, weight_decay=self.args.weight_decay),
                 BCEWithLogitsLoss(),
                 self.device,
                 graphBuilder=None,
@@ -584,6 +617,9 @@ class MainApp:
             self.frontendApp.set_status("Evaluating GRU...")
 
             eval_result_gru = trainer_gru.evaluate_rolling(lstm_val_ds)
+
+            if hasattr(gru_model, "classifier") and hasattr(gru_model.classifier, "set_temperature"):
+                gru_model.classifier.set_temperature(self.args.head_temperature)
 
             metrics_gru = evaluator.evaluate(
                 "GRU", 
@@ -699,7 +735,7 @@ class MainApp:
             #   5. Initialise STGNN model
             trainer_stgnn = Trainer(
                 stgnn_model,
-                Adam(stgnn_model.parameters(), lr=self.args.stgnn_lr),
+                Utils.make_adamw(stgnn_model, lr=self.args.stgnn_lr, weight_decay=self.args.weight_decay),
                 BCEWithLogitsLoss(),
                 self.device,
                 self.graphBuilder,
@@ -799,21 +835,23 @@ class MainApp:
                 ))
 
                 # 4. Update model and trainer with new graph, THEN re-apply ablation
-                edge_index_new = torch.tensor(
-                    [(i, j) for i, j, _ in pruned_new],
-                    dtype=torch.long
-                ).t().contiguous()
-
+                edge_index_new = torch.tensor([(i, j) for i, j, _ in pruned_new], dtype=torch.long).t().contiguous()
                 num_nodes_new = len(tickers_new)
+                mode = getattr(self.args, "graph_ablation", "none")
+
+                # Make undirected + dedupe
+                if edge_index_new.numel() > 0:
+                    rev = edge_index_new[[1, 0], :]
+                    edge_index_new = torch.cat([edge_index_new, rev], dim=1)
+
+                    key = edge_index_new[0] * num_nodes_new + edge_index_new[1]
+                    uniq = torch.unique(key, sorted=True)
+                    edge_index_new = torch.stack([uniq // num_nodes_new, uniq % num_nodes_new], dim=0)
+
+                # Apply ablation ONCE
                 edge_index_new = Utils.apply_graph_ablation(edge_index_new, num_nodes=num_nodes_new, mode=mode)
 
-                # (Optional) memory logging (now uses the updated edge_index_new)
-                try:
-                    Utils.log_graph_memory(G, coords3d, edge_index_new, tag="Post-training")
-                except Exception as e:
-                    self.logger.warning(f"[GraphMemory] Skipped due to error: {e}")
-
-                # Keep init_edge_index and trainer/model in sync
+                # Sync
                 self.init_edge_index = edge_index_new.clone()
                 trainer_stgnn.edge_index = edge_index_new.clone()
                 trainer_stgnn.model.edge_index = edge_index_new
@@ -832,6 +870,9 @@ class MainApp:
             #   1. Perform post-training evaluation
             trainer_stgnn.prediction_horizon = self.horizon
             eval_result_stgnn = trainer_stgnn.evaluate_rolling(stgnn_val_ds)
+            
+            if hasattr(stgnn_model, "classifier") and hasattr(stgnn_model.classifier, "set_temperature"):
+                stgnn_model.classifier.set_temperature(self.args.head_temperature)
 
             #   2. Update front-end
             metrics_stgnn = evaluator.evaluate(
@@ -949,6 +990,7 @@ class MainApp:
                         "model": "STGNN",
                         "graph_ablation": getattr(self.args, "graph_ablation", "none"),
                         "num_edges": int(self.init_edge_index.size(1)),
+                        "graph_homophily": float(getattr(self, "graph_homophily", float("nan"))),  # <-- ADD THIS
                     },
                 ])
 
@@ -1161,7 +1203,7 @@ class MainApp:
                             "ticker": stock,
                             "rewiring": rewire,
                             "graph_ablation": graph_abl,
-                            "ablated": ablated,                 # NEW
+                            "ablated": ablated,
                             "graph_embed": getattr(self.args, "graph_embed", None),
                             "ablate_feature": getattr(self.args, "ablate_feature", None),
                             "max_k": k,
@@ -1220,13 +1262,17 @@ class MainApp:
                                 mean_row[col] = gdf[col].iloc[0]
                         if "num_edges" in gdf.columns:
                             mean_row["num_edges"] = int(gdf["num_edges"].iloc[0])
+                        if "graph_homophily" in gdf.columns:
+                            # take first non-nan if possible (graph is fixed per config)
+                            gh = gdf["graph_homophily"].dropna()
+                            mean_row["graph_homophily"] = float(gh.iloc[0]) if len(gh) else float("nan")
 
                         all_results.append(mean_row.to_dict())
 
                         # std row (sample std)
                         std_series = gdf[numeric_cols].std(numeric_only=True, ddof=1)
                         std_row = std_series.copy()
-                        std_row["ticker"] = stock
+                        std_row["ticker"] = stock 
                         std_row["rewiring"] = rewire
                         std_row["graph_ablation"] = graph_abl
                         std_row["ablated"] = ablated                  # NEW

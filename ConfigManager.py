@@ -87,12 +87,14 @@ class ConfigManager:
         # ====================================
         # === Generic Training
         parser.add_argument("--batch_size", type=int, default=256, help="Mini-batch size for training")
-        parser.add_argument("--dropout", type=float, default=0.15, help="Dropout rate")
+        parser.add_argument("--dropout", type=float, default=0.2, help="Dropout rate")
         epoch_count = 50
         lr = 1e-4
+        parser.add_argument("--head_temperature", type=float, default=1.0,
+                            help="Post-hoc logit temperature (T>1 softens probabilities). Keep 1.0 for raw.")
 
         # === Regularisation
-        parser.add_argument("--weight_decay", type=float, default=1e-4,
+        parser.add_argument("--weight_decay", type=float, default=1e-5,
                             help="Global L2 weight decay")
         
         # ====================================
@@ -104,7 +106,7 @@ class ConfigManager:
 
         # ====================================
         # === LSTM Architecture
-        parser.add_argument("--lstm_hidden", type=int, default=16, help="Hidden dimension of LSTM layers")
+        parser.add_argument("--lstm_hidden", type=int, default=12, help="Hidden dimension of LSTM layers")
         parser.add_argument("--lstm_layers", type=int, default=2, help="Number of LSTM layers")
         parser.add_argument("--bidirectional", action="store_true", help="Use bidirectional LSTM")
 
@@ -118,9 +120,9 @@ class ConfigManager:
         # ====================================
         # === STGNN Architecture
         parser.add_argument("--stgnn_blocks", type=int, default=2, help="Number of ST Blocks")
-        parser.add_argument("--tcn_channels", type=int, default=16, help="Channels in TCN layer")
+        parser.add_argument("--tcn_channels", type=int, default=12, help="Channels in TCN layer")
         parser.add_argument("--tcn_kernel_size", type=int, default=2, help="Kernel size in TCN layer")
-        parser.add_argument("--gcn_hidden", type=int, default=16, help="Hidden dimension in GCN")
+        parser.add_argument("--gcn_hidden", type=int, default=12, help="Hidden dimension in GCN")
         
         # ====================================
         # === Feature Ablations
