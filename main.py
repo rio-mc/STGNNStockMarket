@@ -12,6 +12,7 @@ from torch_geometric.loader import DataLoader as GeoDataLoader
 import os
 import itertools
 import platform
+from datetime import datetime, timezone
 
 # cuBLAS determinism (PyTorch will raise without this when deterministic=True on CUDA >= 10.2)
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -410,8 +411,6 @@ class MainApp:
             #   10. Check stop_event
             self._check_stop(stop_event)
 
-            wd = self.args.weight_decay
-
             # === MISC: per-run seeded DataLoader ===
             dl_gen = torch.Generator(device="cpu")
             # self.current_seed was set by self._set_all_seeds(run_seed) in run_experiments()
@@ -435,6 +434,7 @@ class MainApp:
                 stock,
                 self.horizon
             )
+            gru_train_ds = lstm_train_ds
 
             dl_lstm_train = torch.utils.data.DataLoader(
                 lstm_train_ds,
@@ -452,6 +452,8 @@ class MainApp:
                 stock,
                 self.horizon
             )
+
+            gru_val_ds = lstm_val_ds
 
             #   4. Initialise LSTM model
             lstm_model = LSTMClassifier(
@@ -562,6 +564,7 @@ class MainApp:
             # ------------------------------------
             del lstm_model
             del dl_lstm_train
+            del lstm_train_ds, lstm_val_ds
             torch.cuda.empty_cache()  # Clears unused cached memory
             gc.collect()              # Force Python garbage collection
             if torch.cuda.is_available():
@@ -616,7 +619,7 @@ class MainApp:
             self._check_stop(stop_event)
             self.frontendApp.set_status("Evaluating GRU...")
 
-            eval_result_gru = trainer_gru.evaluate_rolling(lstm_val_ds)
+            eval_result_gru = trainer_gru.evaluate_rolling(gru_val_ds)
 
             if hasattr(gru_model, "classifier") and hasattr(gru_model.classifier, "set_temperature"):
                 gru_model.classifier.set_temperature(self.args.head_temperature)
@@ -659,6 +662,7 @@ class MainApp:
             # ------------------------------------
             del gru_model
             del dl_gru_train
+            del gru_train_ds, gru_val_ds
             torch.cuda.empty_cache()  # Clears unused cached memory
             gc.collect()              # Force Python garbage collection
             if torch.cuda.is_available():
@@ -924,81 +928,163 @@ class MainApp:
                     dir_s_str = "Downwards"
                     conf_s = (1.0 - prob_s) * 100.0
 
-		    # === STEP 19: Final front-end update ===
+            # === STEP 19: Final front-end update ===
             # ------------------------------------
             self.frontendApp.set_status("Predictions completed.")
 
-            #   1. Update frontend with both models' outputs
-            if self.frontendApp:
-                self.frontendApp.root.after(0, lambda: self.frontendApp.updateResults(
-                    f"{dir_l} (Next {horizon//bars_per_day}d)", conf_l,
-                    f"{dir_g} (Next {horizon//bars_per_day}d)", conf_g,
-                    f"{dir_s_str} (Next {horizon//bars_per_day}d)", conf_s
-                ))
+            #   1. Update frontend with all models' outputs
+            self.frontendApp.root.after(
+                0,
+                self.frontendApp.updateResults,
+                f"{dir_l} (Next {horizon//bars_per_day}d)", conf_l,
+                f"{dir_g} (Next {horizon//bars_per_day}d)", conf_g,
+                f"{dir_s_str} (Next {horizon//bars_per_day}d)", conf_s,
+            )
 
             #   2. Refresh tabs for visibility
             self.frontendApp.root.after(0, lambda: self.frontendApp.refresh_selected_tabs())
 
             #   3. Establish pipeline completion
             self.pipeline_running = False
-            
+
+            # Garbage collection before logging
+            del stgnn_model
+            del dl_stgnn_train
+            del stgnn_train_ds, stgnn_val_ds
+            torch.cuda.empty_cache()  # Clears unused cached memory
+            gc.collect()              # Force Python garbage collection
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+
             # === STEP 20: Log results for auto-test ===
             # ------------------------------------
-            if getattr(app.args, "save_results", True):
+            if getattr(self.args, "save_results", True):
                 self.results_log = getattr(self, "results_log", [])
-                self.results_log.extend([
-                    {
-                        **metrics_lstm,
-                        "ticker": stock,
-                        "horizon": gui_window,
-                        "seed": self.current_seed,
-                        "energy_Wh": lstm_energy_Wh,
-                        "train_seconds": lstm_train_secs,
-                        "avg_power_W": lstm_avg_power_W,
-                        "energy_per_sample_Wh": lstm_energy_per_sample_Wh,
-                        "energy_epochs_Wh": lstm_energy_epochs_Wh,
-                        "energy_per_sample_epochs_Wh": lstm_energy_per_sample_epochs_Wh,
-                        "samples_per_epoch": lstm_samples_per_epoch,
-                        "model": "LSTM",
-                    },
-                    {
-                        **metrics_gru,
-                        "ticker": stock,
-                        "horizon": gui_window,
-                        "seed": self.current_seed,
-                        "energy_Wh": gru_energy_Wh,
-                        "train_seconds": gru_train_secs,
-                        "avg_power_W": gru_avg_power_W,
-                        "energy_per_sample_Wh": gru_energy_per_sample_Wh,
-                        "energy_epochs_Wh": gru_energy_epochs_Wh,
-                        "energy_per_sample_epochs_Wh": gru_energy_per_sample_epochs_Wh,
-                        "samples_per_epoch": gru_samples_per_epoch,
-                        "model": "GRU",
-                    },
-                    {
-                        **metrics_stgnn,
-                        "ticker": stock,
-                        "horizon": gui_window,
-                        "seed": self.current_seed,
-                        "energy_Wh": stgnn_energy_Wh,
-                        "train_seconds": stgnn_train_secs,
-                        "avg_power_W": stgnn_avg_power_W,
-                        "energy_per_sample_Wh": stgnn_energy_per_sample_Wh,
-                        "energy_epochs_Wh": stgnn_energy_epochs_Wh,
-                        "energy_per_sample_epochs_Wh": stgnn_energy_per_sample_epochs_Wh,
-                        "samples_per_epoch": stgnn_samples_per_epoch,
-                        "model": "STGNN",
-                        "graph_ablation": getattr(self.args, "graph_ablation", "none"),
-                        "num_edges": int(self.init_edge_index.size(1)),
-                        "graph_homophily": float(getattr(self, "graph_homophily", float("nan"))),  # <-- ADD THIS
-                    },
-                ])
+
+            # Timestamp metadata for later validation
+            pred_made_at_utc = datetime.now(timezone.utc).isoformat()
+            bar_interval = str(getattr(self.args, "interval", "1h"))
+            horizon_bars = int(self.horizon) if getattr(self, "horizon", None) is not None else None
+
+            # Use the last timestamp that fed the prediction features.
+            # This should exist if val_df_stock is built; keep defensive fallback anyway.
+            try:
+                features_end_ts = pd.Timestamp(val_feats[stock].index[-1]).isoformat()
+            except Exception:
+                features_end_ts = None
+
+            # Defensive defaults (avoid None leaking into CSV)
+            dir_l_safe = dir_l if dir_l is not None else "-"
+            dir_g_safe = dir_g if dir_g is not None else "-"
+            dir_s_safe = dir_s_str if dir_s_str is not None else "-"
+
+            def _mk_row(
+                *,
+                metrics: dict | None,
+                model: str,
+                direction: str,
+                confidence_pct: float | None,
+                raw_score: float | None,
+                decision_threshold: float | None,
+                energy_Wh: float | None,
+                energy_per_sample_Wh: float | None,
+                train_seconds: float | None,
+                avg_power_W: float | None,
+                graph_ablation: str | None = None,
+                num_edges: int | None = None,
+                graph_homophily: float | None = None,
+            ) -> dict:
+                row = {
+                    **(metrics or {}),
+
+                    "ticker": stock,
+                    "model": model,
+                    "horizon": gui_window,
+                    "seed": int(self.current_seed) if self.current_seed is not None else None,
+
+                    "direction": direction,
+                    "confidence_pct": float(confidence_pct) if confidence_pct is not None else None,
+
+                    "raw_score": float(raw_score) if raw_score is not None else None,
+                    "decision_threshold": float(decision_threshold) if decision_threshold is not None else None,
+
+                    "pred_made_at_utc": pred_made_at_utc,
+                    "features_end_ts": features_end_ts,
+                    "horizon_bars": horizon_bars,
+                    "bar_interval": bar_interval,
+
+                    "energy_Wh": float(energy_Wh) if energy_Wh is not None else None,
+                    "energy_per_sample_Wh": float(energy_per_sample_Wh) if energy_per_sample_Wh is not None else None,
+                    "train_seconds": float(train_seconds) if train_seconds is not None else None,
+                    "avg_power_W": float(avg_power_W) if avg_power_W is not None else None,
+                }
+
+                if graph_ablation is not None:
+                    row["graph_ablation"] = graph_ablation
+                if num_edges is not None:
+                    row["num_edges"] = int(num_edges)
+                if graph_homophily is not None:
+                    row["graph_homophily"] = float(graph_homophily)
+
+                return row
+
+            self.results_log.extend([
+                _mk_row(
+                    metrics=metrics_lstm,
+                    model="LSTM",
+                    direction=dir_l_safe,
+                    confidence_pct=conf_l,
+                    raw_score=prob_l,
+                    decision_threshold=thr_l,
+                    energy_Wh=lstm_energy_Wh,
+                    energy_per_sample_Wh=lstm_energy_per_sample_Wh,
+                    train_seconds=lstm_train_secs,
+                    avg_power_W=lstm_avg_power_W,
+                ),
+                _mk_row(
+                    metrics=metrics_gru,
+                    model="GRU",
+                    direction=dir_g_safe,
+                    confidence_pct=conf_g,
+                    raw_score=prob_g,
+                    decision_threshold=thr_g,
+                    energy_Wh=gru_energy_Wh,
+                    energy_per_sample_Wh=gru_energy_per_sample_Wh,
+                    train_seconds=gru_train_secs,
+                    avg_power_W=gru_avg_power_W,
+                ),
+                _mk_row(
+                    metrics=metrics_stgnn,
+                    model="STGNN",
+                    direction=dir_s_safe,
+                    confidence_pct=conf_s,
+                    raw_score=prob_s,
+                    decision_threshold=thr_s,
+                    energy_Wh=stgnn_energy_Wh,
+                    energy_per_sample_Wh=stgnn_energy_per_sample_Wh,
+                    train_seconds=stgnn_train_secs,
+                    avg_power_W=stgnn_avg_power_W,
+                    graph_ablation=getattr(self.args, "graph_ablation", "none"),
+                    num_edges=int(self.init_edge_index.size(1)) if getattr(self, "init_edge_index", None) is not None else None,
+                    graph_homophily=float(getattr(self, "graph_homophily", float("nan"))),
+                ),
+            ])
+
+
+            if hasattr(self, "graphBuilder"):
+                del self.graphBuilder
+                self.graphBuilder = None
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             return (
                 f"{dir_l} (Next {horizon//bars_per_day}d)", conf_l,
                 f"{dir_g} (Next {horizon//bars_per_day}d)", conf_g,
                 f"{dir_s_str} (Next {horizon//bars_per_day}d)", conf_s
             ) if all(v is not None for v in [dir_l, dir_g, dir_s_str]) else ("—", 0.0, "—", 0.0, "—", 0.0)
+
             
         except InterruptedError:
             # ====================================
@@ -1090,11 +1176,11 @@ class MainApp:
         # feature means: remove exactly that engineered feature everywhere -> ablate_feature=<feature>
         ablated_options = ["none", "pca", "return", "volatility", "momentum"]
 
-        max_k_values = [1, 2, 4, 8]  # sparsity sweep; adjust as needed
-        seq_len_values = [2]
+        max_k_values = [5]  # sparsity sweep; adjust as needed
+        seq_len_values = [5]
 
         # Multi-seed controls (repetitions == number of seeds)
-        num_seeds = int(getattr(self.args, "num_seeds", 2))
+        num_seeds = int(getattr(self.args, "num_seeds", 1))
         explicit_seeds = getattr(self.args, "seeds", None)
 
         param_grid = list(itertools.product(
@@ -1103,8 +1189,10 @@ class MainApp:
 
         os.makedirs(self.args.results_dir, exist_ok=True)
         all_results = []
+        config_id = 0
 
         for (rewire, graph_abl, ablated, k, seq_len) in param_grid:
+            config_id += 1
             exp_name = (
                 f"{self.args.experiment_name}"
                 f"_rewire-{int(rewire)}"
@@ -1113,7 +1201,12 @@ class MainApp:
                 f"_k-{k}"
                 f"_seq-{seq_len}"
             )
-            csv_path = os.path.join(self.args.results_dir, f"{exp_name}.csv")
+            results_csv = os.path.join(
+                self.args.results_dir,
+                f"{self.args.experiment_name}.csv"
+            )
+
+
             self.logger.info(
                 f"[AutoTest] Starting config: rewiring={rewire}, graph_ablation={graph_abl}, "
                 f"ablated={ablated}, max_k={k}, seq_len={seq_len}"
@@ -1183,17 +1276,18 @@ class MainApp:
                         # Stamp metadata including the seed used
                         for entry in self.results_log:
                             entry.update({
-                                "rewiring": rewire,
-                                "graph_ablation": graph_abl,
-                                "ablated": ablated,                 # NEW CSV COLUMN
-                                "graph_embed": self.args.graph_embed,  # optional but helpful
-                                "ablate_feature": self.args.ablate_feature,  # optional but helpful
-                                "max_k": k,
-                                "seq_len": seq_len,
+                                "config_id": config_id,
                                 "ticker": stock,
                                 "runtime_sec": round(time.time() - start_time, 2),
                                 "rep": rep + 1,
                                 "seed": self.current_seed,
+                                "rewiring": rewire,
+                                "graph_ablation": graph_abl,
+                                "ablated": ablated,
+                                "graph_embed": self.args.graph_embed,  # optional but helpful
+                                "ablate_feature": self.args.ablate_feature,  # optional but helpful
+                                "max_k": k,
+                                "seq_len": seq_len,
                             })
                             stock_results.append(entry)
 
@@ -1223,10 +1317,17 @@ class MainApp:
                 if stock_results:
                     df = pd.DataFrame(stock_results)
 
-                    # keep raw rows
-                    write_header = (not os.path.exists(csv_path)) or os.path.getsize(csv_path) == 0
-                    df.to_csv(csv_path, mode="a", header=write_header, index=False)
-                    self.logger.info(f"[AutoTest] Appended {len(df)} entries for {stock} → {csv_path}")
+                    write_header = not os.path.exists(results_csv)
+                    df.to_csv(
+                        results_csv,
+                        mode="a",
+                        header=write_header,
+                        index=False
+                    )
+
+                    self.logger.info(
+                        f"[AutoTest] Appended {len(df)} rows → {results_csv}"
+                    )
 
                     # ---- compute mean and std summary rows across seeds (PER MODEL) ----
                     numeric_cols = df.select_dtypes(include="number").columns
@@ -1244,12 +1345,13 @@ class MainApp:
                         mean_row["ticker"] = stock
                         mean_row["rewiring"] = rewire
                         mean_row["graph_ablation"] = graph_abl
-                        mean_row["ablated"] = ablated                 # NEW
+                        mean_row["ablated"] = ablated
                         mean_row["graph_embed"] = getattr(self.args, "graph_embed", None)
                         mean_row["ablate_feature"] = getattr(self.args, "ablate_feature", None)
                         mean_row["max_k"] = k
                         mean_row["seq_len"] = seq_len
                         mean_row["rep"] = "mean"
+
                         if model_key is not None:
                             if "model" in df.columns:
                                 mean_row["model"] = model_key
@@ -1259,28 +1361,34 @@ class MainApp:
                         # carry identifiers that should not be averaged
                         for col in ["model_name", "model", "params"]:
                             if col in gdf.columns:
-                                mean_row[col] = gdf[col].iloc[0]
+                                first = gdf[col].dropna()
+                                mean_row[col] = first.iloc[0] if len(first) else None
+
+                        # num_edges: keep first non-null if present
                         if "num_edges" in gdf.columns:
-                            mean_row["num_edges"] = int(gdf["num_edges"].iloc[0])
+                            ne = gdf["num_edges"].dropna()
+                            mean_row["num_edges"] = int(ne.iloc[0]) if len(ne) else np.nan
+
+                        # graph_homophily: keep first non-null if present
                         if "graph_homophily" in gdf.columns:
-                            # take first non-nan if possible (graph is fixed per config)
                             gh = gdf["graph_homophily"].dropna()
-                            mean_row["graph_homophily"] = float(gh.iloc[0]) if len(gh) else float("nan")
+                            mean_row["graph_homophily"] = float(gh.iloc[0]) if len(gh) else np.nan
 
                         all_results.append(mean_row.to_dict())
 
                         # std row (sample std)
                         std_series = gdf[numeric_cols].std(numeric_only=True, ddof=1)
                         std_row = std_series.copy()
-                        std_row["ticker"] = stock 
+                        std_row["ticker"] = stock
                         std_row["rewiring"] = rewire
                         std_row["graph_ablation"] = graph_abl
-                        std_row["ablated"] = ablated                  # NEW
+                        std_row["ablated"] = ablated
                         std_row["graph_embed"] = getattr(self.args, "graph_embed", None)
                         std_row["ablate_feature"] = getattr(self.args, "ablate_feature", None)
                         std_row["max_k"] = k
                         std_row["seq_len"] = seq_len
                         std_row["rep"] = "std"
+
                         if model_key is not None:
                             if "model" in df.columns:
                                 std_row["model"] = model_key
@@ -1289,11 +1397,21 @@ class MainApp:
 
                         for col in ["model_name", "model", "params"]:
                             if col in gdf.columns:
-                                std_row[col] = gdf[col].iloc[0]
+                                first = gdf[col].dropna()
+                                std_row[col] = first.iloc[0] if len(first) else None
+
+                        # num_edges for std row: same safe logic
                         if "num_edges" in gdf.columns:
-                            std_row["num_edges"] = int(gdf["num_edges"].iloc[0])
+                            ne = gdf["num_edges"].dropna()
+                            std_row["num_edges"] = int(ne.iloc[0]) if len(ne) else np.nan
+
+                        # graph_homophily for std row: same safe logic (optional but consistent)
+                        if "graph_homophily" in gdf.columns:
+                            gh = gdf["graph_homophily"].dropna()
+                            std_row["graph_homophily"] = float(gh.iloc[0]) if len(gh) else np.nan
 
                         all_results.append(std_row.to_dict())
+
 
         # ---- append (or create) summary CSV ----
         summary_path = os.path.join(self.args.results_dir, f"{self.args.experiment_name}_summary.csv")

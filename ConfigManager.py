@@ -12,8 +12,15 @@ class ConfigManager:
 
         # ====================================
         # === Result Saving === Toggle to False for main interactive build
-        parser.add_argument("--save_results", action="store_true", default=False, help="Save metrics to CSV")
-
+        parser.add_argument("--save_results", action="store_true", default=True, help="Save metrics to CSV")
+        
+        # ====================================
+        # === Experiment Running
+        parser.add_argument("--results_dir", default="./results", help="Directory to save experiment results")
+        parser.add_argument("--experiment_name", default="benchmark_run", help="Experiment name for CSV output")
+        parser.add_argument("--num-seeds", type=int, default=1,
+                    help="Number of random seeds to run per (ticker, config).")
+        
         # ====================================
         # === Raw Data
         parser.add_argument("--mode", choices=["csv", "yfinance", "av"], default="yfinance")
@@ -39,7 +46,8 @@ class ConfigManager:
         ALL_TICKERS = sorted(ALL_TICKERS)
 
         # test subset
-        test_limit = 20
+        # test_limit = 20
+        test_limit = len(ALL_TICKERS)
         tickers_for_test = ALL_TICKERS[:min(test_limit, len(ALL_TICKERS))]
         
         parser.add_argument(
@@ -58,8 +66,6 @@ class ConfigManager:
 
         parser.add_argument("--num-workers", type=int, default=0,
                             help="Number of worker processes for DataLoaders.")
-        parser.add_argument("--num-seeds", type=int, default=5,
-                    help="Number of random seeds to run per (ticker, config).")
         
         # ====================================
         # === Sampling interval
@@ -158,11 +164,5 @@ class ConfigManager:
                             help="Common representation dim fed into the shared classifier head")
         parser.add_argument("--head_hidden", type=int, default=128,
                             help="Hidden width inside the shared classifier head (same for all models)")
-
-
-        # ====================================
-        # === Experiment Running
-        parser.add_argument("--results_dir", default="./results", help="Directory to save experiment results")
-        parser.add_argument("--experiment_name", default="benchmark_run", help="Experiment name for CSV output")
 
         return parser.parse_args([])

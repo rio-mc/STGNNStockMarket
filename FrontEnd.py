@@ -199,7 +199,7 @@ class FrontEnd:
         self.notebook.add(self.backtestTab, text='Backtesting')
         self.backtest_lstm_pane = tk.LabelFrame(self.backtestTab, text="LSTM Backtest")
         self.backtest_lstm_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        self.backtest_stgnn_pane = tk.LabelFrame(self.backtestTab, text="ST-GNN Backtest")
+        self.backtest_stgnn_pane = tk.LabelFrame(self.backtestTab, text="STGNN Backtest")
         self.backtest_stgnn_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         self.backtest_lstm_pane = tk.Frame(self.backtest_lstm_pane)
         self.backtest_stgnn_pane = tk.Frame(self.backtest_stgnn_pane)
