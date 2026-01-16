@@ -19,7 +19,7 @@ class SharedClassifierHead(nn.Module):
         dropout: float = 0.0,
         base_hidden: Optional[int] = None,
         use_weight_norm: bool = True,
-        temperature: float = 1.5,   # keep 1.0 during training
+        temperature: float = 1,   # keep 1.0 during training
     ):
         super().__init__()
         do = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()

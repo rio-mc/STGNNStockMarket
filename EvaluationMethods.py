@@ -15,7 +15,8 @@ from sklearn.metrics import (
     roc_curve,
     auc,
     precision_recall_curve,
-    average_precision_score
+    average_precision_score,
+    f1_score
 )
 
 from evaluation_types import EvaluationResult
@@ -92,29 +93,92 @@ class EvaluationMethods:
 
         # === STEP 2: Compute Accuracy, Precision, Recall, F1-Score ===
         # ------------------------------------
-        acc = accuracy_score(result.y_true, result.y_pred)
-        f1 = precision_recall_fscore_support(result.y_true, result.y_pred, average="binary")[2]
-        print(f"[{model_name} Evaluation] Accuracy = {acc:.3f} | F1 = {f1:.3f}")
+        best_thr = 0.5
+        rule_name = "default (0.5)"
+
+        y_true = np.asarray(result.y_true, dtype=int)
+
+        # Initialise report fields (so return dict always has something sensible)
+        acc_05 = f1_05 = macro_f1_05 = None
+        acc   = f1   = macro_f1   = None
+
+        # If we have probabilities, compute baseline @0.5 and tuned threshold metrics
+        if result.probs is not None and len(result.probs) == len(result.y_true):
+            probs = np.asarray(result.probs, dtype=float)
+
+            # ---- baseline @ 0.5 (paper baseline) ----
+            y_pred_05 = (probs >= 0.5).astype(int)
+            acc_05 = accuracy_score(y_true, y_pred_05)
+            f1_05  = precision_recall_fscore_support(y_true, y_pred_05, average="binary")[2]  # F1 for positive class
+            macro_f1_05 = f1_score(y_true, y_pred_05, average="macro")
+
+            # ---- tuned threshold (balanced accuracy rule) ----
+            best_thr = self._best_threshold_macro_f1(y_true, probs)
+            rule_name = "Decision Threshold - Macro-F1"
+
+            y_pred_used = (probs >= best_thr).astype(int)
+            acc = accuracy_score(y_true, y_pred_used)
+            f1  = precision_recall_fscore_support(y_true, y_pred_used, average="binary")[2]
+            macro_f1 = f1_score(y_true, y_pred_used, average="macro")
+
+            print(
+                f"[{model_name} Evaluation] "
+                f"thr=0.500 | Acc={acc_05:.3f} | F1(pos)={f1_05:.3f} | F1(macro)={macro_f1_05:.3f}  ||  "
+                f"{rule_name}={best_thr:.3f} | Acc={acc:.3f} | F1(pos)={f1:.3f} | F1(macro)={macro_f1:.3f}"
+            )
+
+        else:
+            # Fallback if probs missing: use whatever y_pred was provided
+            probs = None
+            y_pred_used = np.asarray(result.y_pred, dtype=int)
+            acc = accuracy_score(y_true, y_pred_used)
+            f1  = precision_recall_fscore_support(y_true, y_pred_used, average="binary")[2]
+            macro_f1 = f1_score(y_true, y_pred_used, average="macro")
+
+            print(
+                f"[{model_name} Evaluation] thr=N/A | Acc={acc:.3f} | F1(pos)={f1:.3f} | F1(macro)={macro_f1:.3f}"
+            )
+
         # after acc/f1
         roc_auc = None
         ap = None
-        if result.probs is not None and len(result.probs) == len(result.y_true):
-            fpr, tpr, _ = roc_curve(result.y_true, result.probs, pos_label=1)
+        if probs is not None:
+            fpr, tpr, _ = roc_curve(y_true, probs, pos_label=1)
             roc_auc = auc(fpr, tpr)
-            ap = average_precision_score(result.y_true, result.probs, pos_label=1)
+            ap = average_precision_score(y_true, probs, pos_label=1)
 
         # Confusion Matrix / ROC-PR / Threshold
-        self.frontend.root.after(0, lambda: self.plot_confusion_matrix(result.y_true, result.y_pred, model_name))
-        self.frontend.root.after(0, lambda: self.plot_roc_and_pr(result.y_true, result.probs, model_name))
+        self.frontend.root.after(
+            0,
+            lambda: self.plot_confusion_matrix(y_true, y_pred_used, model_name, thr=best_thr, rule_name=rule_name)
+        )
+
+        if probs is not None:
+            self.frontend.root.after(
+                0,
+                lambda: self.plot_roc_and_pr(y_true, probs, model_name)
+            )
+
         if model_name.upper() == "LSTM":
             threshold_pane = self.lstm_threshold_pane
         elif model_name.upper() == "GRU":
             threshold_pane = self.gru_threshold_pane
         else:
             threshold_pane = self.stgnn_threshold_pane
-        self.frontend.root.after(0, lambda: self.plot_recall_threshold(
-            truths=result.y_true, probs=result.probs, pane=threshold_pane, model_name=model_name
-        ))
+
+        if probs is not None:
+            self.frontend.root.after(
+                0,
+                lambda: self.plot_recall_threshold(
+                    truths=y_true,
+                    probs=probs,
+                    pane=threshold_pane,
+                    model_name=model_name,
+                    best_thr=best_thr,
+                    rule_name=rule_name
+                )
+            )
+
 
         # === STEP 3: Backtesting and Equity Curve (non-overlapping trades) ===
         # ------------------------------------
@@ -212,19 +276,36 @@ class EvaluationMethods:
             self._val_stgnn = [v["loss"] for v in result.val_stgnn] if result.val_stgnn else []
             self._hist_stgnn = result.hist_stgnn or []
 
+
         # === STEP 5: Return summary ===
         # ------------------------------------
         return {
             "model": model_name,
-            "accuracy": acc,
-            "f1": f1,
+
+            # tuned operating point (what your UI/confusion matrix uses)
+            "accuracy": float(acc) if acc is not None else None,
+            "f1": float(f1) if f1 is not None else None,                 # F1(pos)
+            "macro_f1": float(macro_f1) if macro_f1 is not None else None,
+
+            # baseline @ 0.5 (paper baseline)
+            "accuracy_05": float(acc_05) if acc_05 is not None else None,
+            "f1_05": float(f1_05) if f1_05 is not None else None,        # F1(pos) @0.5
+            "macro_f1_05": float(macro_f1_05) if macro_f1_05 is not None else None,
+
+            # Threshold metadata
+            "best_threshold": float(best_thr),
+            "threshold_rule": rule_name,
+
+            # ranking metrics
             "roc_auc": roc_auc,
             "ap": ap,
+
             "sharpe": sharpe,
             "ticker": price_df.columns[0] if hasattr(price_df, "columns") else None,
             "n_predictions": len(result.y_pred),
             "horizon": result.horizon,
         }
+
 
     def plot_loss(
         self,
@@ -298,7 +379,7 @@ class EvaluationMethods:
         self.loss_val_fig.tight_layout(pad=1.0)
         self.loss_val_canvas.draw()
 
-    def plot_confusion_matrix(self, y_true: List[int], y_pred: List[int], model_name: str):
+    def plot_confusion_matrix(self, y_true, y_pred, model_name, thr=None, rule_name=None):
         # === STEP 1: Create Labels and Confusion Matrix ===
         # ------------------------------------
 
@@ -338,7 +419,13 @@ class EvaluationMethods:
         sns.despine(fig=fig, ax=ax_cm, left=False, bottom=False)
         ax_cm.set_xlabel('Predicted', fontsize=10)
         ax_cm.set_ylabel('Actual',    fontsize=10)
-        ax_cm.set_title(f"{model_name} Confusion Matrix", fontsize=12, pad=8)
+
+        title = f"{model_name} Confusion Matrix"
+        if thr is not None:
+            rule = rule_name or "thr"
+            title += f"\n({rule}={thr:.3f})"
+        ax_cm.set_title(title)
+
         ax_cm.tick_params(axis='both', which='major', labelsize=9)
         ax_txt.axis('off')
 
@@ -419,33 +506,47 @@ class EvaluationMethods:
         }
 
     def plot_recall_threshold(
-        self,
-        truths: List[int],
-        probs: List[float],
-        pane,
-        model_name: str
-    ) -> None:
-		# === STEP 1: Metrics and Thresholds ===
-        # ------------------------------------
+            self,
+            truths: List[int],
+            probs: List[float],
+            pane,
+            model_name: str,
+            best_thr: Optional[float] = None,
+            rule_name: str = "default (0.5)",
+        ) -> None:
+
         precision, recall, thresholds = precision_recall_curve(truths, probs, pos_label=1)
         f1_scores = 2 * (precision * recall) / (precision + recall + 1e-8)
 
-        # === STEP 2: Formatting ===
-        # ------------------------------------
         fig, ax = plt.subplots(figsize=(6, 3))
-        ax.plot(thresholds, recall[:-1], label='Recall', linewidth=1.5)
-        ax.plot(thresholds, precision[:-1], '--', label='Precision')
-        ax.plot(thresholds, f1_scores[:-1], ':', label='F1 Score')
-        ax.set_title(f'{model_name} Scores vs Threshold')
-        ax.set_xlabel('Threshold')
-        ax.set_ylabel('Score')
+
+        ax.plot(thresholds, recall[:-1], label="Recall", linewidth=1.5)
+        ax.plot(thresholds, precision[:-1], "--", label="Precision")
+        ax.plot(thresholds, f1_scores[:-1], ":", label="F1 Score")
+
+        # ---- Threshold marker (neutral color, no extra text box) ----
+        if best_thr is not None:
+            ax.axvline(
+                best_thr,
+                linestyle="--",
+                linewidth=1.5,
+                color="black",  # distinct from blue/orange/green
+                label=f"{rule_name}: {best_thr:.3f}",
+            )
+
+        ax.set_title(f"{model_name} Scores vs Threshold")
+        ax.set_xlabel("Threshold")
+        ax.set_ylabel("Score")
         ax.set_xlim([0, 1])
         ax.set_ylim([0, 1])
-        ax.legend()
+
+        # Legend: choose a stable corner (no overlapping text box anymore)
+        ax.legend(loc="lower left", fontsize=8)
+
         fig.tight_layout()
         self._clear_pane(pane)
         canvas = FigureCanvasTkAgg(fig, master=pane)
-        canvas.get_tk_widget().pack(fill='both', expand=True)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
         canvas.draw()
         plt.close(fig)
 
@@ -550,6 +651,30 @@ class EvaluationMethods:
             np.polyval(trend, mdates.date2num(dates)),
             color=colour, linewidth=1, alpha=0.85, label='_nolegend_'
         )
+
+
+    def _best_threshold_macro_f1(self, truths, probs) -> float:
+        """
+        Threshold in [0,1] that maximizes macro-F1.
+        Macro-F1 = (F1_down + F1_up)/2, so it discourages collapsing to one class.
+        """
+        probs = np.asarray(probs, dtype=float)
+        y = np.asarray(truths, dtype=int)
+
+        thr_grid = np.unique(probs)
+        if thr_grid.size == 0:
+            return 0.5
+        thr_grid = np.concatenate(([0.0], thr_grid, [1.0]))
+
+        best_thr, best_score = 0.5, -1.0
+        for thr in thr_grid:
+            pred = (probs >= thr).astype(int)
+            score = f1_score(y, pred, average="macro")
+            if score > best_score:
+                best_score = score
+                best_thr = float(thr)
+        return best_thr
+
 
     def reset_histories(self):
         # ====================================

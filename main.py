@@ -539,7 +539,7 @@ class MainApp:
             #   2. Predict directional confidence
             with torch.no_grad():
                 prob_l = torch.sigmoid(lstm_model(arr_l)[0]).item()
-                thr_l = 0.5
+                thr_l = metrics_lstm.get("best_threshold", 0.5)
                 if prob_l >= thr_l:
                     dir_l = "Upwards"
                     conf_l = prob_l * 100.0          # chosen-class probability
@@ -638,7 +638,7 @@ class MainApp:
             #   2. Predict directional confidence
             with torch.no_grad():
                 prob_g = torch.sigmoid(gru_model(arr_g)[0]).item()
-                thr_g = 0.5
+                thr_g = metrics_gru.get("best_threshold", 0.5)
                 if prob_g >= thr_g:
                     dir_g = "Upwards"
                     conf_g = prob_g * 100.0
@@ -870,7 +870,7 @@ class MainApp:
             #   1. Perform post-training evaluation
             trainer_stgnn.prediction_horizon = self.horizon
             eval_result_stgnn = trainer_stgnn.evaluate_rolling(stgnn_val_ds)
-            
+
             if hasattr(stgnn_model, "classifier") and hasattr(stgnn_model.classifier, "set_temperature"):
                 stgnn_model.classifier.set_temperature(self.args.head_temperature)
 
@@ -916,7 +916,7 @@ class MainApp:
             with torch.no_grad():
                 logits = stgnn_model(arr_s, self.init_edge_index.to(self.device), edge_attr=edge_attr, target_node_index=stock_idx)
                 prob_s = torch.sigmoid(logits[0]).item()
-                thr_s = 0.5
+                thr_s = metrics_stgnn.get("best_threshold", 0.5)
                 if prob_s >= thr_s:
                     dir_s_str = "Upwards"
                     conf_s = prob_s * 100.0
