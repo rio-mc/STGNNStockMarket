@@ -1138,15 +1138,18 @@ class MainApp:
         return torch.zeros((2, 0), dtype=torch.long, device=self.device)
     
     def build_tensor_factory(self, horizon):
-        # ====================================
-		# ===   Helper to build tensor factories
+        engineered = ["return", "volatility", "momentum"]
+        if getattr(self.args, "ablate_feature", "none") in engineered:
+            engineered = [f for f in engineered if f != self.args.ablate_feature]
+        feature_cols = ["close"] + engineered
+
         return TensorFactory(
             tickers=self.args.tickers,
-            featureCols=self.raw_feature_cols,
+            featureCols=feature_cols,
             seq_len=self.seq_len,
             prediction_horizon=horizon
         )
-    
+
     def _set_all_seeds(self, seed: int):
         """Set all RNGs and remember the current run seed."""
         used = Utils.set_seed(seed, deterministic=self.args.deterministic)
