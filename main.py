@@ -324,7 +324,7 @@ class MainApp:
                 pruned_edges=pruned_for_plot,
                 mst_edges=mst_for_plot
             ))
-
+            
             # --- Build edge_index for PyG from pruned edges ---
             edge_index = torch.tensor(
                 [(i, j) for i, j, _ in pruned],
@@ -335,17 +335,28 @@ class MainApp:
             mode = getattr(self.args, "graph_ablation", "none")
             num_nodes = len(tickers)
 
-            # Make edge_index undirected for PyG message passing (cosine similarity is symmetric)
-            if edge_index.numel() > 0:
-                rev = edge_index[[1, 0], :]
-                edge_index = torch.cat([edge_index, rev], dim=1)
+            # If max_k=0 (or pruning) yields no edges, PyG convs (e.g., NNConv) can break on empty edge_index.
+            # Represent "no relational edges" as identity/self-loops only (no cross-asset mixing).
+            # This is paper-defensible: k=0 => remove cross-asset edges, keep self loops to keep MP well-defined.
+            if edge_index.numel() == 0:
+                idx = torch.arange(num_nodes, dtype=torch.long, device=edge_index.device)
+                edge_index = torch.stack([idx, idx], dim=0)
+                # Optional: track this for logging/debugging if you have a logger
+                if hasattr(self, "logger"):
+                    self.logger.info("[Graph] Empty edge_index after pruning (likely max_k=0). Using identity self-loops.")
 
-                # Dedupe + stable sort by (src, dst)
-                key = edge_index[0] * num_nodes + edge_index[1]
-                uniq = torch.unique(key, sorted=True)
-                edge_index = torch.stack([uniq // num_nodes, uniq % num_nodes], dim=0)
+            # Make edge_index undirected for PyG message passing (cosine similarity is symmetric)
+            # NOTE: self-loops remain self-loops after reversal/dedupe, so this is safe.
+            rev = edge_index[[1, 0], :]
+            edge_index = torch.cat([edge_index, rev], dim=1)
+
+            # Dedupe + stable sort by (src, dst)
+            key = edge_index[0] * num_nodes + edge_index[1]
+            uniq = torch.unique(key, sorted=True)
+            edge_index = torch.stack([uniq // num_nodes, uniq % num_nodes], dim=0)
 
             # Apply optional graph ablation (none / identity / empty) ONCE, after finalisation
+            # NOTE: If you ever set mode="empty", it will override the self-loop fallback above.
             edge_index = Utils.apply_graph_ablation(edge_index, num_nodes=num_nodes, mode=mode)
 
             # Optional: sanity log (now truthful for identity/empty)
