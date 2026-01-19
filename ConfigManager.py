@@ -18,7 +18,7 @@ class ConfigManager:
         # === Experiment Running
         parser.add_argument("--results_dir", default="./results", help="Directory to save experiment results")
         parser.add_argument("--experiment_name", default="benchmark_run", help="Experiment name for CSV output")
-        parser.add_argument("--num-seeds", type=int, default=1,
+        parser.add_argument("--num-seeds", type=int, default=3,
                     help="Number of random seeds to run per (ticker, config).")
         
         # ====================================

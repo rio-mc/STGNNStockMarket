@@ -969,7 +969,7 @@ class MainApp:
             # Use the last timestamp that fed the prediction features.
             # This should exist if val_df_stock is built; keep defensive fallback anyway.
             try:
-                features_end_ts = pd.Timestamp(val_feats[stock].index[-1]).isoformat()
+                features_end_ts = pd.Timestamp(val_df_stock.index[-1]).isoformat()
             except Exception:
                 features_end_ts = None
 
@@ -1171,13 +1171,13 @@ class MainApp:
         if bool(getattr(self.args, "include_empty_ablation", False)):
             graph_ablation_options.append("empty")
 
-        # NEW: ablated condition (none | pca | one engineered feature)
+        # Ablated condition (none | pca | one engineered feature)
         # "pca" means: remove PCA -> graph_embed="raw"
         # feature means: remove exactly that engineered feature everywhere -> ablate_feature=<feature>
         ablated_options = ["none", "pca", "return", "volatility", "momentum"]
 
-        max_k_values = [5]  # sparsity sweep; adjust as needed
-        seq_len_values = [5]
+        max_k_values = [1,2,3,5,8]  # sparsity sweep; adjust as needed
+        seq_len_values = [32]  # approximately 1 week of hourly stock market data
 
         # Multi-seed controls (repetitions == number of seeds)
         num_seeds = int(getattr(self.args, "num_seeds", 1))
