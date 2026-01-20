@@ -3,12 +3,12 @@
 Summarise results/benchmark_run.csv into labelled suite averages.
 
 Outputs (in ./summaries next to this script):
-  - suite_averages.csv
-  - suite_averages_pretty.csv
-  - suite_averages.md
-  - per_ticker.csv
-  - completeness.csv
-  - overall_by_model.csv
+  - suite_averages.csv : numeric mean/std/count per (model, suite)
+  - suite_averages_pretty.csv : mean±std strings
+  - suite_averages.md : markdown table
+  - per_ticker.csv : per ticker, averaged over seeds, per (model, suite)
+  - completeness.csv : counts vs expected (tickers * seeds)
+  - overall_by_model.csv : model-level summary
 """
 
 from __future__ import annotations
@@ -21,10 +21,21 @@ import pandas as pd
 DEFAULT_METRICS = [
     # threshold-aligned (your "best threshold" operating point)
     "accuracy", "macro_f1", "roc_auc", "ap",
+
     # fixed 0.5 operating point
     "accuracy_05", "macro_f1_05",
+
+    # threshold actually used at test time (validation-selected, per run)
+    "decision_threshold",
+
     # efficiency
     "energy_Wh", "train_seconds",
+
+    # graph diagnostics (mostly meaningful for STGNN)
+    "num_edges", "graph_homophily",
+
+    # optional: normalised efficiency
+    "energy_per_sample_Wh",
 ]
 DECIMALS = 4
 
@@ -34,32 +45,44 @@ OUTDIR = SCRIPT_DIR / "summaries"
 
 
 def build_suite_label(row: pd.Series) -> str:
-    """Human-readable suite label from config columns."""
-    bits = []
+    """Human-readable suite label from config columns (short but unambiguous)."""
+    bits: list[str] = []
+
+    # --- Read config knobs ---
+    k = row.get("max_k", None)
+    k_int = None if pd.isna(k) else int(k)
 
     ga = row.get("graph_ablation", "unknown")
-    if ga == "identity":
-        bits.append("graph=self-loops")
-    elif ga == "none":
-        bits.append("graph=relational")
-    else:
-        bits.append(f"graph={ga}")
 
-    ablated = row.get("ablated", None)
-    if pd.isna(ablated) or str(ablated) == "none":
+    # Graph label:
+    # - If k==0, treat as "no cross-asset edges" (self-loops), consistent with your PyG-safe fallback.
+    # - Else respect explicit graph_ablation.
+    if k_int == 0:
+        bits.append("graph=self-loops")
+    else:
+        if ga == "identity":
+            bits.append("graph=self-loops")
+        elif ga == "none":
+            bits.append("graph=relational")
+        else:
+            bits.append(f"graph={ga}")
+
+    # Descriptor/embedding used for graph construction:
+    # In your runs this is typically graph_embed in {raw,pca}
+    ge = row.get("graph_embed", None)
+    if pd.isna(ge) or str(ge) == "none":
         bits.append("descriptor=full")
     else:
-        bits.append(f"descriptor={ablated}")
+        bits.append(f"descriptor={ge}")
 
-    k = row.get("max_k", None)
-    if pd.isna(k):
-        bits.append("k=?")
-    else:
-        bits.append(f"k={int(k)}")
+    # Include k always (important for your sweep)
+    bits.append(f"k={k_int if k_int is not None else '?'}")
 
+    # Rewiring
     if "rewiring" in row.index and not pd.isna(row["rewiring"]):
         bits.append(f"rewire={'on' if bool(row['rewiring']) else 'off'}")
 
+    # Sequence length / horizon
     if "seq_len" in row.index and not pd.isna(row["seq_len"]):
         bits.append(f"L={int(row['seq_len'])}")
     if "horizon" in row.index and not pd.isna(row["horizon"]):
@@ -85,8 +108,8 @@ def main() -> None:
     df = pd.read_csv(INPUT_CSV)
     print(f"Loaded {len(df)} rows from: {INPUT_CSV}")
 
-    # Sanity checks
-    required = {"model", "ticker", "seed", "graph_ablation", "ablated", "max_k"}
+    # Required columns for grouping/labeling
+    required = {"model", "ticker", "seed", "graph_ablation", "max_k"}
     missing = sorted(required - set(df.columns))
     if missing:
         raise SystemExit(f"Missing required columns: {missing}")
@@ -94,15 +117,24 @@ def main() -> None:
     # Normalise rewiring if present
     if "rewiring" in df.columns:
         # handles bool/int/str-ish values robustly
-        df["rewiring"] = df["rewiring"].apply(lambda x: bool(int(x)) if str(x).isdigit() else bool(x))
+        df["rewiring"] = df["rewiring"].apply(
+            lambda x: bool(int(x)) if str(x).isdigit() else bool(x)
+        )
+
+    # Ensure decision_threshold is numeric if present
+    # (some CSVs can store it as string; coerce safely)
+    if "decision_threshold" in df.columns:
+        df["decision_threshold"] = pd.to_numeric(df["decision_threshold"], errors="coerce")
 
     # Build suite label
     df["suite"] = df.apply(build_suite_label, axis=1)
 
-    # Keep only metrics that actually exist in the CSV
+    # Keep only metrics that exist
     metrics = [m for m in DEFAULT_METRICS if m in df.columns]
     if not metrics:
-        raise SystemExit(f"None of DEFAULT_METRICS were found in CSV. DEFAULT_METRICS={DEFAULT_METRICS}")
+        raise SystemExit(
+            f"None of DEFAULT_METRICS were found in CSV. DEFAULT_METRICS={DEFAULT_METRICS}"
+        )
 
     # Expected rows per (model, suite): tickers * seeds
     n_tickers = df["ticker"].nunique()
@@ -121,7 +153,7 @@ def main() -> None:
         for (a, b) in [(c if isinstance(c, tuple) else (c, "")) for c in suite_stats.columns]
     ]
 
-    # Completeness (use count from first available metric)
+    # Completeness: use count from first metric (accuracy usually)
     count_col = f"{metrics[0]}_count"
     suite_stats["expected_rows"] = expected
     suite_stats["missing_rows"] = suite_stats["expected_rows"] - suite_stats[count_col].astype(int)
@@ -129,12 +161,12 @@ def main() -> None:
 
     suite_stats.to_csv(OUTDIR / "suite_averages.csv", index=False)
 
-    # Pretty markdown summary (mean ± std)
+    # Pretty markdown summary (mean ± std strings)
     pretty_rows = []
     for _, r in suite_stats.iterrows():
         row = {"model": r["model"], "suite": r["suite"], "n": int(r[count_col])}
         for m in metrics:
-            row[m] = mean_std_str(r[f"{m}_mean"], r[f"{m}_std"], DECIMALS)
+            row[m] = mean_std_str(r.get(f"{m}_mean"), r.get(f"{m}_std"), DECIMALS)
         pretty_rows.append(row)
 
     pretty = pd.DataFrame(pretty_rows)
