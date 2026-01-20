@@ -1,0 +1,45 @@
+## Editing `ConfigManager.py` to control the test suite
+
+### 1) Change default settings (for a fixed “paper config”)
+Most options are defined via lines like:
+
+- `parser.add_argument("--num-seeds", ..., default=3, ...)`
+
+To change the default behaviour for every run, edit the `default=` value inside `ConfigManager.py`. Common examples:
+- `--num-seeds`: number of seed repetitions per (ticker, config)
+- `--mode` / `--data_dir`: where data comes from
+- training hyperparameters (epochs, learning rate, dropout)
+- model sizes (hidden dims, number of layers)
+
+---
+
+### 2) Control which tickers are used
+Tickers are loaded from `tickers.csv` (column `ticker`) and then optionally truncated inside `ConfigManager.py` via a `test_limit` variable.
+
+You can control the ticker universe in two ways:
+1) Edit `tickers.csv` (best for transparency): add/remove tickers there.
+2) Edit `test_limit` in `ConfigManager.py` to quickly limit to the first N tickers for debugging (smaller N = faster runs).
+
+---
+
+### 3) Know what `main.py` overrides
+Even if you change defaults in `ConfigManager.py`, the experiment grid in `main.py` (`run_experiments()`) hard-codes lists such as:
+- `graph_ablation_options`
+- `ablated_options`
+- `max_k_values`
+- `seq_len_values`
+
+So:
+- Use `ConfigManager.py` to control global defaults (seeds, data mode, batch size, etc.)
+- Use `main.py` to control the grid of experiments being swept
+
+If you want to reduce runtime, shrinking the lists in `main.py` often has the biggest impact.
+
+---
+
+### 4) Reproducibility tip (recommended for the instruction file)
+Whenever you edit `ConfigManager.py`, record:
+- the exact file version/commit used
+- the final resolved argument values (e.g., dump into the results folder)
+
+This makes the run reproducible and “paper defensible.”
