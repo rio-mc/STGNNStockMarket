@@ -1,0 +1,106 @@
+## How to initialise / run the test suite (as implemented in `main.py`)
+
+### 1) Prerequisites the suite assumes
+- **`tickers.csv` must exist** (used to build the default ticker universe). `ConfigManager.parseArgs()` reads it and sets `--tickers` accordingly.
+- Your environment must support the dependencies used in the pipeline (PyTorch, PyG, yfinance/CSV ingestion, etc.). The suite loads data first, then runs the grid.
+
+### 2) Run entrypoint (what actually triggers the suite)
+In `main.py`, the `__main__` block does:
+
+- creates `MainApp()`
+- **if `args.save_results` is truthy**, it:
+  - starts the background loader thread (`_load_data_and_start_gui`)
+  - schedules `run_experiments()` to start once the Tk app is up
+  - enters `Tk.mainloop()`
+
+So: **running `python main.py` will start the suite** (because `--save_results` defaults to `True` in your current `ConfigManager`).
+
+### 3) Useful CLI knobs (what you can control without editing code)
+From `ConfigManager.parseArgs()` you can control:
+- ticker set: `--tickers ...`
+- seed repetitions: `--num-seeds K`
+- data source: `--mode {csv,yfinance,av}` + `--data_dir`, `--av_key`
+- determinism: `--deterministic` + `--base-seed`
+- result location: `--results_dir`, `--experiment_name`
+
+**Example (small smoke test):**
+- limit tickers + seeds:
+  - `python main.py --tickers AAPL MSFT --num-seeds 1 --results_dir ./results --experiment_name smoke`
+
+### 4) Knobs that currently require editing `run_experiments()`
+Inside `run_experiments()` the grid is hard-coded:
+- `graph_ablation_options = ["none", "identity"]` (optionally adds `"empty"` if `include_empty_ablation` is set)
+- `ablated_options = ["none", "pca"]`
+- `max_k_values = [1,2,3,5,8]`
+- `seq_len_values = [32]`
+
+So, to shrink/expand the suite **without adding new CLI args**, you edit those lists.
+
+---
+
+## Suite complexity (what it actually loops over)
+
+`run_experiments()` loops as:
+
+**configs** = product of:
+- rewiring (default 1 value: `[False]`)
+- graph_ablation (default 2 values: `none`, `identity`)
+- ablated (2 values)
+- max_k (5 values)
+- seq_len (1 value)
+
+So by default:  
+**#configs = 1 × 2 × 2 × 5 × 1 = 20**
+
+Then for each config:
+- for each **ticker** in `self.args.tickers`
+- for each **seed rep** (default `--num-seeds` = 3)
+- it runs `startPipeline(gui_window="1d", stock=ticker, ...)` once
+
+Each `startPipeline()` trains + evaluates + makes a final prediction for **3 models**: **LSTM, GRU, STGNN**, and logs 3 rows per run.
+
+---
+
+## Time estimation using “1 minute per model prediction” upper bound
+
+### Key assumption
+- Prediction-time only:  
+  **time_per_run_per_seed_per_ticker_per_config ≤ 3 models × 1 min = 3 minutes**
+
+> Note: `startPipeline()` also **trains** each model (epochs, dataloaders, etc.), so wall-clock runtime will usually be **dominated by training**, not prediction. But the estimates below follow your “prediction upper bound” instruction.
+
+### Formula
+Let:
+- **C** = number of configs (default 20)
+- **T** = number of tickers
+- **S** = number of seeds (default 3)
+- **M** = number of models (3)
+
+Then:
+- **Total prediction upper bound (minutes)** = `C × T × S × M × 1`
+- With defaults (C=50, S=3, M=3):  
+  **minutes ≤ 20 × T × 3 × 3 = 180 × T**
+
+So:
+- **per ticker**: `180 minutes` = **3 hours** of prediction upper bound
+- **T tickers**: **3 × T hours**
+
+### Concrete examples
+Using defaults (20 configs, 3 seeds, 3 models):
+
+- **T = 5 tickers** → `3 × 5 = 15 hours` (~0.625 days)
+- **T = 20 tickers** → `3 × 20 = 60 hours` (~2.5 days)
+- **T = 100 tickers** → `3 × 100 = 300 hours` (~12.5 days)
+
+### If you enable the optional “empty” graph ablation
+If `include_empty_ablation=True`, graph_ablation becomes 3 values, so:
+- **C = 1 × 3 × 2 × 5 × 1 = 30 configs**
+- per ticker prediction upper bound becomes:
+  - `30 × 3 × 3 = 270 minutes` = **4.5 hours per ticker**
+
+---
+
+## Practical “keep it manageable” checklist
+- Start with a **tiny ticker set**: `--tickers AAPL MSFT`
+- Set **`--num-seeds 1`** for smoke tests
+- Edit `max_k_values`, `ablated_options`, or `graph_ablation_options` to shrink configs (because those are hard-coded in `run_experiments()`).
