@@ -12,7 +12,7 @@ class ConfigManager:
 
         # ====================================
         # === Result Saving === Toggle to False for main interactive build
-        parser.add_argument("--save_results", action="store_true", default=True, help="Save metrics to CSV")
+        parser.add_argument("--save_results", action="store_true", default=False, help="Save metrics to CSV")
         
         # ====================================
         # === Experiment Running
@@ -46,8 +46,7 @@ class ConfigManager:
         ALL_TICKERS = sorted(ALL_TICKERS)
 
         # test subset
-        # test_limit = 20
-        test_limit = len(ALL_TICKERS)
+        test_limit = 10
         tickers_for_test = ALL_TICKERS[:min(test_limit, len(ALL_TICKERS))]
         
         parser.add_argument(
@@ -80,7 +79,7 @@ class ConfigManager:
 
         # ====================================
         # === Graph Construction
-        parser.add_argument("--max_k", type=int, default=5, help="Number of edges to retain per node (KNN)")
+        parser.add_argument("--max_k", type=int, default=3, help="Number of edges to retain per node (KNN)")
         
         # ====================================
         # === Graph Rewiring

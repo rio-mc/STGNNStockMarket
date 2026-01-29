@@ -47,7 +47,6 @@ class MainApp:
 
         self.args.base_seed = getattr(self.args, "base_seed", 42)
         self.args.deterministic = getattr(self.args, "deterministic", False)
-        Utils.set_seed(self.args.base_seed, deterministic=self.args.deterministic)
 
         self.graph_homophily = float("nan")
 
@@ -66,6 +65,9 @@ class MainApp:
         handler = logging.StreamHandler()
         handler.setFormatter(formatter)
         self.logger.addHandler(handler)
+
+        self._set_all_seeds()   # sets current_seed + logs it
+        self.results_log = []
 
         # === STEP 3: Front-end initialisation ===
         # ------------------------------------
@@ -154,7 +156,6 @@ class MainApp:
             torch.use_deterministic_algorithms(self.args.deterministic)  # True => strict, False => normal
             torch.backends.cudnn.deterministic = self.args.deterministic
             torch.backends.cudnn.benchmark = not self.args.deterministic
-            # NOTE: self._set_all_seeds(run_seed) was already called by run_experiments()
 
             # === STEP 2: Clear memory states ===
             # ------------------------------------
@@ -424,7 +425,6 @@ class MainApp:
 
             # === MISC: per-run seeded DataLoader ===
             dl_gen = torch.Generator(device="cpu")
-            # self.current_seed was set by self._set_all_seeds(run_seed) in run_experiments()
             # Fallback to base_seed if not set (defensive)
             seed_for_loaders = getattr(self, "current_seed", int(self.args.base_seed)) % (2**32)
             dl_gen.manual_seed(seed_for_loaders)
@@ -1161,12 +1161,13 @@ class MainApp:
             prediction_horizon=horizon
         )
 
-    def _set_all_seeds(self, seed: int):
+    def _set_all_seeds(self, run_seed: int | None = None):
         """Set all RNGs and remember the current run seed."""
+        seed = int(run_seed) if run_seed is not None else int(self.args.base_seed)
         used = Utils.set_seed(seed, deterministic=self.args.deterministic)
-        self.current_seed = int(used)  # keep a 32-bit-ish int around for logs
-        self.logger.info(f"[AutoTest] Using seed={self.current_seed} (deterministic={self.args.deterministic})")
-    
+        self.current_seed = int(used)
+        self.logger.info(f"[Seed] Using seed={self.current_seed} (deterministic={self.args.deterministic})")
+
     def _seed_worker(self, worker_id: int):
         """Ensure each DataLoader worker has a distinct, reproducible seed."""
         worker_seed = (self.current_seed + worker_id) % (2**32)
@@ -1270,7 +1271,6 @@ class MainApp:
 
                     # 2) Set seed and stamp it
                     self._set_all_seeds(run_seed)
-                    self.current_seed = run_seed
 
                     stop_event = threading.Event()
                     start_time = time.time()

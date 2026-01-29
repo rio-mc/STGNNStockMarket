@@ -1,4 +1,5 @@
 import math
+import os
 import threading
 import tkinter as tk
 from tkinter import ttk
@@ -146,6 +147,10 @@ class FrontEnd:
         self.graphAx = self.graphFig.add_subplot(111, projection="3d")
         self.graphCanvas = FigureCanvasTkAgg(self.graphFig, master=self.graph_canvas_frame)
         self.graphCanvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.graphCanvas.mpl_connect(
+            "key_press_event",
+            self._on_graph_keypress
+        )
 
         # RIGHT: sector legend frame (outside the plot)
         self.legend_frame = tk.LabelFrame(self.graph_container, text="Sector Legend", padx=8, pady=8)
@@ -1022,3 +1027,57 @@ class FrontEnd:
             swatch.pack(side=tk.LEFT, padx=(0, 6))
 
             tk.Label(row, text=sector).pack(side=tk.LEFT)
+
+    def _on_graph_keypress(self, event):
+        if event.key == "s":
+
+            ts = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+            folder = os.path.join("exports", f"graph_{ts}")
+
+            self.export_graph_and_legend(folder, base_name="graph_visualisation")
+
+    def export_graph_and_legend(self, outdir: str, base_name: str = "graph_visualisation"):
+        import os
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+        from matplotlib.patches import Patch
+
+        os.makedirs(outdir, exist_ok=True)
+
+        # ---- 1) Save the graph (vector PDF) ----
+        graph_path = os.path.join(outdir, f"{base_name}.pdf")
+        self.graphFig.savefig(graph_path, bbox_inches="tight")
+
+        # ---- 2) Save the legend as its own PDF ----
+        sector_to_colour = getattr(self, "_sector_to_colour", None) or {}
+        if not sector_to_colour:
+            print("[Export] No sector palette available yet; legend not saved.")
+            return
+
+        sectors = sorted(sector_to_colour.keys())
+
+        # build handles
+        handles = []
+        for s in sectors:
+            rgba = sector_to_colour[s]
+            handles.append(Patch(facecolor=rgba, edgecolor="black", label=s))
+
+        # Legend-only figure: size scales with number of entries
+        n = max(1, len(handles))
+        fig_leg = Figure(figsize=(4.0, min(0.28 * n + 0.6, 10.0)), dpi=300)
+        FigureCanvas(fig_leg)  # attach an Agg canvas so it can render/save
+        ax = fig_leg.add_subplot(111)
+        ax.axis("off")
+
+        ax.legend(
+            handles=handles,
+            loc="center left",
+            frameon=False,
+            fontsize=8,
+            ncol=1
+        )
+
+        legend_path = os.path.join(outdir, f"{base_name}_legend.pdf")
+        fig_leg.savefig(legend_path, bbox_inches="tight")
+
+        print(f"[Export] Saved:\n  {graph_path}\n  {legend_path}")
