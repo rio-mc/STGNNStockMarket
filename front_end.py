@@ -11,7 +11,7 @@ import pandas as pd
 from matplotlib.figure import Figure
 from matplotlib.patches import Patch
 import matplotlib.cm as cm
-from EvaluationMethods import EvaluationMethods
+from evaluation_methods import EvaluationMethods
 
 class Cancelled(Exception):
     """Raised when training is aborted by user."""
@@ -63,6 +63,17 @@ class FrontEnd:
         )
         self.stockMenu.pack(side=tk.LEFT, padx=2)
         self.stockMenu.bind("<<ComboboxSelected>>", self._onSelectionChange)
+        tk.Label(self.toolbar, text="Model:").pack(side=tk.LEFT, padx=(20, 2))
+        self.modelValues = ["LSTM", "GRU", "STGNN"]
+        self.modelVar = tk.StringVar(value=self.modelValues[0])
+        self.modelMenu = ttk.Combobox(
+            self.toolbar,
+            textvariable=self.modelVar,
+            values=self.modelValues,
+            width=10,
+            state="readonly"
+        )
+        self.modelMenu.pack(side=tk.LEFT, padx=2)
         self.stop_event = threading.Event()
         self.statusVar = tk.StringVar()
         self.statusVar.set("Idle")
@@ -103,29 +114,29 @@ class FrontEnd:
         self.resultFrame = tk.Frame(self.mainTab)
         self.resultFrame.pack(fill=tk.X)
 
-        # --- LSTM
-        self.lstmRes = tk.LabelFrame(self.resultFrame, text="LSTM Prediction", padx=10, pady=10)
-        self.lstmRes.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=20, pady=5)
-        self.lstmStatus = tk.Label(self.lstmRes, text="Trending: —", font=("Helvetica", 12, "bold"), fg="green")
-        self.lstmConf = tk.Label(self.lstmRes, text="Confidence: —")
-        self.lstmStatus.pack()
-        self.lstmConf.pack()
+        self.modelRes = tk.LabelFrame(self.resultFrame, text="Model Prediction", padx=10, pady=10)
+        self.modelRes.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=20, pady=5)
 
-        # --- GRU
-        self.gruRes = tk.LabelFrame(self.resultFrame, text="GRU Prediction", padx=10, pady=10)
-        self.gruRes.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=20, pady=5)
-        self.gruStatus = tk.Label(self.gruRes, text="Trending: —", font=("Helvetica", 12, "bold"), fg="blue")
-        self.gruConf = tk.Label(self.gruRes, text="Confidence: —")
-        self.gruStatus.pack()
-        self.gruConf.pack()
+        self.modelNameLabel = tk.Label(
+            self.modelRes,
+            text=f"Model: {self.modelVar.get()}",
+            font=("Helvetica", 12, "bold")
+        )
+        self.modelNameLabel.pack()
 
-        # --- STGNN
-        self.stgnnRes = tk.LabelFrame(self.resultFrame, text="STGNN Prediction", padx=10, pady=10)
-        self.stgnnRes.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=20, pady=5)
-        self.stgnnStatus = tk.Label(self.stgnnRes, text="Trending: —", font=("Helvetica", 12, "bold"), fg="red")
-        self.stgnnConf = tk.Label(self.stgnnRes, text="Confidence: —")
-        self.stgnnStatus.pack()
-        self.stgnnConf.pack()
+        self.modelStatus = tk.Label(
+            self.modelRes,
+            text="Trending: —",
+            font=("Helvetica", 12, "bold"),
+            fg="black"
+        )
+        self.modelStatus.pack()
+
+        self.modelConf = tk.Label(
+            self.modelRes,
+            text="Confidence: —"
+        )
+        self.modelConf.pack()
 
         #   7. Bottom pane: graph + feature table
         self.bottom_pane = tk.PanedWindow(self.mainTab, orient=tk.VERTICAL)
@@ -320,12 +331,15 @@ class FrontEnd:
 		# === Helper to run main computation pipline
         cancelled = False
         try:
-            metrics = self._compute_callback(window, stock, self.stop_event)
+            result = self._compute_callback(window, stock, self.stop_event)
             if self.stop_event.is_set():
                 cancelled = True
             else:
-                self.root.after(0, lambda:
-                    self.updateResults(*metrics if metrics else ("—", 0.0, "—", 0.0, "—", 0.0))
+                self.root.after(
+                    0,
+                    lambda: self.updateResults(
+                        result[0], result[1], result[2]
+                    ) if result else self.updateResults(self.modelVar.get(), "—", 0.0)
                 )
         except Cancelled:
             cancelled = True
@@ -874,7 +888,7 @@ class FrontEnd:
         self.updateProgress(0.0)
         try:
             #   2. Provide fallback placeholders (safe defaults)
-            self.updateResults("—", 0.0, "—", 0.0, "—", 0.0)
+            self.updateResults(self.modelVar.get(), "—", 0.0)
         except Exception as e:
             print(f"[WARNING] updateResults failed during UI reset: {e}")
 
@@ -904,37 +918,17 @@ class FrontEnd:
 
         self.root.after(0, lambda: [self.clear_axis(pane) for pane in clear_targets])    
 
-    def updateResults(self, lstm_trend, lstm_conf, gru_trend, gru_conf, stgnn_trend, stgnn_conf):
-        """Update the three result label boxes."""
-        # LSTM
-        self.lstmStatus.config(
-            text=f"Trending: {lstm_trend}",
-            fg="green" if "Upwards" in lstm_trend else "red"
-        )
-        self.lstmConf.config(
-            text=f"Confidence: {lstm_conf:.1f}%",
-            fg="green" if "Upwards" in lstm_trend else "red"
-        )
+    def updateResults(self, model_name, trend, confidence):
+        """
+        Update the single selected-model result panel.
+        """
+        is_up = "Upwards" in str(trend)
+        colour = "green" if is_up else "red" if trend not in ("—", "-", None) else "black"
 
-        # GRU
-        self.gruStatus.config(
-            text=f"Trending: {gru_trend}",
-            fg="green" if "Upwards" in gru_trend else "red"
-        )
-        self.gruConf.config(
-            text=f"Confidence: {gru_conf:.1f}%",
-            fg="green" if "Upwards" in gru_trend else "red"
-        )
-
-        # STGNN
-        self.stgnnStatus.config(
-            text=f"Trending: {stgnn_trend}",
-            fg="green" if "Upwards" in stgnn_trend else "red"
-        )
-        self.stgnnConf.config(
-            text=f"Confidence: {stgnn_conf:.1f}%",
-            fg="green" if "Upwards" in stgnn_trend else "red"
-        )
+        self.modelRes.config(text=f"{model_name} Prediction")
+        self.modelNameLabel.config(text=f"Model: {model_name}")
+        self.modelStatus.config(text=f"Trending: {trend}", fg=colour)
+        self.modelConf.config(text=f"Confidence: {confidence:.1f}%", fg=colour)
     
     def refresh_selected_tabs(self):
         # ====================================
@@ -1081,3 +1075,6 @@ class FrontEnd:
         fig_leg.savefig(legend_path, bbox_inches="tight")
 
         print(f"[Export] Saved:\n  {graph_path}\n  {legend_path}")
+
+    def get_selected_model(self) -> str:
+        return self.modelVar.get().strip().lower()

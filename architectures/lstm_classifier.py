@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from SharedHead import SharedClassifierHead
+from architectures.shared_head import SharedClassifierHead
 
 class LSTMClassifier(nn.Module):
     def __init__(

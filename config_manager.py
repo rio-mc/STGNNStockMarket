@@ -164,4 +164,4 @@ class ConfigManager:
         parser.add_argument("--head_hidden", type=int, default=128,
                             help="Hidden width inside the shared classifier head (same for all models)")
 
-        return parser.parse_args([])
+        return parser.parse_args()
