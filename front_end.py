@@ -305,12 +305,15 @@ class FrontEnd:
 
     def _onCompute(self):
         # ====================================
-		# === Helper to attach main computation pipline
+        # === Helper to attach main computation pipeline
+
+        selected_model = self.get_selected_model()
+        self.set_status(f"Queued {selected_model.upper()} run...")
 
         #   1. Stop and start computation
         self.stop_event.clear()
         self.btnCompute.config(state=tk.DISABLED, text="…Running")
-        self.btnStop.config(state=tk.NORMAL)  # Ensures Stop is always clickable
+        self.btnStop.config(state=tk.NORMAL)
         self.updateProgress(0.0)
 
         #   2. Launch background thread

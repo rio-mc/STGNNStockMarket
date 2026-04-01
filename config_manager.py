@@ -1,167 +1,354 @@
 import argparse
+import json
 from pathlib import Path
-import pandas as pd
+
 
 class ConfigManager:
     @staticmethod
     def parseArgs():
         """
-        Defines configuration across raw data, models, and graph construction
+        Defines configuration across run mode, dataset selection, model choice,
+        training, graph construction, and ablation controls.
+
+        This parser now supports both GUI execution and headless experiment runs.
         """
         parser = argparse.ArgumentParser("Spatio-Temporal Forecasting")
 
         # ====================================
-        # === Result Saving === Toggle to False for main interactive build
-        parser.add_argument("--save_results", action="store_true", default=False, help="Save metrics to CSV")
-        
-        # ====================================
-        # === Experiment Running
-        parser.add_argument("--results_dir", default="./results", help="Directory to save experiment results")
-        parser.add_argument("--experiment_name", default="benchmark_run", help="Experiment name for CSV output")
-        parser.add_argument("--num-seeds", type=int, default=3,
-                    help="Number of random seeds to run per (ticker, config).")
-        
-        # ====================================
-        # === Raw Data
-        parser.add_argument("--mode", choices=["csv", "yfinance", "av"], default="yfinance")
-        parser.add_argument("--data_dir", default="./data")
-        parser.add_argument("--av_key", default=None)
-
-        # ====================================
-        # === Stock Tickers (from sector CSV)
-        sector_map_path = "tickers.csv"
-
-        sector_df = pd.read_csv(sector_map_path)
-
-        # canonical ticker universe
-        ALL_TICKERS = (
-            sector_df["ticker"]
-            .astype(str)
-            .str.upper()
-            .unique()
-            .tolist()
-        )
-
-        # optional deterministic ordering
-        ALL_TICKERS = sorted(ALL_TICKERS)
-
-        # test subset
-        test_limit = 10
-        tickers_for_test = ALL_TICKERS[:min(test_limit, len(ALL_TICKERS))]
-        
+        # === Run Mode / Execution Control
         parser.add_argument(
-            "--tickers", nargs="+", default=tickers_for_test,
-            help="List of stock tickers to include in analysis."
+            "--run_mode",
+            type=str,
+            default="gui",
+            choices=["gui", "headless"],
+            help="Execution mode: launch GUI or run a single headless experiment"
+        )
+        parser.add_argument(
+            "--target_stock",
+            type=str,
+            default=None,
+            help="Ticker to run in headless mode. Defaults to the first available ticker."
+        )
+        parser.add_argument(
+            "--prediction_window",
+            type=str,
+            default="1d",
+            choices=["1d", "2d", "5d", "1w"],
+            help="Prediction horizon label used by the pipeline"
         )
 
         # ====================================
-        # === Determinism & seeds
-        parser.add_argument("--deterministic", action="store_true",
-                            help="Use deterministic CUDA kernels and raise on non-deterministic ops.")
-        parser.add_argument("--no-deterministic", dest="deterministic", action="store_false")
-        parser.set_defaults(deterministic=False)
-        parser.add_argument("--base-seed", type=int, default=42,
-                            help="Base RNG seed. Experiments increment this per repetition.")
+        # === Result Saving
+        parser.add_argument(
+            "--save_results",
+            action="store_true",
+            default=False,
+            help="Save metrics to CSV"
+        )
+        parser.add_argument(
+            "--results_dir",
+            type=str,
+            default="./results",
+            help="Directory to save experiment results"
+        )
+        parser.add_argument(
+            "--experiment_name",
+            type=str,
+            default="benchmark_run",
+            help="Experiment name for saved outputs"
+        )
+        parser.add_argument(
+            "--config_file",
+            type=str,
+            default=None,
+            help="Path to JSON config file"
+        )
 
-        parser.add_argument("--num-workers", type=int, default=0,
-                            help="Number of worker processes for DataLoaders.")
-        
         # ====================================
-        # === Sampling interval
-        parser.add_argument("--interval", default="1h", help="Data sampling interval (e.g., 1h, 30m, 1d)")
+        # === Dataset / Universe Selection
+        parser.add_argument(
+            "--dataset_name",
+            type=str,
+            default="sp500_top_n",
+            choices=["sp500_top_n", "nasdaq100", "custom"],
+            help="Dataset / asset universe to use"
+        )
+        parser.add_argument(
+            "--top_n",
+            type=int,
+            default=50,
+            help="Top N assets to select where applicable"
+        )
+        parser.add_argument(
+            "--universe_as_of",
+            type=str,
+            default=None,
+            help="As-of date for universe selection metadata"
+        )
+        parser.add_argument(
+            "--custom_tickers",
+            nargs="+",
+            default=None,
+            help="Explicit ticker list when dataset_name=custom"
+        )
+        parser.add_argument(
+            "--dataset_dir",
+            type=str,
+            default="./data",
+            help="Reserved for future local dataset support"
+        )
+        parser.add_argument(
+            "--date_start",
+            type=str,
+            default=None,
+            help="Inclusive start date for price history"
+        )
+        parser.add_argument(
+            "--date_end",
+            type=str,
+            default=None,
+            help="Inclusive end date for price history"
+        )
+        parser.add_argument(
+            "--interval",
+            type=str,
+            default="1h",
+            help="Yahoo Finance sampling interval, e.g. 1h, 30m, 1d"
+        )
+
+        # ====================================
+        # === Legacy compatibility
+        parser.add_argument(
+            "--mode",
+            choices=["csv", "yfinance", "av"],
+            default="yfinance",
+            help="Legacy argument. Retained temporarily for compatibility."
+        )
+        parser.add_argument(
+            "--data_dir",
+            type=str,
+            default="./data",
+            help="Legacy argument. Retained temporarily for compatibility."
+        )
+        parser.add_argument(
+            "--av_key",
+            type=str,
+            default=None,
+            help="Legacy Alpha Vantage key. Not used in Yahoo-only path."
+        )
+
+        # ====================================
+        # === Model Selection
+        parser.add_argument(
+            "--model",
+            type=str,
+            choices=["lstm", "gru", "stgnn"],
+            default="lstm",
+            help="Model to run"
+        )
+
+        # ====================================
+        # === Experiment Controls
+        parser.add_argument(
+            "--num_seeds",
+            type=int,
+            default=3,
+            help="Number of random seeds to run per configuration"
+        )
+        parser.add_argument(
+            "--base_seed",
+            type=int,
+            default=42,
+            help="Base RNG seed for sweeps"
+        )
+        parser.add_argument(
+            "--seed",
+            type=int,
+            default=42,
+            help="Single-run RNG seed"
+        )
+        parser.add_argument(
+            "--deterministic",
+            action="store_true",
+            help="Use deterministic CUDA kernels and raise on non-deterministic ops."
+        )
+        parser.add_argument(
+            "--no_deterministic",
+            dest="deterministic",
+            action="store_false"
+        )
+        parser.set_defaults(deterministic=False)
+
+        parser.add_argument(
+            "--num_workers",
+            type=int,
+            default=0,
+            help="Number of worker processes for DataLoaders"
+        )
 
         # ====================================
         # === Sequence Length
         parser.add_argument(
-            "--seq-len", type=int, default=10,
-            help="Number of past timesteps to use as temporal lookback window."
+            "--seq_len",
+            type=int,
+            default=10,
+            help="Temporal lookback window"
         )
 
         # ====================================
         # === Graph Construction
-        parser.add_argument("--max_k", type=int, default=3, help="Number of edges to retain per node (KNN)")
-        
+        parser.add_argument(
+            "--k",
+            type=int,
+            default=3,
+            help="Number of edges to retain per node (KNN)"
+        )
+        parser.add_argument(
+            "--graph_mode",
+            type=str,
+            default="knn_mst",
+            choices=["knn", "mst", "knn_mst"],
+            help="Graph construction strategy"
+        )
+        parser.add_argument(
+            "--graph_window",
+            type=int,
+            default=10,
+            help="Rolling window size used when aggregating graph features"
+        )
+
         # ====================================
         # === Graph Rewiring
-        parser.add_argument("--rewiring", action="store_true",
-                            help="Enable post-training graph rewiring after STGNN training.")
-        parser.add_argument("--no-rewiring", dest="rewiring", action="store_false",
-                            help="Disable post-training graph rewiring.")
+        parser.add_argument(
+            "--rewiring",
+            action="store_true",
+            help="Enable post-training graph rewiring after STGNN training."
+        )
+        parser.add_argument(
+            "--no_rewiring",
+            dest="rewiring",
+            action="store_false",
+            help="Disable post-training graph rewiring."
+        )
         parser.set_defaults(rewiring=False)
 
         # ====================================
         # === Generic Training
-        parser.add_argument("--batch_size", type=int, default=256, help="Mini-batch size for training")
+        parser.add_argument("--batch_size", type=int, default=256, help="Mini-batch size")
         parser.add_argument("--dropout", type=float, default=0.15, help="Dropout rate")
+
         epoch_count = 50
         lr = 1e-4
-        parser.add_argument("--head_temperature", type=float, default=2.0,
-                            help="Post-hoc logit temperature (T>1 softens probabilities). Keep 1.0 for raw.")
 
-        # === Regularisation
-        parser.add_argument("--weight_decay", type=float, default=1e-5,
-                            help="Global L2 weight decay")
-        
-        # ====================================
-        # === LSTM Training
-        parser.add_argument("--lstm_lr", type=float, default=lr, help="Learning rate for LSTM")
-        parser.add_argument("--lstm_epochs", type=int, default=epoch_count, help="Number of LSTM training epochs")
-        parser.add_argument("--lstm_save", default="misc/lstm_best.pth",  # use forward slashes (portable)
-                            help="Path to save LSTM model")
+        parser.add_argument(
+            "--head_temperature",
+            type=float,
+            default=2.0,
+            help="Post-hoc logit temperature. Keep 1.0 for raw probabilities."
+        )
+        parser.add_argument(
+            "--weight_decay",
+            type=float,
+            default=1e-5,
+            help="Global L2 weight decay"
+        )
 
         # ====================================
-        # === LSTM Architecture
-        parser.add_argument("--lstm_hidden", type=int, default=16, help="Hidden dimension of LSTM layers")
-        parser.add_argument("--lstm_layers", type=int, default=2, help="Number of LSTM layers")
-        parser.add_argument("--bidirectional", action="store_true", help="Use bidirectional LSTM")
+        # === LSTM / GRU Training
+        parser.add_argument("--lstm_lr", type=float, default=lr, help="LSTM/GRU learning rate")
+        parser.add_argument("--lstm_epochs", type=int, default=epoch_count, help="LSTM/GRU epochs")
+        parser.add_argument("--lstm_save", type=str, default="misc/lstm_best.pth", help="LSTM save path")
+
+        # ====================================
+        # === LSTM / GRU Architecture
+        parser.add_argument("--lstm_hidden", type=int, default=16, help="LSTM/GRU hidden dimension")
+        parser.add_argument("--lstm_layers", type=int, default=2, help="Number of recurrent layers")
+        parser.add_argument("--bidirectional", action="store_true", help="Use bidirectional LSTM/GRU")
 
         # ====================================
         # === STGNN Training
-        parser.add_argument("--stgnn_lr", type=float, default=lr, help="Learning rate for STGNN")
-        parser.add_argument("--stgnn_epochs", type=int, default=epoch_count, help="Number of STGNN training epochs")
-        parser.add_argument("--stgnn_save", default="misc/stgnn_best.pth",
-                            help="Path to save STGNN model")
+        parser.add_argument("--stgnn_lr", type=float, default=lr, help="STGNN learning rate")
+        parser.add_argument("--stgnn_epochs", type=int, default=epoch_count, help="STGNN epochs")
+        parser.add_argument("--stgnn_save", type=str, default="misc/stgnn_best.pth", help="STGNN save path")
 
         # ====================================
         # === STGNN Architecture
-        parser.add_argument("--stgnn_blocks", type=int, default=2, help="Number of ST Blocks")
-        parser.add_argument("--tcn_channels", type=int, default=16, help="Channels in TCN layer")
-        parser.add_argument("--tcn_kernel_size", type=int, default=2, help="Kernel size in TCN layer")
-        parser.add_argument("--gcn_hidden", type=int, default=16, help="Hidden dimension in GCN")
-        
+        parser.add_argument("--stgnn_blocks", type=int, default=2, help="Number of ST blocks")
+        parser.add_argument("--tcn_channels", type=int, default=16, help="TCN channels")
+        parser.add_argument("--tcn_kernel_size", type=int, default=2, help="TCN kernel size")
+        parser.add_argument("--gcn_hidden", type=int, default=16, help="GCN hidden dimension")
+
         # ====================================
-        # === Feature Ablations
+        # === Ablations
         parser.add_argument(
             "--graph_ablation",
             type=str,
             default="none",
-            choices=["none", "identity"],
-            help="Graph ablation for STGNN: none=use learned sparse graph; "
-                "identity=self-loops only."
+            choices=["none", "identity", "empty"],
+            help="Graph ablation mode"
         )
-
         parser.add_argument(
             "--ablate_feature",
             type=str,
             default="none",
             choices=["none", "return", "volatility", "momentum"],
-            help="Ablation: remove exactly one engineered feature everywhere (node inputs + graph scalars)."
+            help="Remove one engineered feature everywhere"
         )
-
-        # === PCA ablation for graph embedding ===
         parser.add_argument(
             "--graph_embed",
             type=str,
             default="pca",
             choices=["pca", "raw"],
-            help="Graph scalar embedding: pca=StandardScaler+PCA; raw=StandardScaler only (no PCA)."
+            help="Graph scalar embedding mode"
         )
 
         # ====================================
-        # === Shared Representation + Head (ALL MODELS)
-        parser.add_argument("--rep_dim", type=int, default=128,
-                            help="Common representation dim fed into the shared classifier head")
-        parser.add_argument("--head_hidden", type=int, default=128,
-                            help="Hidden width inside the shared classifier head (same for all models)")
+        # === Shared Representation + Head
+        parser.add_argument(
+            "--rep_dim",
+            type=int,
+            default=128,
+            help="Shared representation dimension"
+        )
+        parser.add_argument(
+            "--head_hidden",
+            type=int,
+            default=128,
+            help="Shared classifier head hidden width"
+        )
 
-        return parser.parse_args()
+        args = parser.parse_args()
+
+        # ====================================
+        # === Config file override
+        if args.config_file is not None:
+            config_path = Path(args.config_file)
+            if not config_path.exists():
+                raise FileNotFoundError(f"Config file not found: {config_path}")
+
+            with config_path.open("r", encoding="utf-8") as f:
+                config_dict = json.load(f)
+
+            for key, value in config_dict.items():
+                if not hasattr(args, key):
+                    raise ValueError(f"Unknown config key in {config_path}: {key}")
+                setattr(args, key, value)
+
+        # ====================================
+        # === Validation
+        if args.dataset_name == "custom" and not args.custom_tickers:
+            raise ValueError("dataset_name='custom' requires --custom_tickers")
+
+        if args.run_mode == "headless" and args.target_stock is not None:
+            args.target_stock = args.target_stock.strip().upper()
+
+        if args.graph_window < 1:
+            raise ValueError("--graph_window must be >= 1")
+
+        if args.seq_len < 1:
+            raise ValueError("--seq_len must be >= 1")
+
+        if args.k < 0:
+            raise ValueError("--k must be >= 0")
+
+        return args

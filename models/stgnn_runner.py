@@ -4,10 +4,10 @@ import torch
 from torch.nn import BCEWithLogitsLoss
 from torch_geometric.loader import DataLoader as GeoDataLoader
 
-from Trainer import Trainer
+from trainer import Trainer
 from data import STGNNDataset
 from architectures import STGNNClassifier
-from Utils import Utils
+from utils import Utils
 
 from .base_runner import BaseModelRunner, ModelRunResult
 

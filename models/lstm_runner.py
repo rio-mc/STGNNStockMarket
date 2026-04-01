@@ -4,10 +4,10 @@ import numpy as np
 import torch
 from torch.nn import BCEWithLogitsLoss
 
-from Trainer import Trainer
+from trainer import Trainer
 from data import RecurrentDataset
 from architectures import LSTMClassifier
-from Utils import Utils
+from utils import Utils
 
 from .base_runner import BaseModelRunner, ModelRunResult
 
