@@ -79,15 +79,25 @@ class MainApp:
         self._resolve_universe()
 
         # ====================================
-        # === STEP 4: Front-end
+        # === STEP 4: Front-end / compatibility layer
         self.args.tickers = sorted(self.args.tickers)
+
+        run_mode = str(getattr(self.args, "run_mode", "gui")).strip().lower()
         self.frontendApp = FrontEnd(self.args.tickers)
 
-        avi_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "loading.avi"
-        )
-        self.loader = LoadingOverlay(self.frontendApp.root, avi_path, delay=24)
+        if run_mode == "headless":
+            # Transitional compatibility:
+            # keep FrontEnd/evaluator available for existing runners,
+            # but do not show a visible Tk window.
+            self.frontendApp.root.withdraw()
+            self.loader = None
+            self.logger.info("[Init] FrontEnd created in hidden mode for headless execution")
+        else:
+            avi_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "loading.avi"
+            )
+            self.loader = LoadingOverlay(self.frontendApp.root, avi_path, delay=24)
 
     def _resolve_universe(self):
         """
@@ -234,9 +244,178 @@ class MainApp:
             self.frontendApp.clear_status()
 
     def run(self):
-        threading.Thread(target=self._load_data_and_start_gui, daemon=True).start()
-        self.frontendApp.root.mainloop()
+        """
+        Entry point for application execution.
 
+        Modes:
+        - gui: start background data loading and enter the Tk mainloop
+        - headless: run a single CLI experiment without entering the GUI loop
+        """
+        run_mode = str(getattr(self.args, "run_mode", "gui")).strip().lower()
+
+        if run_mode == "gui":
+            self.logger.info("[RunMode] Starting GUI mode")
+            threading.Thread(target=self._load_data_and_start_gui, daemon=True).start()
+            self.frontendApp.root.mainloop()
+            return None
+
+        if run_mode == "headless":
+            self.logger.info("[RunMode] Starting headless mode")
+
+            selected_stock = getattr(self.args, "target_stock", None)
+            selected_window = getattr(self.args, "prediction_window", "1d")
+            selected_model = getattr(self.args, "model", "lstm")
+
+            result = self.run_headless(
+                stock=selected_stock,
+                gui_window=selected_window,
+                model_name=selected_model,
+            )
+
+            self.logger.info(
+                "[HeadlessResult] model=%s direction=%s confidence=%.2f",
+                result.model_name,
+                result.direction,
+                result.confidence,
+            )
+
+            print("\n=== Experiment Result ===")
+            print(f"Model      : {result.model_name}")
+            print(f"Direction  : {result.direction}")
+            print(f"Confidence : {result.confidence:.2f}%")
+
+            if getattr(result, "metrics", None):
+                print("Metrics:")
+                for key, value in result.metrics.items():
+                    print(f"  {key}: {value}")
+
+            return result
+
+        raise ValueError(
+            f"Unknown run_mode '{self.args.run_mode}'. "
+            f"Expected one of: gui, headless."
+        )
+    
+
+    def run_headless(self, stock: str = None, gui_window: str = None, model_name: str = None):
+        """
+        Run a single experiment without entering the Tk mainloop.
+
+        Transitional headless mode:
+        - reuses the existing FrontEnd/evaluator objects for compatibility
+        - keeps the Tk root hidden
+        - does not start the GUI event loop
+        """
+
+        # ====================================
+        # STEP 1: Ensure the compatibility UI stays hidden
+        try:
+            self.frontendApp.root.withdraw()
+            self.frontendApp.root.update_idletasks()
+        except Exception:
+            pass
+
+        # ====================================
+        # STEP 2: Resolve defaults
+        selected_stock = stock or (self.args.tickers[0] if self.args.tickers else None)
+        if not selected_stock:
+            raise RuntimeError("No stock available for headless execution.")
+
+        selected_stock = str(selected_stock).strip().upper()
+        selected_window = str(gui_window or getattr(self.args, "prediction_window", "1d")).strip()
+        selected_model = str(model_name or getattr(self.args, "model", "lstm")).strip().lower()
+        self.args.model = selected_model
+
+        self.logger.info(
+            "[Headless] stock=%s window=%s model=%s",
+            selected_stock,
+            selected_window,
+            selected_model,
+        )
+
+        # ====================================
+        # STEP 3: Establish feature columns
+        engineered = ["return", "volatility", "momentum"]
+        if self.args.ablate_feature != "none":
+            engineered = [f for f in engineered if f != self.args.ablate_feature]
+
+        self.raw_feature_cols = ["close"] + engineered
+
+        self.logger.info(
+            "[Ablation] ablate_feature=%s | node_raw_feature_cols=%s",
+            self.args.ablate_feature,
+            self.raw_feature_cols,
+        )
+
+        # ====================================
+        # STEP 4: Load raw price history synchronously
+        self.priceHistory, load_result = self._load_price_history(
+            self.args.tickers,
+            return_handler=True
+        )
+
+        valid_tickers = load_result.listTickers()
+        dropped_tickers = [t for t in self.args.tickers if t not in valid_tickers]
+        if dropped_tickers:
+            self.logger.warning(
+                "Dropped tickers (no valid data): %s",
+                ", ".join(dropped_tickers)
+            )
+
+        self.args.tickers = valid_tickers
+        self.raw_feature_dfs = {
+            t: self.priceHistory[t] for t in valid_tickers
+        }
+
+        if not self.raw_feature_dfs:
+            raise RuntimeError("No usable asset data was loaded.")
+
+        if selected_stock not in self.raw_feature_dfs:
+            raise ValueError(
+                f"Requested stock '{selected_stock}' not available after data load. "
+                f"Available: {', '.join(sorted(self.raw_feature_dfs.keys()))}"
+            )
+
+        # ====================================
+        # STEP 5: Bind compatibility state without starting mainloop
+        self.frontendApp.bindMainApp(self)
+        self.frontendApp.modelVar.set(selected_model.upper())
+        self.frontendApp.stockVar.set(selected_stock)
+        self.frontendApp.windowVar.set(selected_window)
+
+        evaluator = self.frontendApp.evaluator
+        evaluator.reset_histories()
+
+        # ====================================
+        # STEP 6: Build pipeline state
+        pipeline = Pipeline(self)
+        state = pipeline.run(selected_stock, selected_window, stop_event=None)
+
+        # ====================================
+        # STEP 7: Execute shared experiment runner
+        experiment_runner = ExperimentRunner(self)
+        result = experiment_runner.run(
+            model_name=selected_model,
+            stock=selected_stock,
+            state=state,
+            evaluator=evaluator,
+            stop_event=None,
+        )
+
+        # ====================================
+        # STEP 8: Flush pending UI work while remaining hidden
+        try:
+            self.frontendApp.updateResults(
+                result.model_name,
+                result.direction,
+                result.confidence,
+            )
+            self.frontendApp.root.update_idletasks()
+        except Exception as exc:
+            self.logger.warning("[Headless] UI compatibility update failed: %s", exc)
+
+        return result
+    
     def _load_price_history(self, tickers, period="729d", return_handler=False):
         """
         Load OHLCV data using the new Yahoo-only price loader.
