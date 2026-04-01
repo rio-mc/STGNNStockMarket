@@ -1,6 +1,6 @@
-from .lstm_runner import LSTMRunner
-from .gru_runner import GRURunner
-from .stgnn_runner import STGNNRunner
+from .runners.lstm_runner import LSTMRunner
+from .runners.gru_runner import GRURunner
+from .runners.stgnn_runner import STGNNRunner
 
 
 class ModelRegistry:

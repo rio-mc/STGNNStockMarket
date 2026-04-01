@@ -1,4 +1,4 @@
-from main import MainApp
+from core.main import MainApp
 
 
 def main():

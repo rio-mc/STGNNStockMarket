@@ -1,9 +1,9 @@
 import pandas as pd
 import torch
 
-from feature_extractor import FeatureExtractor
-from graph_builder import GraphBuilder
-from utils import Utils
+from features.feature_extractor import FeatureExtractor
+from graph.graph_builder import GraphBuilder
+from core.utils.utils import Utils
 
 
 class Pipeline:

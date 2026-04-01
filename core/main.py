@@ -9,11 +9,11 @@ import pandas as pd
 import torch
 
 from core.pipeline import Pipeline
-from front_end import FrontEnd
+from ui.front_end import FrontEnd
 from data.tensor_factory import TensorFactory
-from loading_overlay import LoadingOverlay
-from utils import Utils
-from config_manager import ConfigManager
+from ui.loading_overlay import LoadingOverlay
+from core.utils.utils import Utils
+from config.config_manager import ConfigManager
 from data.universe_service import UniverseService
 from data.yahoo_price_loader import YahooPriceLoader
 from core.experiment_runner import ExperimentRunner

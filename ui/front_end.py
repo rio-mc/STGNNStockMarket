@@ -11,7 +11,7 @@ import pandas as pd
 from matplotlib.figure import Figure
 from matplotlib.patches import Patch
 import matplotlib.cm as cm
-from evaluation_methods import EvaluationMethods
+from evaluation.evaluation_methods import EvaluationMethods
 
 class Cancelled(Exception):
     """Raised when training is aborted by user."""

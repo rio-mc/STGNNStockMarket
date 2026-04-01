@@ -3,7 +3,7 @@ import torch
 import numpy as np
 from torch_geometric.data import Batch as GeoBatch, Data
 import pandas as pd
-from evaluation_types import EvaluationResult
+from evaluation.evaluation_types import EvaluationResult
 from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetPowerUsage, nvmlShutdown
 
 

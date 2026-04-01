@@ -19,7 +19,7 @@ from sklearn.metrics import (
     f1_score
 )
 
-from evaluation_types import EvaluationResult
+from evaluation.evaluation_types import EvaluationResult
 
 class EvaluationMethods:
     """

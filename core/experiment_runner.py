@@ -3,7 +3,7 @@ import pandas as pd
 import torch
 
 from models import ModelRegistry
-from utils import Utils
+from core.utils.utils import Utils
 
 
 class ExperimentRunner:

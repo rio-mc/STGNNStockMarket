@@ -4,12 +4,12 @@ import torch
 from torch.nn import BCEWithLogitsLoss
 from torch_geometric.loader import DataLoader as GeoDataLoader
 
-from trainer import Trainer
+from trainer.trainer import Trainer
 from data import STGNNDataset
 from architectures import STGNNClassifier
-from utils import Utils
+from core.utils.utils import Utils
 
-from .base_runner import BaseModelRunner, ModelRunResult
+from ..base_runner import BaseModelRunner, ModelRunResult
 
 
 class STGNNRunner(BaseModelRunner):
