@@ -187,6 +187,12 @@ class MainApp:
             # STEP 1: Resolve model
             selected_model = self.frontendApp.get_selected_model()
             self.args.model = selected_model
+
+            self.frontendApp.root.after(
+                0,
+                lambda: self.frontendApp.set_active_model_titles(selected_model)
+            )
+
             self.logger.info("[ModelSelection] %s", selected_model)
 
             # ====================================
@@ -382,6 +388,7 @@ class MainApp:
         self.frontendApp.modelVar.set(selected_model.upper())
         self.frontendApp.stockVar.set(selected_stock)
         self.frontendApp.windowVar.set(selected_window)
+        self.frontendApp.set_active_model_titles(selected_model)
 
         evaluator = self.frontendApp.evaluator
         evaluator.reset_histories()

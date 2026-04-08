@@ -1,15 +1,22 @@
 import time
-import torch
+
 import numpy as np
-from torch_geometric.data import Batch as GeoBatch, Data
 import pandas as pd
+import torch
+from pynvml import (
+    nvmlDeviceGetHandleByIndex,
+    nvmlDeviceGetPowerUsage,
+    nvmlInit,
+    nvmlShutdown,
+)
+from torch_geometric.data import Batch as GeoBatch, Data
+
 from evaluation.evaluation_types import EvaluationResult
-from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetPowerUsage, nvmlShutdown
 
 
 class Trainer:
     """
-    Handles training and evaluation for both LSTM and STGNN models.
+    Handles training and rolling evaluation for a single active model run.
     """
 
     def __init__(
@@ -58,6 +65,10 @@ class Trainer:
         self._clip_activations = 0
         self.decision_threshold = 0.5
 
+        # Single-model history buffers
+        self.train_loss_history = []
+        self.val_loss_history = []
+
     def train(self, dataloader, num_epochs, stop_event=None):
         self._init_energy_monitoring()
 
@@ -74,7 +85,7 @@ class Trainer:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimiser,
             factor=0.5,
-            patience=5
+            patience=5,
         )
 
         for epoch in range(num_epochs):
@@ -146,21 +157,15 @@ class Trainer:
             self.energy_per_sample_epochs_Wh.append(energy_per_sample_Wh)
 
             print(f"[Epoch {epoch}] Avg Loss = {avg_loss:.4f}")
-            print(f"[Epoch {epoch}] Duration = {epoch_time:.2f}s | Avg Power = {avg_power:.2f} W | Energy = {energy_Wh:.4f} Wh")
+            print(
+                f"[Epoch {epoch}] Duration = {epoch_time:.2f}s | "
+                f"Avg Power = {avg_power:.2f} W | Energy = {energy_Wh:.4f} Wh"
+            )
 
             scheduler.step(avg_loss)
 
-            model_key = self.model_name
-            self.evaluator.record_training_loss(model_key, avg_loss)
-
-            self.evaluator.plot_loss(
-                hist_l=self.evaluator.get_training_loss("LSTM"),
-                hist_s=self.evaluator.get_training_loss("STGNN"),
-                hist_g=self.evaluator.get_training_loss("GRU"),
-                val_l=[v["loss"] for v in self.evaluator.get_validation_loss("LSTM")],
-                val_s=[v["loss"] for v in self.evaluator.get_validation_loss("STGNN")],
-                val_g=[v["loss"] for v in self.evaluator.get_validation_loss("GRU")],
-            )
+            # Store training loss locally for this single active model run
+            self.train_loss_history.append(float(avg_loss))
 
         self.total_energy_Wh = total_energy_Wh
         self.total_train_seconds = total_train_seconds
@@ -215,7 +220,7 @@ class Trainer:
                             x,
                             edge_index=edge_index,
                             edge_attr=edge_attr,
-                            target_node_index=self.targetIdx
+                            target_node_index=self.targetIdx,
                         )
                     else:
                         logits = self.model(x)
@@ -233,7 +238,11 @@ class Trainer:
                     loss = self.criterion(logits, y)
                     losses.append(loss.item())
 
-                    self.evaluator.record_validation_loss(self.model_name, loss.item(), timestamp)
+                    # Store validation loss locally for this single active model run
+                    self.val_loss_history.append({
+                        "date": timestamp,
+                        "loss": float(loss.item()),
+                    })
 
                 except Exception as e:
                     print(f"[ERROR] Skipping sample index={i} due to: {e}")
@@ -245,34 +254,29 @@ class Trainer:
         print(f"[EVAL] True 1s: {sum(y_true_all)}, 0s: {len(y_true_all) - sum(y_true_all)}")
         print(f"[EVAL] Mean validation loss (dense): {mean_val_loss:.6f}")
 
-        val_l = [v["loss"] for v in self.evaluator.get_validation_loss("LSTM")]
-        val_g = [v["loss"] for v in self.evaluator.get_validation_loss("GRU")]
-        val_s = [v["loss"] for v in self.evaluator.get_validation_loss("STGNN")]
-
-        self.evaluator.plot_loss(
-            hist_l=self.evaluator.get_training_loss("LSTM"),
-            hist_g=self.evaluator.get_training_loss("GRU"),
-            hist_s=self.evaluator.get_training_loss("STGNN"),
-            val_l=val_l,
-            val_g=val_g,
-            val_s=val_s
-        )
-
         return EvaluationResult(
             y_true=y_true_all,
             y_pred=y_pred_all,
             probs=probs_all,
             prediction_dates=prediction_dates,
-            hist_train=self.evaluator.get_training_loss(self.model_name),
-            hist_val=self.evaluator.get_validation_loss(self.model_name),
+            decision_threshold=float(self.decision_threshold),
+            dense_val_loss=mean_val_loss,
+            hist_train=self.train_loss_history,
+            hist_val=self.val_loss_history,
             horizon=self.prediction_horizon,
-            model_name=self.model_name
+            model_name=self.model_name,
+            metadata={
+                "evaluation_mode": "dense_rolling",
+                "decision_threshold_policy": "fixed",
+            },
         )
 
     def _unpack_batch(self, batch):
         if isinstance(batch, GeoBatch):
             if batch.x.dim() != 3:
-                raise ValueError(f"[Trainer:_unpack_batch] Expected batch.x dim=3, got shape={tuple(batch.x.shape)}")
+                raise ValueError(
+                    f"[Trainer:_unpack_batch] Expected batch.x dim=3, got shape={tuple(batch.x.shape)}"
+                )
 
             num_graphs = int(batch.num_graphs)
             num_nodes = len(self.tickers)
@@ -306,7 +310,7 @@ class Trainer:
             edge_attr = edge_attr.to(self.device) if edge_attr is not None else None
             return x.to(self.device), y.to(self.device), edge_index, edge_attr
 
-        elif isinstance(batch, (tuple, list)):
+        if isinstance(batch, (tuple, list)):
             x, y = batch
             return x.to(self.device), y.to(self.device), None, None
 
@@ -315,7 +319,12 @@ class Trainer:
     def _forward_and_loss(self, x, y, edge_index, edge_attr=None):
         if self.graphBuilder:
             assert self.targetIdx is not None, "STGNN requires a valid target index"
-            pred = self.model(x, edge_index=edge_index, edge_attr=edge_attr, target_node_index=self.targetIdx)
+            pred = self.model(
+                x,
+                edge_index=edge_index,
+                edge_attr=edge_attr,
+                target_node_index=self.targetIdx,
+            )
         else:
             pred = self.model(x)
 
