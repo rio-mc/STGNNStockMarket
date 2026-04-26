@@ -1,5 +1,5 @@
 import time
-
+from tqdm.auto import tqdm
 import numpy as np
 import pandas as pd
 import torch
@@ -88,31 +88,21 @@ class Trainer:
             patience=5,
         )
 
-        for epoch in range(num_epochs):
+        epoch_bar = tqdm(range(num_epochs), desc="Training", position=0)
+
+        for epoch in epoch_bar:
             epoch_samples = 0
             self.model.train()
             epoch_losses = []
             epoch_start_time = time.time()
             power_samples = []
 
-            print(f"[Trainer] Starting epoch {epoch + 1}/{num_epochs}")
-
             for batch_idx, batch in enumerate(dataloader):
                 try:
-                    if batch_idx == 0:
-                        print(f"[Trainer] First batch type: {type(batch)}")
 
                     power_samples.append(self._get_gpu_power_usage())
 
                     x, y, edge_index, edge_attr = self._unpack_batch(batch)
-
-                    if batch_idx == 0:
-                        print(f"[Trainer] x shape: {tuple(x.shape)}")
-                        print(f"[Trainer] y shape: {tuple(y.shape)}")
-                        if edge_index is not None:
-                            print(f"[Trainer] edge_index shape: {tuple(edge_index.shape)}")
-                        if edge_attr is not None:
-                            print(f"[Trainer] edge_attr shape: {tuple(edge_attr.shape)}")
 
                     batch_size = x.shape[0] if hasattr(x, "shape") and len(x.shape) > 0 else 1
                     epoch_samples += int(batch_size)
@@ -156,12 +146,6 @@ class Trainer:
             energy_per_sample_Wh = (energy_Wh / epoch_samples) if epoch_samples > 0 else 0.0
             self.energy_per_sample_epochs_Wh.append(energy_per_sample_Wh)
 
-            print(f"[Epoch {epoch}] Avg Loss = {avg_loss:.4f}")
-            print(
-                f"[Epoch {epoch}] Duration = {epoch_time:.2f}s | "
-                f"Avg Power = {avg_power:.2f} W | Energy = {energy_Wh:.4f} Wh"
-            )
-
             scheduler.step(avg_loss)
 
             # Store training loss locally for this single active model run
@@ -173,8 +157,8 @@ class Trainer:
         self.total_samples = total_samples
         self.energy_per_sample_Wh = (total_energy_Wh / total_samples) if total_samples > 0 else 0.0
 
-        print(f"[Training Summary] Total energy used: {self.total_energy_Wh:.4f} Wh")
-        print(f"[Training Summary] Batches with gradient clipping: {self._clip_activations}")
+        tqdm.write(f"[Training Summary] Total energy used: {self.total_energy_Wh:.4f} Wh")
+        tqdm.write(f"[Training Summary] Batches with gradient clipping: {self._clip_activations}")
 
         self._finalise_energy_monitoring()
         return self.total_energy_Wh
@@ -223,7 +207,10 @@ class Trainer:
                             target_node_index=self.targetIdx,
                         )
                     else:
-                        logits = self.model(x)
+                        if self.targetIdx is not None:
+                            logits = self.model(x, target_node_index=self.targetIdx)
+                        else:
+                            logits = self.model(x)
 
                     prob = torch.sigmoid(logits).item()
                     pred = int(prob >= self.decision_threshold)
@@ -326,7 +313,10 @@ class Trainer:
                 target_node_index=self.targetIdx,
             )
         else:
-            pred = self.model(x)
+            if self.targetIdx is not None:
+                pred = self.model(x, target_node_index=self.targetIdx)
+            else:
+                pred = self.model(x)
 
         y = y.view(-1, 1)
         loss = self.criterion(pred, y)

@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch.nn import BCEWithLogitsLoss
 
-from trainer.trainer import Trainer
+from training.trainer import Trainer
 from data import RecurrentDataset
 from architectures import GRUClassifier
 from core.utils.utils import Utils
@@ -26,17 +26,28 @@ class GRURunner(BaseModelRunner):
         val_df_stock = app.val_feats[stock].iloc[-app.min_val_len:]
 
         gru_train_ds = RecurrentDataset(
-            app.tf_train,
-            {stock: train_df_stock},
-            stock,
-            app.horizon,
+            feature_dict={stock: train_df_stock},
+            tickers=[stock],
+            target_ticker=stock,
+            feature_cols=app.raw_feature_cols,
+            seq_len=app.seq_len,
+            prediction_horizon=app.horizon,
         )
 
         gru_val_ds = RecurrentDataset(
-            app.tf_val,
-            {stock: val_df_stock},
-            stock,
-            app.horizon,
+            feature_dict={stock: val_df_stock},
+            tickers=[stock],
+            target_ticker=stock,
+            feature_cols=app.raw_feature_cols,
+            seq_len=app.seq_len,
+            prediction_horizon=app.horizon,
+        )
+
+        app.logger.info(
+            "[GRURunner] train_ds size=%d | val_ds size=%d | aligned_tickers=%s",
+            len(gru_train_ds),
+            len(gru_val_ds),
+            gru_train_ds.aligned_tickers,
         )
 
         dl_gru_train = torch.utils.data.DataLoader(
@@ -59,7 +70,7 @@ class GRURunner(BaseModelRunner):
         ).to(app.device)
 
         params = Utils.count_parameters(model)
-        app.logger.info(f"GRU parameters: {params:,}")
+        app.logger.info("GRU parameters: %s", f"{params:,}")
 
         trainer = Trainer(
             model,
@@ -83,14 +94,15 @@ class GRURunner(BaseModelRunner):
             app.args.lstm_epochs,
             stop_event=stop_event,
         )
-        app.logger.info(f"[GRURunner] Training completed in {time.time() - start:.2f}s")
+        app.logger.info("[GRURunner] Training completed in %.2fs", time.time() - start)
         Utils.log_gpu_memory("After GRU")
 
         app._check_stop(stop_event)
 
         app.frontendApp.set_status("Evaluating GRU...")
         eval_result = trainer.evaluate_rolling(gru_val_ds)
-
+        self._attach_metadata(app, eval_result)
+        
         if hasattr(model, "classifier") and hasattr(model.classifier, "set_temperature"):
             model.classifier.set_temperature(app.args.head_temperature)
 
@@ -109,7 +121,11 @@ class GRURunner(BaseModelRunner):
         with torch.no_grad():
             prob = torch.sigmoid(model(arr_x)[0]).item()
 
-        threshold = metrics.get("best_threshold", 0.5)
+        threshold = self._resolve_threshold(
+            metrics,
+            policy=getattr(app.args, "decision_threshold_policy", "fixed"),
+        )
+
         if prob >= threshold:
             direction = "Upwards"
             confidence = prob * 100.0
@@ -117,7 +133,7 @@ class GRURunner(BaseModelRunner):
             direction = "Downwards"
             confidence = (1.0 - prob) * 100.0
 
-        app.logger.info(f"[GRURunner] {direction} ({confidence:.1f}%)")
+        app.logger.info("[GRURunner] %s (%.1f%%)", direction, confidence)
 
         result = ModelRunResult(
             model_name=self.model_name,

@@ -1,32 +1,51 @@
-# STGNN GUI (Docker + CUDA)
+# STGNN Stock Market Prediction
 
-This repo can be run inside a GPU-enabled Docker container **with the Tkinter GUI**.  
-You can also run everything locally (recommended if you’re developing and already have Python + deps installed).
-
-## Which should I use?
-- **Docker (recommended for reproducibility / easiest setup):** best if you want “it runs” with fewer dependency issues.
-- **Local install:** best if you’re actively developing and don’t want GUI/X11 in a container.
+Spatio-temporal graph neural network framework for stock trend prediction, with recurrent and graph-based baselines.
 
 ---
 
-## Prerequisites
+## Overview
 
-### Linux (recommended)
-- NVIDIA GPU drivers installed
-- Docker installed
-- NVIDIA Container Toolkit installed (enables `--gpus all`)
+This project compares:
 
-### Windows / macOS
-- Windows: use **WSL2** + Docker Desktop + an X server (e.g., VcXsrv)
-- macOS: you generally need an X server (XQuartz). GPU passthrough is not as straightforward as Linux.
+- **LSTM / GRU** → single-asset temporal models  
+- **PANEL_GRU** → multi-asset temporal (no graph)  
+- **STGNN** → spatio-temporal graph model  
 
-If you only care about running on Linux with a local desktop, the steps below are the smoothest.
+The goal is to isolate the gain from **graph structure vs temporal modelling alone**.
 
 ---
 
-## Docker: Build the image
+## Setup Options
 
-From the repo root (where the Dockerfile is):
+### Recommended: Local virtual environment (development)
+
+### Alternative: Docker (reproducibility)
+
+---
+
+# Local Setup (Recommended)
+
+## 1. Create virtual environment
 
 ```bash
-docker build -t stgnn-gui:cuda .
+python -m venv .venv
+
+.venv\Scripts\Activate.ps1
+```
+
+## 2. Install dependecies
+
+```bash
+pip install --upgrade pip
+pip install -r instructions/requirements.txt
+
+# GPU / PyTorch CUDA 12.1 example
+pip install -r instructions/requirements-gpu.txt --extra-index-url https://download.pytorch.org/whl/cu121
+```
+
+## 3. Run application
+
+```bash
+python -m core.main
+```

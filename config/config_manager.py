@@ -69,8 +69,8 @@ class ConfigManager:
         parser.add_argument(
             "--dataset_name",
             type=str,
-            default="sp500_top_n",
-            choices=["sp500_top_n", "nasdaq100", "custom"],
+            default="sp500",
+            choices=["sp500", "nasdaq100", "custom"],
             help="Dataset / asset universe to use"
         )
         parser.add_argument(
@@ -142,11 +142,35 @@ class ConfigManager:
         parser.add_argument(
             "--model",
             type=str,
-            choices=["lstm", "gru", "stgnn"],
+            choices=[
+                "lstm",
+                "gru",
+                "panel_gru",
+                "panel_lstm",
+                "gcn",
+                "nnconv",
+                "graphsage",
+                "stgnn",
+            ],
             default="lstm",
-            help="Model to run"
+            help="Model to run",
         )
 
+        parser.add_argument(
+            "--graph_model",
+            type=str,
+            default="gcn",
+            choices=["gcn", "graphsage", "gat", "nnconv"],
+            help="Graph operator/backend used by STGNN-style graph models."
+        )
+        parser.add_argument(
+            "--decision-threshold-policy",
+            type=str,
+            default="fixed",
+            choices=["fixed", "macro_f1_dense"],
+            help="Threshold policy for final decision"
+        )
+        
         # ====================================
         # === Experiment Controls
         parser.add_argument(

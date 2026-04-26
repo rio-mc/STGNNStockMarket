@@ -6,6 +6,7 @@ import networkx as nx
 from pympler import asizeof
 import pandas as pd
 from torch.optim import AdamW
+from pathlib import Path
 
 class Utils:
 
@@ -184,7 +185,17 @@ class Utils:
         raise ValueError(f"Unknown graph ablation mode: {mode}")
     
     def load_ticker_to_sector(csv_path: str) -> dict:
-        df = pd.read_csv(csv_path)
+        path = Path(csv_path)
+
+        # If relative path, resolve from project root
+        if not path.is_absolute():
+            project_root = Path(__file__).resolve().parents[2]
+            path = project_root / "static" / "universes" / csv_path
+
+        if not path.exists():
+            raise FileNotFoundError(f"Ticker CSV not found at: {path}")
+
+        df = pd.read_csv(path)
 
         assert "ticker" in df.columns and "sector" in df.columns, \
             "CSV must contain 'ticker' and 'sector' columns"

@@ -1,77 +1,152 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.nn import NNConv
 from typing import Optional
 
+from torch_geometric.nn import GATConv, GCNConv, SAGEConv
+
 from .shared_head import SharedClassifierHead
+from .components.temporal_encoders import TCNTemporalEncoder
+from .components.graph_layers import EdgeConditionedNNConvLayer
+from .components.readouts import NeighbourAttentionReadout
 
 
-class STBlock(nn.Module):
-    def __init__(self, in_channels, tcn_channels, gcn_hidden, tcn_kernel, dropout):
+class GraphOperatorLayer(nn.Module):
+    """
+    Batched graph operator wrapper.
+
+    Input:
+        x: [B, N, H]
+        edge_index: batched edge index over B copies of the graph
+        edge_attr: optional edge features, used only for nnconv
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        dropout: float,
+        graph_model: str = "gcn",
+    ):
         super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.dropout = float(dropout)
+        self.graph_model = str(graph_model).strip().lower()
 
-        self.conv1 = nn.Conv1d(in_channels, tcn_channels, kernel_size=tcn_kernel, padding=tcn_kernel // 2)
-        self.conv2 = nn.Conv1d(tcn_channels, gcn_hidden, kernel_size=tcn_kernel, padding=tcn_kernel // 2)
+        if self.graph_model == "nnconv":
+            self.op = EdgeConditionedNNConvLayer(
+                hidden_dim=hidden_dim,
+                dropout=dropout,
+                aggr="mean",
+            )
+        elif self.graph_model == "gcn":
+            self.op = GCNConv(hidden_dim, hidden_dim)
+        elif self.graph_model == "graphsage":
+            self.op = SAGEConv(hidden_dim, hidden_dim, aggr="mean")
+        elif self.graph_model == "gat":
+            self.op = GATConv(
+                hidden_dim,
+                hidden_dim,
+                heads=1,
+                concat=False,
+                dropout=dropout,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported graph_model='{graph_model}'. "
+                f"Expected one of: gcn, graphsage, gat, nnconv."
+            )
 
-        self.norm_t = nn.LayerNorm(gcn_hidden)
-
-        nn_edge_mlp = nn.Sequential(
-            nn.Linear(1, gcn_hidden),
-            nn.ReLU(),
-            nn.Linear(gcn_hidden, gcn_hidden * gcn_hidden)
-        )
-
-        self.gcn = NNConv(
-            in_channels=gcn_hidden,
-            out_channels=gcn_hidden,
-            nn=nn_edge_mlp,
-            aggr="mean"
-        )
-        self.norm_g = nn.LayerNorm(gcn_hidden)
-        self.dropout = nn.Dropout(dropout)
-
-        self._init_weights()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.act = nn.ReLU()
+        self.drop = nn.Dropout(dropout)
 
     def forward(
         self,
-        h_seq: torch.Tensor,
+        x: torch.Tensor,
         edge_index: torch.LongTensor,
-        edge_attr: Optional[torch.Tensor] = None
+        edge_attr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        x = h_seq.permute(0, 2, 1)   # [B*N, F, T]
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = x.permute(0, 2, 1)       # [B*N, T, H]
+        if x.dim() != 3:
+            raise ValueError(f"Expected x shape [B, N, H], got {tuple(x.shape)}")
 
-        x = x.mean(dim=1)            # [B*N, H]
-        x = self.norm_t(x)
+        batch_size, num_nodes, hidden_dim = x.shape
+        if hidden_dim != self.hidden_dim:
+            raise ValueError(
+                f"Hidden dim mismatch: got {hidden_dim}, expected {self.hidden_dim}"
+            )
 
-        h_spat = self.gcn(x, edge_index, edge_attr)
-        h_spat = self.norm_g(h_spat + x)
-        h_spat = F.relu(h_spat)
-        h_spat = self.dropout(h_spat)
+        x_flat = x.reshape(batch_size * num_nodes, hidden_dim)
 
-        return h_spat.unsqueeze(1)   # [B*N, 1, H]
+        if self.graph_model == "nnconv":
+            h = self.op(x, edge_index, edge_attr)
+        else:
+            h = self.op(x_flat, edge_index)
+            h = h.reshape(batch_size, num_nodes, hidden_dim)
 
-    def _init_weights(self):
-        for conv in (self.conv1, self.conv2):
-            nn.init.kaiming_uniform_(conv.weight, nonlinearity="relu")
-            if conv.bias is not None:
-                nn.init.zeros_(conv.bias)
+        h = self.norm(h)
+        h = self.act(h)
+        h = self.drop(h)
+        return h
 
-        for ln in (self.norm_t, self.norm_g):
-            nn.init.ones_(ln.weight)
-            nn.init.zeros_(ln.bias)
 
-        for m in self.gcn.nn.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+class STBlock(nn.Module):
+    """
+    One reusable spatio-temporal block:
+
+        TCN temporal encoder -> selectable graph layer
+
+    Input:
+        x: [B, N, T, F] for first block
+        or [B, N, 1, H] for later blocks
+
+    Output:
+        h_seq: [B, N, 1, H]
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        tcn_channels: int,
+        gcn_hidden: int,
+        tcn_kernel: int,
+        dropout: float,
+        graph_model: str = "gcn",
+    ):
+        super().__init__()
+
+        self.temporal = TCNTemporalEncoder(
+            in_channels=in_channels,
+            tcn_channels=tcn_channels,
+            hidden_dim=gcn_hidden,
+            kernel_size=tcn_kernel,
+        )
+
+        self.graph = GraphOperatorLayer(
+            hidden_dim=gcn_hidden,
+            dropout=dropout,
+            graph_model=graph_model,
+        )
+
+    def forward(
+        self,
+        x_seq: torch.Tensor,
+        edge_index: torch.LongTensor,
+        edge_attr: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        h = self.temporal(x_seq)
+        h = self.graph(h, edge_index, edge_attr)
+        return h.unsqueeze(2)
 
 
 class STGNNClassifier(nn.Module):
+    """
+    Full spatio-temporal graph model.
+
+    Composition:
+        stacked STBlocks
+        -> neighbour attention readout
+        -> shared classifier head
+    """
+
     def __init__(
         self,
         edge_index: torch.LongTensor,
@@ -84,14 +159,16 @@ class STGNNClassifier(nn.Module):
         out_dim: int = 1,
         dropout: float = 0.3,
         rep_dim: int = 128,
-        head_hidden: int = 128
+        head_hidden: int = 128,
+        graph_model: str = "gcn",
     ):
         super().__init__()
 
-        self.feature_dim = feature_dim
-        self.gcn_hidden = gcn_hidden
+        self.feature_dim = int(feature_dim)
+        self.gcn_hidden = int(gcn_hidden)
         self.edge_index = edge_index
-        self.num_nodes = num_nodes
+        self.num_nodes = int(num_nodes)
+        self.graph_model = str(graph_model).strip().lower()
 
         self.blocks = nn.ModuleList()
         for i in range(stgnn_blocks):
@@ -102,24 +179,27 @@ class STGNNClassifier(nn.Module):
                     tcn_channels=tcn_channels,
                     gcn_hidden=gcn_hidden,
                     tcn_kernel=tcn_kernel,
-                    dropout=dropout
+                    dropout=dropout,
+                    graph_model=self.graph_model,
                 )
             )
+
+        self.readout = NeighbourAttentionReadout()
 
         self.head_norm = nn.LayerNorm(gcn_hidden * 2)
         self.rep_proj = nn.Linear(gcn_hidden * 2, rep_dim)
         self.rep_norm = nn.LayerNorm(rep_dim)
+        self.dropout = nn.Dropout(dropout)
 
         self.classifier = SharedClassifierHead(
             in_dim=rep_dim,
             base_hidden=head_hidden,
             out_channels=out_dim,
-            dropout=dropout
+            dropout=dropout,
         )
 
         self.bottleneck = nn.Linear(gcn_hidden, 3)
-        self.norm = nn.LayerNorm(gcn_hidden)
-        self.dropout = nn.Dropout(dropout)
+        self.embed_norm = nn.LayerNorm(gcn_hidden)
 
         self._init_weights()
 
@@ -128,230 +208,59 @@ class STGNNClassifier(nn.Module):
         x: torch.Tensor,
         edge_index: Optional[torch.LongTensor] = None,
         edge_attr: Optional[torch.Tensor] = None,
-        target_node_index: Optional[int] = None
+        target_node_index: Optional[int] = None,
     ) -> torch.Tensor:
-        B, N, T, F_in = x.shape
-        if N != self.num_nodes:
-            raise ValueError(f"[STGNN] Expected {self.num_nodes} nodes, got {N}")
+        _batch_size, num_nodes, _seq_len, _feat_dim = x.shape
 
-        if edge_index is None:
-            edge_index = self.edge_index
-
-        h = x.contiguous().view(B * N, T, F_in)
-
-        for block in self.blocks:
-            h_new = block(h, edge_index, edge_attr)
-            h = h + h_new if h_new.shape == h.shape else h_new
-
-        h_final = h.mean(dim=1).view(B, N, self.gcn_hidden)
+        if num_nodes != self.num_nodes:
+            raise ValueError(f"[STGNN] Expected {self.num_nodes} nodes, got {num_nodes}")
 
         if target_node_index is None:
             raise ValueError("Must supply target_node_index")
 
-        target_h = h_final[:, target_node_index, :]
+        if edge_index is None:
+            edge_index = self.edge_index
 
-        src, dst = edge_index
-        mask = (src == target_node_index) | (dst == target_node_index)
-        neigh_idx = torch.unique(
-            torch.cat([
-                src[mask],
-                dst[mask],
-                torch.tensor([target_node_index], device=edge_index.device)
-            ])
+        h_seq = x
+        for block in self.blocks:
+            h_new = block(h_seq, edge_index=edge_index, edge_attr=edge_attr)
+            h_seq = h_seq + h_new if h_seq.shape == h_new.shape else h_new
+
+        h_final = h_seq.squeeze(2)
+
+        combined = self.readout(
+            h=h_final,
+            edge_index=edge_index,
+            target_node_index=int(target_node_index),
         )
 
-        q = target_h.unsqueeze(1)
-        K = h_final.index_select(1, neigh_idx)
-        att = torch.softmax((q @ K.transpose(1, 2)) / (K.size(-1) ** 0.5), dim=-1)
-        context_h = (att @ K).squeeze(1)
-
-        combined = torch.cat([target_h, context_h], dim=-1)
         combined = self.head_norm(combined)
         rep = self.rep_norm(self.rep_proj(combined))
         rep = self.dropout(rep)
-        logits = self.classifier(rep)
-        return logits
 
-    def embed(self, x: torch.Tensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.Tensor] = None) -> torch.Tensor:
-        self.eval()
-        with torch.no_grad():
-            B, N, T, F_in = x.shape
-            h = x.contiguous().view(B * N, T, F_in)
+        return self.classifier(rep)
 
-            for block in self.blocks:
-                h = block(h, edge_index, edge_attr)
-            h_final = h.mean(dim=1).view(B, N, self.gcn_hidden)
-            return self.bottleneck(self.norm(h_final))
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-
-class STGNNClassifier(nn.Module):
-    def __init__(
-        self,
-        edge_index: torch.LongTensor,
-        num_nodes: int,
-        feature_dim: int,
-        tcn_channels: int = 32,
-        tcn_kernel: int = 3,
-        gcn_hidden: int = 32,
-        stgnn_blocks: int = 2,
-        out_dim: int = 1,
-        dropout: float = 0.3,
-        rep_dim: int = 128,
-        head_hidden: int = 128
-    ):
-        # === STEP 1: Initialisation ===
-        # ------------------------------------
-
-        #   1. Parent abstract class initialisation
-        super().__init__()
-
-        #   2. Model parameters
-        self.feature_dim = feature_dim
-        self.gcn_hidden  = gcn_hidden
-
-        #   3. Graph parameters
-        self.edge_index  = edge_index
-        self.num_nodes   = num_nodes
-
-        # === STEP 2: Stacked ST blocks ===
-        # ------------------------------------
-        self.blocks = nn.ModuleList()
-        for i in range(stgnn_blocks):
-            in_ch = feature_dim if i == 0 else gcn_hidden
-            self.blocks.append(
-                STBlock(
-                    in_channels=in_ch,
-                    tcn_channels=tcn_channels,
-                    gcn_hidden=gcn_hidden,
-                    tcn_kernel=tcn_kernel,
-                    dropout=dropout
-                )
-            )
-
-        # === STEP 3: target + context -> logits (shared head) ===
-        # ------------------------------------
-        self.head_norm = nn.LayerNorm(gcn_hidden * 2)   # keep: stabilizes combined vector
-        self.rep_proj  = nn.Linear(gcn_hidden * 2, rep_dim)
-        self.rep_norm  = nn.LayerNorm(rep_dim)
-
-        # === Shared classifier head (identical across all models) ===
-        self.classifier = SharedClassifierHead(
-            in_dim=rep_dim,
-            base_hidden=head_hidden,
-            out_channels=out_dim,
-            dropout=dropout
-        )
-
-        self.bottleneck = nn.Linear(gcn_hidden, 3)  # used in embed()
-        self.norm      = nn.LayerNorm(gcn_hidden)
-        self.dropout   = nn.Dropout(dropout)
-
-		# === STEP 4: Initialise weights ===
-        # ------------------------------------
-        self._init_weights()
-
-    def forward(
+    def embed(
         self,
         x: torch.Tensor,
-        edge_index: Optional[torch.LongTensor] = None,
+        edge_index: torch.LongTensor,
         edge_attr: Optional[torch.Tensor] = None,
-        target_node_index: Optional[int] = None
     ) -> torch.Tensor:
-        """
-        Forward pass for STGNN with neighbour-only context aggregation.
-
-        Args:
-            x: [B, N, T, F] input tensor
-            edge_index: Graph connectivity [2, E] (optional, defaults to self.edge_index)
-            edge_attr: Edge features [E, *] or None
-            target_node_index: Index of node to classify
-        """
-        # 1. Validate shapes
-        B, N, T, F_in = x.shape
-        if N != self.num_nodes:
-            raise ValueError(f"[STGNN] Expected {self.num_nodes} nodes, got {N}")
-
-        # 2. Fallback to stored graph if not provided
-        if edge_index is None:
-            edge_index = self.edge_index
-
-        # 3. Node-wise sequences: [B*N, T, F]
-        # x is [B, N, T, F] -> flatten nodes without mixing time/features
-        h = x.contiguous().view(B * N, T, F_in)
-
-        # 4. ST blocks (+ residual if shapes match)
-        for block in self.blocks:
-            h_new = block(h, edge_index, edge_attr)
-            h = h + h_new if h_new.shape == h.shape else h_new
-
-        # 5. Aggregate over time → [B, N, H]
-        h_final = h.mean(dim=1).view(B, N, self.gcn_hidden)
-
-        # 6. Target/context split
-        if target_node_index is None:
-            raise ValueError("Must supply target_node_index")
-
-        target_h = h_final[:, target_node_index, :]  # [B, H]
-
-        # --- Neighbour-only context aggregation ---
-        src, dst = edge_index
-        mask = (src == target_node_index) | (dst == target_node_index)
-        neigh_idx = torch.unique(
-            torch.cat([
-                src[mask], dst[mask],
-                torch.tensor([target_node_index], device=edge_index.device)  # include self
-            ])
-        )
-        # context_h = h_final.index_select(1, neigh_idx).mean(dim=1)  # [B, H]
-
-        # Optional: attention-based context
-        q = target_h.unsqueeze(1)                                  # [B, 1, H]
-        K = h_final.index_select(1, neigh_idx)                     # [B, M, H]
-        att = torch.softmax((q @ K.transpose(1, 2)) / (K.size(-1) ** 0.5), dim=-1)
-        context_h = (att @ K).squeeze(1)                           # [B, H]
-
-        # 7. Combine target + context, classify
-        combined = torch.cat([target_h, context_h], dim=-1)  # [B, 2H]
-        combined = self.head_norm(combined)
-        rep = self.rep_norm(self.rep_proj(combined))         # [B, rep_dim]
-        rep = self.dropout(rep)
-        logits = self.classifier(rep)
-        return logits
-
-    def embed(self, x: torch.Tensor, edge_index: torch.LongTensor, edge_attr: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # ====================================
-		# === Helper to produce embedding at evaluation time
         self.eval()
         with torch.no_grad():
-            B, N, T, F_in = x.shape
-            # x is [B, N, T, F] -> flatten nodes without mixing time/features
-            h = x.contiguous().view(B * N, T, F_in)
-
+            h_seq = x
             for block in self.blocks:
-                h = block(h, edge_index, edge_attr)
-            h_final = h.mean(dim=1).view(B, N, self.gcn_hidden)
-            return self.bottleneck(self.norm(h_final))
+                h_seq = block(h_seq, edge_index=edge_index, edge_attr=edge_attr)
+
+            h_final = h_seq.squeeze(2)
+            return self.bottleneck(self.embed_norm(h_final))
 
     def _init_weights(self):
-        # ====================================
-		# === Helper to initialise layer weights
-
-        #   1. Linear layers -> Glorot; biases 0
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.ones_(m.weight)
+        for m in (self.rep_proj, self.bottleneck):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
                 nn.init.zeros_(m.bias)
-        # (STBlock initialises its own convs and NNConv edge MLP)
+
+        for ln in (self.head_norm, self.rep_norm, self.embed_norm):
+            nn.init.ones_(ln.weight)
+            nn.init.zeros_(ln.bias)

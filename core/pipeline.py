@@ -123,7 +123,7 @@ class Pipeline:
 
         # ====================================
         # STEP 5: Graph construction
-        ticker_to_sector = Utils.load_ticker_to_sector("tickers.csv")
+        ticker_to_sector = Utils.load_ticker_to_sector("sp500_tickers.csv")
 
         graphBuilder = GraphBuilder(
             dfFeats=train_feats,

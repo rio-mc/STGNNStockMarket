@@ -1,43 +1,59 @@
-from typing import Dict
+from __future__ import annotations
+
+from typing import Dict, List, Optional
+
 import pandas as pd
+import torch
 from torch.utils.data import Dataset
+
+from data.tensor_factory import TensorFactory
 
 
 class RecurrentDataset(Dataset):
+    """
+    Dataset wrapper for LSTM/GRU-style models.
+
+    This dataset is intentionally thin:
+    - TensorFactory handles window generation and alignment
+    - Dataset handles indexing and timestamp retrieval
+    """
+
     def __init__(
         self,
-        tensor_factory,
-        df_feats: Dict[str, pd.DataFrame],
+        feature_dict: Dict[str, pd.DataFrame],
+        tickers: Optional[List[str]] = None,
         target_ticker: str = "AAPL",
-        prediction_horizon: int = 1
-    ):
-        self.tensor_factory = tensor_factory
-        self.df_feats = df_feats
+        feature_cols: Optional[List[str]] = None,
+        seq_len: int = 32,
+        prediction_horizon: int = 1,
+    ) -> None:
+        self.feature_dict = feature_dict
+        self.requested_tickers = tickers or list(feature_dict.keys())
         self.target_ticker = target_ticker
-        self.horizon = prediction_horizon
-        self.seq_len = tensor_factory.seq_len
+        self.feature_cols = feature_cols or ["close", "return", "volatility", "momentum"]
+        self.seq_len = int(seq_len)
+        self.horizon = int(prediction_horizon)
 
-        self.x, self.y = tensor_factory.getLstmAllWindows(
-            features=self.df_feats,
-            tickers=list(self.df_feats.keys()),
+        self.x, self.y, self.timestamps, self.metadata = TensorFactory.build_recurrent_windows(
+            features=self.feature_dict,
+            tickers=self.requested_tickers,
             target_ticker=self.target_ticker,
-            feature_cols=tensor_factory.featureCols
+            feature_cols=self.feature_cols,
+            seq_len=self.seq_len,
+            prediction_horizon=self.horizon,
         )
 
-        df = self.df_feats[self.target_ticker]
-        full_index = df.index
-        pred_offset = self.seq_len + self.horizon - 1
-        self.timestamps = full_index[pred_offset - 1:]
-        self.timestamps = self.timestamps[:len(self.x)]
-
-    def __len__(self):
+        self.aligned_tickers = list(self.metadata["aligned_tickers"])
+        assert len(self.x) == len(self.y)
+        
+    def __len__(self) -> int:
         return len(self.x)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         return (
             self.x[idx].clone().detach().float(),
-            self.y[idx].clone().detach().float()
+            self.y[idx].clone().detach().float(),
         )
 
-    def get_timestamp(self, idx):
+    def get_timestamp(self, idx: int):
         return self.timestamps[idx]

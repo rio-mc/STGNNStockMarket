@@ -1,6 +1,4 @@
-torch
-torch-geometric
-numpy
+numpy==1.26.4
 pandas
 scikit-learn
 networkx
@@ -10,3 +8,6 @@ yfinance
 alpha_vantage
 requests
 nvidia-ml-py
+tqdm
+pympler
+opencv-python

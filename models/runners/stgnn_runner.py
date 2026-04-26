@@ -4,7 +4,7 @@ import torch
 from torch.nn import BCEWithLogitsLoss
 from torch_geometric.loader import DataLoader as GeoDataLoader
 
-from trainer.trainer import Trainer
+from training.trainer import Trainer
 from data import STGNNDataset
 from architectures import STGNNClassifier
 from core.utils.utils import Utils
@@ -22,9 +22,45 @@ class STGNNRunner(BaseModelRunner):
             torch.cuda.reset_peak_memory_stats()
         Utils.log_gpu_memory("Before STGNN")
 
+        stgnn_train_ds = STGNNDataset(
+            graph_builder=app.graphBuilder,
+            feature_dict=app.train_feats,
+            tickers=app.args.tickers,
+            edge_index=app.init_edge_index,
+            target_ticker=stock,
+            feature_cols=app.raw_feature_cols,
+            seq_len=app.seq_len,
+            horizon=app.horizon,
+            include_target_flag=True,
+        )
+
+        stgnn_val_ds = STGNNDataset(
+            graph_builder=app.graphBuilder,
+            feature_dict=app.val_feats,
+            tickers=app.args.tickers,
+            edge_index=app.init_edge_index,
+            target_ticker=stock,
+            feature_cols=app.raw_feature_cols,
+            seq_len=app.seq_len,
+            horizon=app.horizon,
+            include_target_flag=True,
+        )
+
+        aligned_tickers = stgnn_train_ds.tickers
+        num_nodes = len(aligned_tickers)
+
+        app.logger.info("[STGNNRunner] train_ds size=%d", len(stgnn_train_ds))
+        app.logger.info("[STGNNRunner] val_ds size=%d", len(stgnn_val_ds))
+        app.logger.info("[STGNNRunner] aligned_tickers=%s", aligned_tickers)
+
+        if len(stgnn_train_ds) == 0:
+            raise RuntimeError("STGNN training dataset is empty.")
+        if len(stgnn_val_ds) == 0:
+            raise RuntimeError("STGNN validation dataset is empty.")
+
         model = STGNNClassifier(
             edge_index=app.init_edge_index,
-            num_nodes=len(app.args.tickers),
+            num_nodes=num_nodes,
             feature_dim=len(app.raw_feature_cols) + 1,
             tcn_channels=app.args.tcn_channels,
             tcn_kernel=app.args.tcn_kernel_size,
@@ -34,13 +70,13 @@ class STGNNRunner(BaseModelRunner):
             dropout=app.args.dropout,
             rep_dim=app.args.rep_dim,
             head_hidden=app.args.head_hidden,
+            graph_model=getattr(app.args, "graph_model", "gcn"),
         ).to(app.device)
 
         params = Utils.count_parameters(model)
-        app.logger.info(f"STGNN parameters: {params:,}")
+        app.logger.info("STGNN parameters: %s", f"{params:,}")
 
         mode = getattr(app.args, "graph_ablation", "none")
-        num_nodes = len(app.args.tickers)
 
         if mode == "empty":
             edge_attr = None
@@ -51,47 +87,19 @@ class STGNNRunner(BaseModelRunner):
 
         model.edge_attr = edge_attr.to(app.device) if edge_attr is not None else None
 
-        stgnn_train_ds = STGNNDataset(
-            app.tf_train,
-            app.graphBuilder,
-            app.train_feats,
-            app.args.tickers,
-            app.init_edge_index,
-            stock,
-            app.horizon,
-        )
-
-        stgnn_val_ds = STGNNDataset(
-            app.tf_val,
-            app.graphBuilder,
-            app.val_feats,
-            app.args.tickers,
-            app.init_edge_index,
-            stock,
-            app.horizon,
-        )
-
-        app.logger.info(f"[STGNNRunner] train_ds size={len(stgnn_train_ds)}")
-        app.logger.info(f"[STGNNRunner] val_ds size={len(stgnn_val_ds)}")
-
-        if len(stgnn_train_ds) == 0:
-            raise RuntimeError("STGNN training dataset is empty.")
-        if len(stgnn_val_ds) == 0:
-            raise RuntimeError("STGNN validation dataset is empty.")
-
         sample0 = stgnn_train_ds[0]
-        app.logger.info(f"[STGNNRunner] sample0 type={type(sample0)}")
+        app.logger.info("[STGNNRunner] sample0 type=%s", type(sample0))
         if hasattr(sample0, "x"):
-            app.logger.info(f"[STGNNRunner] sample0.x shape={tuple(sample0.x.shape)}")
+            app.logger.info("[STGNNRunner] sample0.x shape=%s", tuple(sample0.x.shape))
         if hasattr(sample0, "y"):
             try:
-                app.logger.info(f"[STGNNRunner] sample0.y shape={tuple(sample0.y.shape)}")
+                app.logger.info("[STGNNRunner] sample0.y shape=%s", tuple(sample0.y.shape))
             except Exception:
-                app.logger.info(f"[STGNNRunner] sample0.y={sample0.y}")
+                app.logger.info("[STGNNRunner] sample0.y=%s", sample0.y)
         if hasattr(sample0, "edge_index"):
-            app.logger.info(f"[STGNNRunner] sample0.edge_index shape={tuple(sample0.edge_index.shape)}")
+            app.logger.info("[STGNNRunner] sample0.edge_index shape=%s", tuple(sample0.edge_index.shape))
         if hasattr(sample0, "edge_attr") and sample0.edge_attr is not None:
-            app.logger.info(f"[STGNNRunner] sample0.edge_attr shape={tuple(sample0.edge_attr.shape)}")
+            app.logger.info("[STGNNRunner] sample0.edge_attr shape=%s", tuple(sample0.edge_attr.shape))
 
         dl_stgnn_train = GeoDataLoader(
             stgnn_train_ds,
@@ -103,17 +111,16 @@ class STGNNRunner(BaseModelRunner):
             worker_init_fn=app._seed_worker,
         )
 
-        app.logger.info("[STGNNRunner] Probing first dataloader batch...")
         first_batch = next(iter(dl_stgnn_train))
-        app.logger.info(f"[STGNNRunner] first batch type={type(first_batch)}")
+        app.logger.info("[STGNNRunner] first batch type=%s", type(first_batch))
         if hasattr(first_batch, "x"):
-            app.logger.info(f"[STGNNRunner] first batch x shape={tuple(first_batch.x.shape)}")
+            app.logger.info("[STGNNRunner] first batch x shape=%s", tuple(first_batch.x.shape))
         if hasattr(first_batch, "y"):
-            app.logger.info(f"[STGNNRunner] first batch y shape={tuple(first_batch.y.shape)}")
+            app.logger.info("[STGNNRunner] first batch y shape=%s", tuple(first_batch.y.shape))
         if hasattr(first_batch, "edge_index"):
-            app.logger.info(f"[STGNNRunner] first batch edge_index shape={tuple(first_batch.edge_index.shape)}")
+            app.logger.info("[STGNNRunner] first batch edge_index shape=%s", tuple(first_batch.edge_index.shape))
         if hasattr(first_batch, "edge_attr") and first_batch.edge_attr is not None:
-            app.logger.info(f"[STGNNRunner] first batch edge_attr shape={tuple(first_batch.edge_attr.shape)}")
+            app.logger.info("[STGNNRunner] first batch edge_attr shape=%s", tuple(first_batch.edge_attr.shape))
 
         trainer = Trainer(
             model,
@@ -122,7 +129,7 @@ class STGNNRunner(BaseModelRunner):
             app.device,
             app.graphBuilder,
             {"feature": None},
-            app.args.tickers,
+            aligned_tickers,
             stock,
             app.frontendApp,
             evaluator,
@@ -130,22 +137,24 @@ class STGNNRunner(BaseModelRunner):
             seq_len=app.seq_len,
             model_name=self.model_name,
         )
-
-        app.logger.info("[STGNNRunner] Starting training...")
+        trainer.targetIdx = stgnn_train_ds.target_idx
+        model.target_node_index = stgnn_train_ds.target_idx
+        
         start = time.time()
         trainer.train(
             dl_stgnn_train,
             num_epochs=app.args.stgnn_epochs,
             stop_event=stop_event,
         )
-        app.logger.info(f"[STGNNRunner] Training completed in {time.time() - start:.2f}s")
+        app.logger.info("[STGNNRunner] Training completed in %.2fs", time.time() - start)
         Utils.log_gpu_memory("After STGNN")
 
         app._check_stop(stop_event)
 
         app.frontendApp.set_status("Evaluating STGNN...")
         eval_result = trainer.evaluate_rolling(stgnn_val_ds)
-
+        self._attach_metadata(app, eval_result)
+        
         if hasattr(model, "classifier") and hasattr(model.classifier, "set_temperature"):
             model.classifier.set_temperature(app.args.head_temperature)
 
@@ -162,18 +171,26 @@ class STGNNRunner(BaseModelRunner):
         live_graph = stgnn_val_ds[len(stgnn_val_ds) - 1]
         x_live = live_graph.x.unsqueeze(0).to(app.device)
         edge_index_live = live_graph.edge_index.to(app.device)
-        edge_attr_live = live_graph.edge_attr.to(app.device) if getattr(live_graph, "edge_attr", None) is not None else None
+        edge_attr_live = (
+            live_graph.edge_attr.to(app.device)
+            if getattr(live_graph, "edge_attr", None) is not None
+            else None
+        )
 
         with torch.no_grad():
             logits = model(
                 x_live,
                 edge_index=edge_index_live,
                 edge_attr=edge_attr_live,
-                target_node_index=app.args.tickers.index(stock),
+                target_node_index=stgnn_val_ds.target_idx,
             )
             prob = torch.sigmoid(logits.view(-1)[0]).item()
 
-        threshold = metrics.get("best_threshold", 0.5)
+        threshold = self._resolve_threshold(
+            metrics,
+            policy=getattr(app.args, "decision_threshold_policy", "fixed"),
+        )
+
         if prob >= threshold:
             direction = "Upwards"
             confidence = prob * 100.0
@@ -181,7 +198,7 @@ class STGNNRunner(BaseModelRunner):
             direction = "Downwards"
             confidence = (1.0 - prob) * 100.0
 
-        app.logger.info(f"[STGNNRunner] {direction} ({confidence:.1f}%)")
+        app.logger.info("[STGNNRunner] %s (%.1f%%)", direction, confidence)
 
         result = ModelRunResult(
             model_name=self.model_name,

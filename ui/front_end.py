@@ -12,8 +12,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Patch
 
+from core.job_queue import QueueJob, JobQueueController, parse_seed_spec
 from evaluation.evaluation_methods import EvaluationMethods
-
 
 class Cancelled(Exception):
     """Raised when training is aborted by user."""
@@ -36,8 +36,8 @@ class FrontEnd:
         # === 1. Top-level window
         self.root = tk.Tk()
         self.root.title("Stock Trend Explorer")
-        self.root.geometry("1500x1000")
-        self.root.minsize(1200, 900)
+        self.root.geometry("1650x1050")
+        self.root.minsize(1300, 900)
 
         # ====================================
         # === 2. Notebook for tabs
@@ -81,17 +81,46 @@ class FrontEnd:
         self.stockMenu.bind("<<ComboboxSelected>>", self._onSelectionChange)
 
         tk.Label(self.toolbar, text="Model:").pack(side=tk.LEFT, padx=(20, 2))
-        self.modelValues = ["LSTM", "GRU", "STGNN"]
+        
+        self.modelValues = [
+            "LSTM",
+            "GRU",
+            "PANEL_GRU",
+            "PANEL_LSTM",
+            "GCN",
+            "NNCONV",
+            "GRAPHSAGE",
+            "STGNN",
+        ]
+
         self.modelVar = tk.StringVar(value=self.modelValues[0])
         self.modelMenu = ttk.Combobox(
             self.toolbar,
             textvariable=self.modelVar,
             values=self.modelValues,
             width=10,
-            state="readonly",
+            state="readonly"
         )
         self.modelMenu.pack(side=tk.LEFT, padx=2)
+        self.modelMenu.bind("<<ComboboxSelected>>", self._on_model_selection_change)
 
+        tk.Label(self.toolbar, text="Seed(s):").pack(side=tk.LEFT, padx=(20, 2))
+        self.seedVar = tk.StringVar(value="42")
+        self.seedEntry = ttk.Entry(self.toolbar, textvariable=self.seedVar, width=12)
+        self.seedEntry.pack(side=tk.LEFT, padx=2)
+
+        tk.Label(self.toolbar, text="Graph backend:").pack(side=tk.LEFT, padx=(20, 2))
+        self.graphModelValues = ["GCN", "GRAPHSAGE", "GAT", "NNCONV"]
+        self.graphModelVar = tk.StringVar(value=self.graphModelValues[0])
+        self.graphModelMenu = ttk.Combobox(
+            self.toolbar,
+            textvariable=self.graphModelVar,
+            values=self.graphModelValues,
+            width=12,
+            state="readonly"
+        )
+        self.graphModelMenu.pack(side=tk.LEFT, padx=2)
+        self._sync_graph_backend_state()
         self.stop_event = threading.Event()
         self.statusVar = tk.StringVar(value="Idle")
 
@@ -100,6 +129,15 @@ class FrontEnd:
 
         self.btnStop = tk.Button(self.toolbar, text="Stop ■", command=self._onStop, state=tk.DISABLED)
         self.btnStop.pack(side=tk.RIGHT, padx=(0, 10))
+
+        self.btnRunQueue = tk.Button(self.toolbar, text="Run Queue ▷", command=self._onRunQueue)
+        self.btnRunQueue.pack(side=tk.RIGHT, padx=(0, 10))
+
+        self.btnQueueAdd = tk.Button(self.toolbar, text="Add To Queue +", command=self._onAddToQueue)
+        self.btnQueueAdd.pack(side=tk.RIGHT, padx=(0, 10))
+
+        self.btnQueuePopout = tk.Button(self.toolbar, text="Queue Popout", command=self._open_queue_popout)
+        self.btnQueuePopout.pack(side=tk.RIGHT, padx=(0, 10))
 
         self.progressVar = tk.DoubleVar(value=0.0)
         self.progressBar = ttk.Progressbar(
@@ -118,6 +156,28 @@ class FrontEnd:
             font=("Arial", 9),
         )
         self.statusLabel.pack(side=tk.RIGHT, padx=10)
+
+        self.queueFrame = tk.LabelFrame(self.mainTab, text="Prediction Queue", padx=6, pady=6)
+        self.queueFrame.pack(fill=tk.X, padx=10, pady=(6, 4))
+
+        queue_cols = ("Job ID", "Window", "Ticker", "Model", "Seed", "Graph")
+        self.queueTable = ttk.Treeview(self.queueFrame, columns=queue_cols, show="headings", height=5)
+        for c in queue_cols:
+            self.queueTable.heading(c, text=c)
+            self.queueTable.column(c, width=110, anchor=tk.CENTER)
+        self.queueTable.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        queue_scroll = ttk.Scrollbar(self.queueFrame, orient=tk.VERTICAL, command=self.queueTable.yview)
+        queue_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.queueTable.configure(yscrollcommand=queue_scroll.set)
+
+        self.queueButtons = tk.Frame(self.queueFrame)
+        self.queueButtons.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
+        tk.Button(self.queueButtons, text="Remove", command=self._onRemoveQueueItem).pack(fill=tk.X, pady=2)
+        tk.Button(self.queueButtons, text="Clear", command=self._onClearQueue).pack(fill=tk.X, pady=2)
+
+        self.queue_popout = None
+        self.queue_popout_table = None
 
         # ====================================
         # === 5. Price chart
@@ -154,7 +214,6 @@ class FrontEnd:
             font=("Helvetica", 12, "bold"),
         )
         self.modelNameLabel.pack()
-
         self.modelStatus = tk.Label(
             self.modelRes,
             text="Trending: —",
@@ -279,6 +338,7 @@ class FrontEnd:
 
         self.threshold_pane = tk.LabelFrame(self.metrics_model_pane, text="Threshold Curve")
         self.metrics_model_pane.add(self.threshold_pane)
+        self.set_active_model_titles(self.modelVar.get())
 
         # ====================================
         # === 11. State
@@ -298,6 +358,11 @@ class FrontEnd:
         self._highlight_markers = []
         self.ticker_to_sector = {}
         self._selected_ticker = None
+
+        self._queue_add_callback = None
+        self._queue_run_callback = None
+        self._queue_remove_callback = None
+        self._queue_clear_callback = None
 
         # ====================================
         # === 12. Evaluation logic
@@ -341,7 +406,28 @@ class FrontEnd:
         self._refresh_and_plot(ticker, raw_df, num_bars=self.currentWindowIdx + 1)
 
     def set_active_model_titles(self, model_name: str):
-        pretty = str(model_name).upper()
+        labels = {
+            "lstm": "LSTM",
+            "gru": "GRU",
+            "panel_gru": "PANEL GRU",
+            "panel_lstm": "PANEL LSTM",
+            "gcn": "GCN",
+            "nnconv": "NNConv",
+            "graphsage": "GraphSAGE",
+            "stgnn": "STGNN",
+        }
+
+
+        key = str(model_name).strip().lower()
+        pretty = labels.get(key, key.upper())
+
+        if key in ("lstm", "gru"):
+            self.graphFrame.config(text=f"{pretty} Target Node")
+        elif key in ("panel_gru", "panel_lstm"):
+            self.graphFrame.config(text=f"{pretty} Panel Nodes (no graph edges used)")
+        else:
+            self.graphFrame.config(text=f"{pretty} Graph Structure")
+
         self.modelRes.config(text=f"{pretty} Prediction")
         self.modelNameLabel.config(text=f"Model: {pretty}")
         self.eval_summary_frame.config(text=f"{pretty} Evaluation")
@@ -360,9 +446,166 @@ class FrontEnd:
     def setComputeCallback(self, cb):
         self._compute_callback = cb
 
+
+    def setQueueAddCallback(self, cb):
+        self._queue_add_callback = cb
+
+    def setQueueRunCallback(self, cb):
+        self._queue_run_callback = cb
+
+    def setQueueRemoveCallback(self, cb):
+        self._queue_remove_callback = cb
+
+    def setQueueClearCallback(self, cb):
+        self._queue_clear_callback = cb
+
+    def _build_current_jobs(self) -> List[QueueJob]:
+        seed_values = parse_seed_spec(str(self.seedVar.get()).strip())
+
+        model_name = str(self.modelVar.get()).strip().lower()
+        graph_model = (
+            str(self.graphModelVar.get()).strip().lower()
+            if self._is_graph_backend_applicable(model_name)
+            else "gcn"
+        )
+
+        jobs: List[QueueJob] = []
+        for seed in seed_values:
+            jobs.append(
+                QueueJob(
+                    job_id=JobQueueController.make_job_id(),
+                    created_at="now",
+                    prediction_window=str(self.windowVar.get()).strip(),
+                    ticker=str(self.stockVar.get()).strip().upper(),
+                    model=model_name,
+                    seed=int(seed),
+                    graph_model=graph_model,
+                )
+            )
+        return jobs
+
+    def _onAddToQueue(self):
+        if self._queue_add_callback is None:
+            return
+        try:
+            jobs = self._build_current_jobs()
+            self._queue_add_callback(jobs)
+            self.set_status(f"Added {len(jobs)} job(s) to queue")
+        except Exception as exc:
+            self.set_status(f"Queue add failed: {exc}")
+
+    def _onRunQueue(self):
+        if self._queue_run_callback is not None:
+            self._queue_run_callback()
+
+    def _onRemoveQueueItem(self):
+        selected = self.queueTable.selection()
+        if not selected or self._queue_remove_callback is None:
+            return
+        idx = self.queueTable.index(selected[0])
+        self._queue_remove_callback(idx)
+
+    def _onClearQueue(self):
+        if self._queue_clear_callback is not None:
+            self._queue_clear_callback()
+
+    def refresh_queue_table(self, jobs):
+        def _apply():
+            self.queueTable.delete(*self.queueTable.get_children())
+            for job in jobs:
+                self.queueTable.insert(
+                    "",
+                    "end",
+                    values=(
+                        job.job_id,
+                        job.prediction_window,
+                        job.ticker,
+                        job.model.upper(),
+                        job.seed,
+                        job.graph_model.upper(),
+                    ),
+                )
+
+            self._clear_dead_queue_popout_refs()
+
+            if self.queue_popout_table is not None:
+                try:
+                    self.queue_popout_table.delete(*self.queue_popout_table.get_children())
+                    for job in jobs:
+                        self.queue_popout_table.insert(
+                            "",
+                            "end",
+                            values=(
+                                job.job_id,
+                                job.prediction_window,
+                                job.ticker,
+                                job.model.upper(),
+                                job.seed,
+                                job.graph_model.upper(),
+                            ),
+                        )
+                except tk.TclError:
+                    self.queue_popout_table = None
+
+        self.ui_call(_apply)
+
+    def _open_queue_popout(self):
+        self._clear_dead_queue_popout_refs()
+
+        if self.queue_popout is not None:
+            try:
+                if self.queue_popout.winfo_exists():
+                    self.queue_popout.lift()
+                    return
+            except tk.TclError:
+                self.queue_popout = None
+                self.queue_popout_table = None
+
+        self.queue_popout = tk.Toplevel(self.root)
+        self.queue_popout.title("Prediction Queue")
+        self.queue_popout.geometry("900x300")
+        self.queue_popout.protocol("WM_DELETE_WINDOW", self._on_queue_popout_closed)
+
+        cols = ("Job ID", "Window", "Ticker", "Model", "Seed", "Graph")
+        self.queue_popout_table = ttk.Treeview(
+            self.queue_popout,
+            columns=cols,
+            show="headings",
+        )
+        for c in cols:
+            self.queue_popout_table.heading(c, text=c)
+            self.queue_popout_table.column(c, width=130, anchor=tk.CENTER)
+        self.queue_popout_table.pack(fill=tk.BOTH, expand=True)
+
+    def _clear_dead_queue_popout_refs(self):
+        try:
+            if self.queue_popout is not None and not self.queue_popout.winfo_exists():
+                self.queue_popout = None
+                self.queue_popout_table = None
+                return
+        except tk.TclError:
+            self.queue_popout = None
+            self.queue_popout_table = None
+            return
+
+        try:
+            if self.queue_popout_table is not None and not self.queue_popout_table.winfo_exists():
+                self.queue_popout_table = None
+        except tk.TclError:
+            self.queue_popout_table = None
+
+
+    def _on_queue_popout_closed(self):
+        self.queue_popout_table = None
+        try:
+            if self.queue_popout is not None and self.queue_popout.winfo_exists():
+                self.queue_popout.destroy()
+        except tk.TclError:
+            pass
+        self.queue_popout = None
+
     def _onCompute(self):
         selected_model = self.get_selected_model()
-        self.set_active_model_titles(selected_model)
         self.set_status(f"Queued {selected_model.upper()} run...")
 
         self.stop_event.clear()
@@ -690,9 +933,15 @@ class FrontEnd:
         self._trainers["stgnn"] = stgnn
 
     def updateProgress(self, fraction: float):
-        frac = max(0.0, min(1.0, fraction))
-        self.progressVar.set(frac)
-        self.root.update_idletasks()
+        frac = max(0.0, min(1.0, float(fraction)))
+
+        def _update():
+            self.progressVar.set(frac)
+
+        try:
+            self.root.after(0, _update)
+        except Exception as exc:
+            print(f"[WARN] Progress update skipped: {exc}")
 
     def bars_to_days(self, bar_count: int, interval: str) -> float:
         bars_per_day_map = {
@@ -753,8 +1002,6 @@ class FrontEnd:
         is_up = "Upwards" in str(trend)
         colour = "green" if is_up else "red" if trend not in ("—", "-", None) else "black"
 
-        self.modelRes.config(text=f"{model_name} Prediction")
-        self.modelNameLabel.config(text=f"Model: {model_name}")
         self.modelStatus.config(text=f"Trending: {trend}", fg=colour)
         self.modelConf.config(text=f"Confidence: {confidence:.1f}%", fg=colour)
 
@@ -900,3 +1147,41 @@ class FrontEnd:
     @property
     def backtestSTGNN(self):
         return self.backtest_pane
+    
+    def set_sector_map(self, ticker_to_sector):
+        self.ticker_to_sector = dict(ticker_to_sector or {})
+        sectors = list(self.ticker_to_sector.values())
+        self._sector_to_colour = self._sector_palette(sectors) if sectors else {}
+        self.update_sector_legend()
+        
+    def _on_model_selection_change(self, event=None):
+        if self.btnCompute["state"] == tk.DISABLED:
+            return
+
+        selected_model = str(self.modelVar.get()).strip().lower()
+
+        def _update():
+            self.set_active_model_titles(selected_model)
+            self._sync_graph_backend_state()
+            self.refresh_selected_tabs()
+
+        self.ui_call(_update)
+
+    def ui_call(self, fn, *args, **kwargs):
+        try:
+            self.root.after(0, lambda: fn(*args, **kwargs))
+        except RuntimeError:
+            pass
+
+    def _is_graph_backend_applicable(self, model_name: str) -> bool:
+        key = str(model_name).strip().lower()
+        return key == "stgnn"
+
+
+    def _sync_graph_backend_state(self):
+        selected_model = str(self.modelVar.get()).strip().lower()
+        enabled = self._is_graph_backend_applicable(selected_model)
+
+        self.graphModelMenu.config(state="readonly" if enabled else "disabled")
+        if not enabled:
+            self.graphModelVar.set("GCN")

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional
 import logging
+from typing import Dict, List, Optional
 
 import pandas as pd
 import yfinance as yf
@@ -12,12 +12,19 @@ from data.price_loader import BasePriceLoader
 class YahooPriceLoader(BasePriceLoader):
     """
     Yahoo Finance OHLCV loader with standardised cleaning.
+
+    Notes:
+    - Returns only successfully loaded tickers.
+    - Failed tickers are logged and omitted.
+    - Caller should record requested vs loaded tickers for research provenance.
     """
 
+    PROVIDER_NAME = "yahoo"
     REQUIRED_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
     def __init__(self) -> None:
         self.logger = logging.getLogger(self.__class__.__name__)
+
         if not self.logger.handlers:
             handler = logging.StreamHandler()
             formatter = logging.Formatter(
@@ -35,15 +42,13 @@ class YahooPriceLoader(BasePriceLoader):
         interval: str = "1d",
         period: Optional[str] = None,
     ) -> Dict[str, pd.DataFrame]:
-        """
-        Load historical OHLCV price data from Yahoo Finance.
-        """
         if not tickers:
             raise ValueError("No tickers were provided to YahooPriceLoader.")
 
         cleaned_data: Dict[str, pd.DataFrame] = {}
+        requested = [str(t).upper().strip() for t in tickers]
 
-        for ticker in [t.upper() for t in tickers]:
+        for ticker in requested:
             try:
                 df = self._download_single_ticker(
                     ticker=ticker,
@@ -59,6 +64,12 @@ class YahooPriceLoader(BasePriceLoader):
         if not cleaned_data:
             raise RuntimeError("YahooPriceLoader failed for all requested tickers.")
 
+        self.logger.info(
+            "Loaded prices for %d/%d tickers using provider=%s.",
+            len(cleaned_data),
+            len(requested),
+            self.PROVIDER_NAME,
+        )
         return cleaned_data
 
     def _download_single_ticker(
@@ -69,9 +80,6 @@ class YahooPriceLoader(BasePriceLoader):
         interval: str,
         period: Optional[str],
     ) -> pd.DataFrame:
-        """
-        Download one ticker using either explicit dates or a Yahoo period.
-        """
         yf_ticker = yf.Ticker(ticker)
 
         if start_date is not None or end_date is not None:
@@ -91,10 +99,7 @@ class YahooPriceLoader(BasePriceLoader):
         if raw.empty:
             raise RuntimeError(f"No data returned for {ticker}")
 
-        df = raw.reset_index().rename(
-            columns={raw.index.name or "Date": "timestamp"}
-        )
-
+        df = raw.reset_index().rename(columns={raw.index.name or "Date": "timestamp"})
         df = df.rename(
             columns={
                 "Open": "open",
@@ -104,13 +109,9 @@ class YahooPriceLoader(BasePriceLoader):
                 "Volume": "volume",
             }
         )
-
         return df
 
     def _clean_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Standardise, validate, and clean an OHLCV dataframe.
-        """
         missing = [col for col in self.REQUIRED_COLUMNS if col not in df.columns]
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
@@ -120,9 +121,15 @@ class YahooPriceLoader(BasePriceLoader):
         df = df.dropna(subset=["timestamp"]).sort_values("timestamp")
         df = df.set_index("timestamp")
 
+        if getattr(df.index, "tz", None) is not None:
+            df.index = df.index.tz_localize(None)
+
         if df["close"].isna().all():
             raise ValueError("All close values are NaN")
 
         df = df.ffill().dropna()
+
+        if df.empty:
+            raise ValueError("Dataframe is empty after cleaning")
 
         return df
