@@ -1,28 +1,32 @@
 import gc
 import logging
 import os
-import platform
 import threading
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import torch
 
+from config.config_manager import ConfigManager
+from core.experiment_runner import ExperimentRunner
+from core.experiment_store import ExperimentStore, RunRecord
 from core.job_queue import JobQueueController, QueueJob
 from core.pipeline import Pipeline
-from ui.front_end import FrontEnd
-from data.tensor_factory import TensorFactory
-from ui.loading_overlay import LoadingOverlay
 from core.utils.utils import Utils
-from config.config_manager import ConfigManager
 from data.price_loader import PriceLoaderRegistry
+from data.tensor_factory import TensorFactory
 from data.universe_service import UniverseService
 from data.yahoo_price_loader import YahooPriceLoader
-from core.experiment_runner import ExperimentRunner
+from ui.front_end import FrontEnd
+from ui.loading_overlay import LoadingOverlay
 
-# cuBLAS determinism
+from pathlib import Path
+
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 class LoadedPriceResult:
@@ -41,12 +45,10 @@ class LoadedPriceResult:
 class MainApp:
     """
     Orchestrates universe resolution, data loading, preprocessing,
-    graph-building, and model execution.
+    graph-building, model execution, queue execution, and result storage.
     """
 
     def __init__(self):
-        # ====================================
-        # === STEP 1: Configuration
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.args = ConfigManager.parseArgs()
 
@@ -54,7 +56,6 @@ class MainApp:
         self.args.seed = getattr(self.args, "seed", self.args.base_seed)
         self.args.deterministic = getattr(self.args, "deterministic", False)
 
-        # Canonical selection / provider fields with backward compatibility
         self.args.universe_id = self._resolve_universe_id_from_args()
         self.args.universe_provider = str(
             getattr(self.args, "universe_provider", "static_csv")
@@ -70,8 +71,6 @@ class MainApp:
         self.universe_definition = None
         self.universe_info = None
 
-        # ====================================
-        # === STEP 2: Logging
         self.logger = logging.getLogger("MainApp")
         self.logger.setLevel(logging.INFO)
 
@@ -84,54 +83,55 @@ class MainApp:
         if not self.logger.handlers:
             self.logger.addHandler(handler)
 
-        # ====================================
-        # === STEP 3: Services
         self.universe_service = UniverseService()
         self.price_loader_registry = PriceLoaderRegistry()
         self.price_loader_registry.register("yahoo", YahooPriceLoader())
 
         self._set_all_seeds(self.args.seed)
         self.results_log = []
+
         self.queue_controller = JobQueueController()
         self.queue_running = False
         self.queue_stop_event = threading.Event()
+        self._active_queue_job_id = None
+        self._active_queue_run_id = None
+        self._active_queue_run_started_at = None
+        self._active_queue_manifest_jobs = []
+        self._active_queue_job_summaries = []
+        self._active_queue_completed = 0
+        self._active_queue_failed = 0
+        self._active_queue_cancelled = 0
 
-        # ====================================
-        # === STEP 4: Resolve universe
+        self.experiment_store = ExperimentStore(
+            root_dir=getattr(self.args, "results_dir", "./results")
+        )
+
         self._resolve_universe()
 
-        # ====================================
-        # === STEP 5: Front-end / compatibility layer
         self.args.tickers = sorted(self.args.tickers)
 
         run_mode = str(getattr(self.args, "run_mode", "gui")).strip().lower()
-        self.frontendApp = FrontEnd(self.args.tickers)
+        self.frontendApp = FrontEnd(self.args.tickers, project_root=PROJECT_ROOT)
         self.frontendApp.setQueueAddCallback(self.enqueue_jobs)
         self.frontendApp.setQueueRunCallback(self.run_queue)
         self.frontendApp.setQueueRemoveCallback(self.remove_job_at)
         self.frontendApp.setQueueClearCallback(self.clear_queue)
 
         if run_mode == "headless":
-            # Transitional compatibility:
-            # keep FrontEnd/evaluator available for existing runners,
-            # but do not show a visible Tk window.
             self.frontendApp.root.withdraw()
             self.loader = None
             self.logger.info("[Init] FrontEnd created in hidden mode for headless execution")
         else:
             from pathlib import Path
 
-            PROJECT_ROOT = Path(__file__).resolve().parent.parent
-            avi_path = PROJECT_ROOT / "assets" / "loading.avi"
+            project_root = Path(__file__).resolve().parent.parent
+            avi_path = project_root / "assets" / "loading.avi"
 
             self.loader = LoadingOverlay(self.frontendApp.root, str(avi_path), delay=24)
             if not avi_path.exists():
                 raise FileNotFoundError(f"Loading animation not found at: {avi_path}")
 
     def _resolve_universe_id_from_args(self) -> str:
-        """
-        Canonicalise historical argument names into a single concept: universe_id.
-        """
         candidates = [
             getattr(self.args, "universe_id", None),
             getattr(self.args, "universe_name", None),
@@ -171,11 +171,11 @@ class MainApp:
             self.universe_definition.metadata.snapshot_date,
         )
 
-
     def enqueue_jobs(self, jobs):
         jobs = list(jobs)
         if not jobs:
             return
+
         self.queue_controller.enqueue_many(jobs)
         self.frontendApp.refresh_queue_table(self.queue_controller.snapshot())
         self.frontendApp.set_status(f"Queued {len(jobs)} job(s)")
@@ -196,10 +196,41 @@ class MainApp:
             self.frontendApp.set_status("Queue already running")
             return
 
+        snapshot = self.queue_controller.snapshot()
+        if not snapshot:
+            self.frontendApp.set_status("Queue is empty. Add jobs before running.")
+            return
+
         self.queue_running = True
         self.queue_stop_event.clear()
 
+        # Queue lifecycle:
+        # - a non-empty queue starts a new queue run group
+        # - every popped job belongs to this queue_run_id
+        # - when the queue drains again, the manifest is finalised once
+        self._active_queue_run_id = self.experiment_store.make_queue_run_id()
+        self._active_queue_run_started_at = self.experiment_store.utc_now_iso()
+        self._active_queue_manifest_jobs = list(snapshot)
+        self._active_queue_job_summaries = []
+        self._active_queue_completed = 0
+        self._active_queue_failed = 0
+        self._active_queue_cancelled = 0
+
+        self.experiment_store.write_queue_manifest(
+            queue_run_id=self._active_queue_run_id,
+            status="running",
+            timestamp_start=self._active_queue_run_started_at,
+            jobs=self._active_queue_manifest_jobs,
+            extras={
+                "universe_id": str(getattr(self.args, "universe_id", "unknown")),
+                "interval": str(getattr(self.args, "interval", "unknown")),
+            },
+        )
+
+        self.frontendApp.set_status(f"Started queue run {self._active_queue_run_id}")
+
         def _worker():
+            queue_status = "completed"
             try:
                 while not self.queue_stop_event.is_set():
                     job = self.queue_controller.pop_next()
@@ -211,14 +242,66 @@ class MainApp:
                     self.frontendApp.set_status(
                         f"Running queued job {job.model.upper()} {job.ticker} {job.prediction_window}"
                     )
-                    self._run_single_job(job)
 
-                self.frontendApp.set_status("Queue finished")
+                    try:
+                        self._run_single_job(job)
+                        self._active_queue_completed += 1
+                    except InterruptedError:
+                        self._active_queue_cancelled += 1
+                        queue_status = "cancelled"
+                        raise
+                    except Exception:
+                        self._active_queue_failed += 1
+                        queue_status = "partial_failed"
+                        self.logger.exception("Queued job failed: %s", job.job_id)
+                        # Continue queue execution so one failed job does not
+                        # discard the rest of the batch.
+                        continue
+
+                if self.queue_stop_event.is_set():
+                    queue_status = "cancelled"
+
+                if self._active_queue_failed and queue_status == "completed":
+                    queue_status = "partial_failed"
+
+                self.frontendApp.set_status(f"Queue finished: {queue_status}")
+
             except Exception as exc:
                 self.logger.exception("Queue failed")
                 self.frontendApp.set_status(f"Queue failed: {exc}")
+
             finally:
+                queue_run_id = self._active_queue_run_id
+                started_at = self._active_queue_run_started_at
+
+                if queue_run_id and started_at:
+                    summary_paths = self.experiment_store.write_queue_seed_summaries(
+                        queue_run_id=queue_run_id,
+                        job_summaries=self._active_queue_job_summaries,
+                    )
+
+                    self.experiment_store.write_queue_manifest(
+                        queue_run_id=queue_run_id,
+                        status=queue_status,
+                        timestamp_start=started_at,
+                        timestamp_end=self.experiment_store.utc_now_iso(),
+                        jobs=self._active_queue_manifest_jobs,
+                        completed=self._active_queue_completed,
+                        failed=self._active_queue_failed,
+                        cancelled=self._active_queue_cancelled,
+                        extras={
+                            "remaining_queue_count": len(self.queue_controller),
+                            "universe_id": str(getattr(self.args, "universe_id", "unknown")),
+                            "interval": str(getattr(self.args, "interval", "unknown")),
+                            "summary_paths": summary_paths,
+                        },
+                    )
+
                 self.queue_running = False
+                self._active_queue_run_id = None
+                self._active_queue_run_started_at = None
+                self._active_queue_manifest_jobs = []
+                self._active_queue_job_summaries = []
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -226,11 +309,14 @@ class MainApp:
         prev_model = self.args.model
         prev_seed = self.args.seed
         prev_graph_model = getattr(self.args, "graph_model", "gcn")
+        prev_job_id = self._active_queue_job_id
+        prev_queue_run_id = self._active_queue_run_id
 
         try:
             self.args.model = str(job.model).strip().lower()
             self.args.seed = int(job.seed)
             self.args.graph_model = str(job.graph_model).strip().lower()
+            self._active_queue_job_id = job.job_id
 
             self._set_all_seeds(self.args.seed)
 
@@ -250,6 +336,8 @@ class MainApp:
             self.args.model = prev_model
             self.args.seed = prev_seed
             self.args.graph_model = prev_graph_model
+            self._active_queue_job_id = prev_job_id
+            self._active_queue_run_id = prev_queue_run_id
 
     def _load_data_and_start_gui(self):
         engineered = ["return", "volatility", "momentum"]
@@ -287,9 +375,7 @@ class MainApp:
                 )
                 self.universe_info = self.universe_definition.to_dict()
 
-            self.raw_feature_dfs = {
-                t: self.priceHistory[t] for t in valid_tickers
-            }
+            self.raw_feature_dfs = {t: self.priceHistory[t] for t in valid_tickers}
 
             if not self.raw_feature_dfs:
                 raise RuntimeError("No usable asset data was loaded.")
@@ -305,17 +391,151 @@ class MainApp:
 
         threading.Thread(target=background_task, daemon=True).start()
 
+    def _serialise_metrics(self, metrics_obj):
+        if metrics_obj is None:
+            return {}
+
+        if isinstance(metrics_obj, dict):
+            return dict(metrics_obj)
+
+        if hasattr(metrics_obj, "__dict__"):
+            return dict(metrics_obj.__dict__)
+
+        return {"value": str(metrics_obj)}
+
+    def _store_run_result(
+        self,
+        *,
+        stock: str,
+        gui_window: str,
+        selected_model: str,
+        result,
+        status: str,
+        ts_start: str,
+        job_id=None,
+        queue_run_id=None,
+        error_message=None,
+    ) -> None:
+        run_id = self.experiment_store.make_run_id()
+        ts_end = self.experiment_store.utc_now_iso()
+
+        start_dt = datetime.fromisoformat(ts_start)
+        end_dt = datetime.fromisoformat(ts_end)
+        duration_sec = (end_dt - start_dt).total_seconds()
+
+        history_path = None
+        eval_result = getattr(result, "eval_result", None) if result is not None else None
+
+        # For queue research suites, keep outputs seed-level rather than
+        # per-iteration/per-date loss histories. Single manual runs still save
+        # histories as before.
+        if eval_result is not None and not queue_run_id:
+            history_path = self.experiment_store.save_history(
+                run_id=run_id,
+                hist_train=getattr(eval_result, "hist_train", None),
+                hist_val=getattr(eval_result, "hist_val", None),
+            )
+
+        metrics_payload = self._serialise_metrics(
+            getattr(result, "metrics", None) if result is not None else None
+        )
+
+        queue_group = None
+        job_payload_path = None
+        if queue_run_id and job_id:
+            queue_group = self.experiment_store.model_group(
+                selected_model,
+                str(getattr(self.args, "graph_model", "gcn")).lower(),
+            )
+            job_payload_path = self.experiment_store.save_job_payload(
+                queue_run_id=queue_run_id,
+                job_id=job_id,
+                model=selected_model,
+                graph_model=str(getattr(self.args, "graph_model", "gcn")).lower(),
+                filename="result.json",
+                payload={
+                    "run_id": run_id,
+                    "job_id": job_id,
+                    "queue_run_id": queue_run_id,
+                    "status": status,
+                    "ticker": str(stock).upper(),
+                    "prediction_window": str(gui_window),
+                    "model": str(selected_model).lower(),
+                    "seed": int(self.args.seed),
+                    "graph_model": str(getattr(self.args, "graph_model", "gcn")).lower(),
+                    "direction": str(getattr(result, "direction", "")) if result is not None else "",
+                    "confidence": float(getattr(result, "confidence", 0.0)) if result is not None else 0.0,
+                    "metrics": metrics_payload,
+                    "error_message": error_message,
+                },
+            )
+
+        if queue_run_id and job_id:
+            self._active_queue_job_summaries.append(
+                {
+                    "run_id": run_id,
+                    "job_id": job_id,
+                    "queue_run_id": queue_run_id,
+                    "queue_group": queue_group,
+                    "status": status,
+                    "ticker": str(stock).upper(),
+                    "prediction_window": str(gui_window),
+                    "model": str(selected_model).lower(),
+                    "seed": int(self.args.seed),
+                    "graph_model": str(getattr(self.args, "graph_model", "gcn")).lower(),
+                    "direction": str(getattr(result, "direction", "")) if result is not None else "",
+                    "confidence": float(getattr(result, "confidence", 0.0)) if result is not None else 0.0,
+                    "metrics": metrics_payload,
+                    "error_message": error_message,
+                }
+            )
+
+        record = RunRecord(
+            run_id=run_id,
+            job_id=job_id,
+            queue_run_id=queue_run_id,
+            queue_group=queue_group,
+            status=status,
+            timestamp_start=ts_start,
+            timestamp_end=ts_end,
+            duration_sec=duration_sec,
+            ticker=str(stock).upper(),
+            prediction_window=str(gui_window),
+            model=str(selected_model).lower(),
+            seed=int(self.args.seed),
+            graph_model=str(getattr(self.args, "graph_model", "gcn")).lower(),
+            universe_id=str(getattr(self.args, "universe_id", "unknown")),
+            interval=str(getattr(self.args, "interval", "unknown")),
+            k=int(getattr(self.args, "k", 0)),
+            graph_mode=str(getattr(self.args, "graph_mode", "unknown")),
+            graph_embed=str(getattr(self.args, "graph_embed", "unknown")),
+            ablate_feature=str(getattr(self.args, "ablate_feature", "none")),
+            threshold_policy=str(getattr(self.args, "decision_threshold_policy", "fixed")),
+            direction=str(getattr(result, "direction", "")) if result is not None else "",
+            confidence=float(getattr(result, "confidence", 0.0)) if result is not None else 0.0,
+            metrics=metrics_payload,
+            extras={
+                "history_path": history_path,
+                "job_payload_path": job_payload_path,
+                "queue_run": queue_run_id is not None,
+                "queue_run_id": queue_run_id,
+                "queue_group": queue_group,
+                "error_message": error_message,
+            },
+        )
+        self.experiment_store.append_run(record)
+
     def startPipeline(self, gui_window: str, stock: str, stop_event: threading.Event):
         if self.pipeline_running:
             self.logger.warning("Pipeline already running.")
             return ("-", 0.0, "-", 0.0, "-", 0.0)
 
         self.pipeline_running = True
+        ts_start = self.experiment_store.utc_now_iso()
+        selected_model = self.frontendApp.get_selected_model()
+        result = None
 
         try:
-            # ====================================
-            # STEP 1: Resolve model
-            selected_model = self.frontendApp.get_selected_model()
             self.args.model = selected_model
 
             self.frontendApp.root.after(
@@ -325,21 +545,15 @@ class MainApp:
 
             self.logger.info("[ModelSelection] %s", selected_model)
 
-            # ====================================
-            # STEP 2: Reset evaluation/UI state
             evaluator = self.frontendApp.evaluator
             evaluator.reset_histories()
 
             self.frontendApp.root.after(0, self.frontendApp._reset_ui)
             self.frontendApp.set_status(f"Starting {selected_model.upper()}...")
 
-            # ====================================
-            # STEP 3: Build pipeline state
             pipeline = Pipeline(self)
             state = pipeline.run(stock, gui_window, stop_event)
 
-            # ====================================
-            # STEP 4: Run experiment through shared runner
             experiment_runner = ExperimentRunner(self)
             result = experiment_runner.run(
                 model_name=selected_model,
@@ -347,6 +561,17 @@ class MainApp:
                 state=state,
                 evaluator=evaluator,
                 stop_event=stop_event,
+            )
+
+            self._store_run_result(
+                stock=stock,
+                gui_window=gui_window,
+                selected_model=selected_model,
+                result=result,
+                status="success",
+                ts_start=ts_start,
+                job_id=self._active_queue_job_id,
+                queue_run_id=self._active_queue_run_id,
             )
 
             self.frontendApp.root.after(
@@ -366,11 +591,33 @@ class MainApp:
 
         except InterruptedError:
             self.logger.info("[startPipeline] Pipeline interrupted by stop_event")
+            self._store_run_result(
+                stock=stock,
+                gui_window=gui_window,
+                selected_model=selected_model,
+                result=result,
+                status="cancelled",
+                ts_start=ts_start,
+                job_id=self._active_queue_job_id,
+                queue_run_id=self._active_queue_run_id,
+                error_message="Pipeline interrupted",
+            )
             self.frontendApp.root.after(0, self.frontendApp._reset_ui)
             return (self.frontendApp.modelVar.get(), "-", 0.0)
 
-        except Exception:
+        except Exception as exc:
             self.logger.exception("Pipeline failed")
+            self._store_run_result(
+                stock=stock,
+                gui_window=gui_window,
+                selected_model=selected_model,
+                result=result,
+                status="failed",
+                ts_start=ts_start,
+                job_id=self._active_queue_job_id,
+                queue_run_id=self._active_queue_run_id,
+                error_message=str(exc),
+            )
             raise
 
         finally:
@@ -385,15 +632,8 @@ class MainApp:
                 self.frontendApp.root.after(0, _finish_ui)
             except RuntimeError:
                 pass
-            
-    def run(self):
-        """
-        Entry point for application execution.
 
-        Modes:
-        - gui: start background data loading and enter the Tk mainloop
-        - headless: run a single CLI experiment without entering the GUI loop
-        """
+    def run(self):
         run_mode = str(getattr(self.args, "run_mode", "gui")).strip().lower()
 
         if run_mode == "gui":
@@ -440,25 +680,12 @@ class MainApp:
         )
 
     def run_headless(self, stock: str = None, gui_window: str = None, model_name: str = None):
-        """
-        Run a single experiment without entering the Tk mainloop.
-
-        Transitional headless mode:
-        - reuses the existing FrontEnd/evaluator objects for compatibility
-        - keeps the Tk root hidden
-        - does not start the GUI event loop
-        """
-
-        # ====================================
-        # STEP 1: Ensure the compatibility UI stays hidden
         try:
             self.frontendApp.root.withdraw()
             self.frontendApp.root.update_idletasks()
         except Exception:
             pass
 
-        # ====================================
-        # STEP 2: Resolve defaults
         selected_stock = stock or (self.args.tickers[0] if self.args.tickers else None)
         if not selected_stock:
             raise RuntimeError("No stock available for headless execution.")
@@ -475,8 +702,6 @@ class MainApp:
             selected_model,
         )
 
-        # ====================================
-        # STEP 3: Establish feature columns
         engineered = ["return", "volatility", "momentum"]
         if self.args.ablate_feature != "none":
             engineered = [f for f in engineered if f != self.args.ablate_feature]
@@ -489,8 +714,6 @@ class MainApp:
             self.raw_feature_cols,
         )
 
-        # ====================================
-        # STEP 4: Load raw price history synchronously
         self.priceHistory, load_result = self._load_price_history(
             self.args.tickers,
             return_handler=True
@@ -513,9 +736,7 @@ class MainApp:
             )
             self.universe_info = self.universe_definition.to_dict()
 
-        self.raw_feature_dfs = {
-            t: self.priceHistory[t] for t in valid_tickers
-        }
+        self.raw_feature_dfs = {t: self.priceHistory[t] for t in valid_tickers}
 
         if not self.raw_feature_dfs:
             raise RuntimeError("No usable asset data was loaded.")
@@ -526,8 +747,6 @@ class MainApp:
                 f"Available: {', '.join(sorted(self.raw_feature_dfs.keys()))}"
             )
 
-        # ====================================
-        # STEP 5: Bind compatibility state without starting mainloop
         self.frontendApp.bindMainApp(self)
         self.frontendApp.modelVar.set(selected_model.upper())
         self.frontendApp.stockVar.set(selected_stock)
@@ -537,13 +756,9 @@ class MainApp:
         evaluator = self.frontendApp.evaluator
         evaluator.reset_histories()
 
-        # ====================================
-        # STEP 6: Build pipeline state
         pipeline = Pipeline(self)
         state = pipeline.run(selected_stock, selected_window, stop_event=None)
 
-        # ====================================
-        # STEP 7: Execute shared experiment runner
         experiment_runner = ExperimentRunner(self)
         result = experiment_runner.run(
             model_name=selected_model,
@@ -553,8 +768,6 @@ class MainApp:
             stop_event=None,
         )
 
-        # ====================================
-        # STEP 8: Flush pending UI work while remaining hidden
         try:
             self.frontendApp.updateResults(
                 result.model_name,
@@ -568,9 +781,6 @@ class MainApp:
         return result
 
     def _load_price_history(self, tickers, period="729d", return_handler=False):
-        """
-        Load OHLCV data using the configured price provider.
-        """
         loader = self.price_loader_registry.get(self.args.price_provider)
 
         data = loader.load_prices(
@@ -583,6 +793,30 @@ class MainApp:
 
         wrapper = LoadedPriceResult(loaded_tickers=list(data.keys()))
         return (data, wrapper) if return_handler else data
+
+    def reload_universe(self, universe_id: str, custom_tickers: list = None):
+        """Reload universe and prices - called from frontend universe selector."""
+        self.args.universe_id = universe_id
+        if custom_tickers:
+            self.args.custom_tickers = custom_tickers
+        
+        self._resolve_universe()
+        
+        # Load prices for new universe
+        self.priceHistory, load_result = self._load_price_history(
+            self.args.tickers,
+            return_handler=True,
+        )
+        
+        valid_tickers = load_result.listTickers()
+        dropped = [t for t in self.args.tickers if t not in valid_tickers]
+        if dropped:
+            self.logger.warning("Dropped tickers: %s", ", ".join(dropped))
+        
+        self.args.tickers = valid_tickers
+        self.raw_feature_dfs = {t: self.priceHistory[t] for t in valid_tickers}
+        
+        return valid_tickers
 
     def _check_stop(self, stop_event: threading.Event):
         if stop_event and stop_event.is_set():
@@ -604,7 +838,6 @@ class MainApp:
             engineered = [f for f in engineered if f != self.args.ablate_feature]
 
         feature_cols = ["close"] + engineered
-
         resolved_seq_len = int(seq_len) if seq_len is not None else int(self.args.seq_len)
 
         return {

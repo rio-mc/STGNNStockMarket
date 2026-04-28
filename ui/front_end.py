@@ -1,7 +1,8 @@
 import math
+import shutil
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, ttk
 from typing import List, Tuple, Optional
 
 import matplotlib.cm as cm
@@ -12,8 +13,14 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Patch
 
-from core.job_queue import QueueJob, JobQueueController, parse_seed_spec
+from core.job_queue import (
+    QueueJob,
+    JobQueueController,
+    parse_seed_spec,
+    parse_ticker_spec,
+)
 from evaluation.evaluation_methods import EvaluationMethods
+
 
 class Cancelled(Exception):
     """Raised when training is aborted by user."""
@@ -23,65 +30,127 @@ class Cancelled(Exception):
 class FrontEnd:
     """
     Handles front-end logic for a single selected-model run.
-
-    Refactor intent:
-    - one selected model
-    - one evaluation pane
-    - one backtest pane
-    - one metrics pane
     """
 
-    def __init__(self, availableTickers):
-        # ====================================
-        # === 1. Top-level window
+    def __init__(self, availableTickers, project_root=None):
         self.root = tk.Tk()
         self.root.title("Stock Trend Explorer")
         self.root.geometry("1650x1050")
         self.root.minsize(1300, 900)
 
-        # ====================================
-        # === 2. Notebook for tabs
+        # Store project root for custom universe imports
+        from pathlib import Path
+        self.project_root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
+
+        # ------------------------------------------------------------------
+        # Global state used by callbacks and async loading
+        # ------------------------------------------------------------------
+        self.stop_event = threading.Event()
+        self.statusVar = tk.StringVar(value="Idle")
+        self._background_busy = False
+        self._busy_controls = []
+
+        self._compute_callback = None
+        self._trainers = {}
+        self._main_app = None
+
+        self.priceHistory = {}
+        self.currentWindowIdx = 0
+
+        self._last_drawn_tickers = []
+        self._last_drawn_pos = {}
+        self._last_pruned_edges = []
+        self._last_mst_edges = []
+        self._last_edge_labels = []
+        self._sector_to_colour = {}
+        self._highlight_markers = []
+        self.ticker_to_sector = {}
+        self._selected_ticker = None
+
+        self._queue_add_callback = None
+        self._queue_run_callback = None
+        self._queue_remove_callback = None
+        self._queue_clear_callback = None
+
+        self.queue_popout = None
+        self.queue_popout_table = None
+
+        # ------------------------------------------------------------------
+        # Notebook
+        # ------------------------------------------------------------------
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        # ====================================
-        # === 3. Main tab
         self.mainTab = tk.Frame(self.notebook)
         self.notebook.add(self.mainTab, text="Main")
 
-        # ====================================
-        # === 4. Toolbar frame
-        self.toolbar = tk.Frame(self.mainTab, height=40, bd=1, relief=tk.RAISED)
-        self.toolbar.pack(fill=tk.X)
+        # ------------------------------------------------------------------
+        # Top control area: Configuration / Run / Queue
+        # ------------------------------------------------------------------
+        self.toolbar = tk.Frame(self.mainTab, bd=1, relief=tk.RAISED)
+        self.toolbar.pack(fill=tk.X, padx=6, pady=(6, 2))
 
-        tk.Label(self.toolbar, text="Prediction range:").pack(side=tk.LEFT, padx=(10, 2))
+        self.configGroup = tk.LabelFrame(self.toolbar, text="Configuration", padx=8, pady=6)
+        self.configGroup.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+        self.runGroup = tk.LabelFrame(self.toolbar, text="Run", padx=8, pady=6)
+        self.runGroup.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
+
+        self.queueGroup = tk.LabelFrame(self.toolbar, text="Queue", padx=8, pady=6)
+        self.queueGroup.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Configuration group: compact grid instead of one long toolbar.
+        for col in range(12):
+            self.configGroup.columnconfigure(col, weight=0)
+        self.configGroup.columnconfigure(1, weight=1)
+        self.configGroup.columnconfigure(3, weight=1)
+        self.configGroup.columnconfigure(5, weight=1)
+        self.configGroup.columnconfigure(7, weight=1)
+
+        tk.Label(self.configGroup, text="Prediction range").grid(row=0, column=0, sticky="w", padx=(0, 4))
         self.windowValues = ["1d", "2d", "5d", "1w"]
         self.windowOptions = []
         self.windowVar = tk.StringVar(value=self.windowValues[0])
         self.windowMenu = ttk.Combobox(
-            self.toolbar,
+            self.configGroup,
             textvariable=self.windowVar,
             values=self.windowValues,
-            width=6,
+            width=7,
             state="readonly",
         )
-        self.windowMenu.pack(side=tk.LEFT, padx=2)
+        self.windowMenu.grid(row=1, column=0, sticky="ew", padx=(0, 10))
         self.windowMenu.bind("<<ComboboxSelected>>", self._onSelectionChange)
 
-        tk.Label(self.toolbar, text="Stock:").pack(side=tk.LEFT, padx=(20, 2))
+        tk.Label(self.configGroup, text="Stock(s)").grid(row=0, column=1, sticky="w", padx=(0, 4))
         self.stockVar = tk.StringVar(value=availableTickers[0] if availableTickers else "")
         self.stockMenu = ttk.Combobox(
-            self.toolbar,
+            self.configGroup,
             textvariable=self.stockVar,
             values=availableTickers,
-            width=8,
-            state="readonly",
+            width=26,
+            state="normal",
         )
-        self.stockMenu.pack(side=tk.LEFT, padx=2)
+        self.stockMenu.grid(row=1, column=1, sticky="ew", padx=(0, 10))
         self.stockMenu.bind("<<ComboboxSelected>>", self._onSelectionChange)
 
-        tk.Label(self.toolbar, text="Model:").pack(side=tk.LEFT, padx=(20, 2))
-        
+        tk.Label(self.configGroup, text="Universe").grid(row=0, column=2, sticky="w", padx=(0, 4))
+        self.universeValues = ["S&P 500", "NASDAQ 100", "Custom"]
+        self.universeVar = tk.StringVar(value=self.universeValues[0])
+        self.universeMenu = ttk.Combobox(
+            self.configGroup,
+            textvariable=self.universeVar,
+            values=self.universeValues,
+            width=13,
+            state="readonly",
+        )
+        self.universeMenu.grid(row=1, column=2, sticky="ew", padx=(0, 4))
+        self.universeMenu.bind("<<ComboboxSelected>>", self._on_universe_change)
+
+        self.btnImport = tk.Button(self.configGroup, text="Import CSV", command=self._on_import_csv)
+        self.btnImport.grid(row=1, column=3, sticky="w", padx=(0, 10))
+        self.btnImport.configure(state=tk.DISABLED)
+
+        tk.Label(self.configGroup, text="Model").grid(row=0, column=4, sticky="w", padx=(0, 4))
         self.modelValues = [
             "LSTM",
             "GRU",
@@ -92,76 +161,80 @@ class FrontEnd:
             "GRAPHSAGE",
             "STGNN",
         ]
-
         self.modelVar = tk.StringVar(value=self.modelValues[0])
         self.modelMenu = ttk.Combobox(
-            self.toolbar,
+            self.configGroup,
             textvariable=self.modelVar,
             values=self.modelValues,
-            width=10,
-            state="readonly"
+            width=13,
+            state="readonly",
         )
-        self.modelMenu.pack(side=tk.LEFT, padx=2)
+        self.modelMenu.grid(row=1, column=4, sticky="ew", padx=(0, 10))
         self.modelMenu.bind("<<ComboboxSelected>>", self._on_model_selection_change)
 
-        tk.Label(self.toolbar, text="Seed(s):").pack(side=tk.LEFT, padx=(20, 2))
+        tk.Label(self.configGroup, text="Seed(s)").grid(row=0, column=5, sticky="w", padx=(0, 4))
         self.seedVar = tk.StringVar(value="42")
-        self.seedEntry = ttk.Entry(self.toolbar, textvariable=self.seedVar, width=12)
-        self.seedEntry.pack(side=tk.LEFT, padx=2)
+        self.seedEntry = ttk.Entry(self.configGroup, textvariable=self.seedVar, width=14)
+        self.seedEntry.grid(row=1, column=5, sticky="ew", padx=(0, 10))
 
-        tk.Label(self.toolbar, text="Graph backend:").pack(side=tk.LEFT, padx=(20, 2))
+        tk.Label(self.configGroup, text="Graph backend").grid(row=0, column=6, sticky="w", padx=(0, 4))
         self.graphModelValues = ["GCN", "GRAPHSAGE", "GAT", "NNCONV"]
         self.graphModelVar = tk.StringVar(value=self.graphModelValues[0])
         self.graphModelMenu = ttk.Combobox(
-            self.toolbar,
+            self.configGroup,
             textvariable=self.graphModelVar,
             values=self.graphModelValues,
-            width=12,
-            state="readonly"
+            width=13,
+            state="readonly",
         )
-        self.graphModelMenu.pack(side=tk.LEFT, padx=2)
-        self._sync_graph_backend_state()
-        self.stop_event = threading.Event()
-        self.statusVar = tk.StringVar(value="Idle")
+        self.graphModelMenu.grid(row=1, column=6, sticky="ew", padx=(0, 10))
 
-        self.btnCompute = tk.Button(self.toolbar, text="Compute ▶", command=self._onCompute)
-        self.btnCompute.pack(side=tk.RIGHT, padx=10)
+        # Run group
+        self.btnCompute = tk.Button(self.runGroup, text="Compute ▶", command=self._onCompute, width=14)
+        self.btnCompute.grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 4))
 
-        self.btnStop = tk.Button(self.toolbar, text="Stop ■", command=self._onStop, state=tk.DISABLED)
-        self.btnStop.pack(side=tk.RIGHT, padx=(0, 10))
-
-        self.btnRunQueue = tk.Button(self.toolbar, text="Run Queue ▷", command=self._onRunQueue)
-        self.btnRunQueue.pack(side=tk.RIGHT, padx=(0, 10))
-
-        self.btnQueueAdd = tk.Button(self.toolbar, text="Add To Queue +", command=self._onAddToQueue)
-        self.btnQueueAdd.pack(side=tk.RIGHT, padx=(0, 10))
-
-        self.btnQueuePopout = tk.Button(self.toolbar, text="Queue Popout", command=self._open_queue_popout)
-        self.btnQueuePopout.pack(side=tk.RIGHT, padx=(0, 10))
+        self.btnStop = tk.Button(self.runGroup, text="Stop ■", command=self._onStop, state=tk.DISABLED, width=12)
+        self.btnStop.grid(row=0, column=1, sticky="ew", pady=(0, 4))
 
         self.progressVar = tk.DoubleVar(value=0.0)
         self.progressBar = ttk.Progressbar(
-            self.toolbar,
+            self.runGroup,
             variable=self.progressVar,
             maximum=1.0,
-            length=200,
+            length=210,
         )
-        self.progressBar.pack(side=tk.RIGHT, padx=(0, 10))
+        self.progressBar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 4))
 
         self.statusLabel = tk.Label(
-            self.toolbar,
+            self.runGroup,
             textvariable=self.statusVar,
-            anchor="e",
+            anchor="w",
             fg="gray",
             font=("Arial", 9),
         )
-        self.statusLabel.pack(side=tk.RIGHT, padx=10)
+        self.statusLabel.grid(row=2, column=0, columnspan=2, sticky="ew")
 
+        # Queue group
+        self.btnQueueAdd = tk.Button(self.queueGroup, text="Add to queue +", command=self._onAddToQueue, width=14)
+        self.btnQueueAdd.grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 4))
+
+        self.btnRunQueue = tk.Button(self.queueGroup, text="Run queue ▷", command=self._onRunQueue, width=14)
+        self.btnRunQueue.grid(row=0, column=1, sticky="ew", pady=(0, 4))
+
+        self.btnQueuePopout = tk.Button(self.queueGroup, text="Queue popout", command=self._open_queue_popout, width=14)
+        self.btnQueuePopout.grid(row=1, column=0, columnspan=2, sticky="ew")
+
+        # ------------------------------------------------------------------
+        # Queue strip: secondary, compact, still always available
+        # ------------------------------------------------------------------
         self.queueFrame = tk.LabelFrame(self.mainTab, text="Prediction Queue", padx=6, pady=6)
-        self.queueFrame.pack(fill=tk.X, padx=10, pady=(6, 4))
+        self.queueFrame.pack(fill=tk.X, padx=10, pady=(4, 4))
+
+        queue_body = tk.Frame(self.queueFrame)
+        queue_body.pack(fill=tk.X, expand=True)
 
         queue_cols = ("Job ID", "Window", "Ticker", "Model", "Seed", "Graph")
-        self.queueTable = ttk.Treeview(self.queueFrame, columns=queue_cols, show="headings", height=5)
+        self.queueTable = ttk.Treeview(self.queueFrame, columns=queue_cols, show="headings", height=4)
         for c in queue_cols:
             self.queueTable.heading(c, text=c)
             self.queueTable.column(c, width=110, anchor=tk.CENTER)
@@ -176,21 +249,40 @@ class FrontEnd:
         tk.Button(self.queueButtons, text="Remove", command=self._onRemoveQueueItem).pack(fill=tk.X, pady=2)
         tk.Button(self.queueButtons, text="Clear", command=self._onClearQueue).pack(fill=tk.X, pady=2)
 
-        self.queue_popout = None
-        self.queue_popout_table = None
+        # ------------------------------------------------------------------
+        # Main workspace: top = price + prediction, bottom = graph + table
+        # ------------------------------------------------------------------
+        self.workspace = tk.PanedWindow(self.mainTab, orient=tk.VERTICAL, sashrelief=tk.RAISED)
+        self.workspace.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
-        # ====================================
-        # === 5. Price chart
-        self.priceFrame = tk.Frame(self.mainTab, bd=1, relief=tk.SUNKEN)
-        self.priceFrame.pack(fill=tk.BOTH, expand=True)
+        self.topWorkspace = tk.PanedWindow(self.workspace, orient=tk.HORIZONTAL, sashrelief=tk.RAISED)
+        self.workspace.add(self.topWorkspace, minsize=260)
 
-        self.priceFig, self.priceAx = plt.subplots(figsize=(8, 2.5))
-        self.priceCanvas = FigureCanvasTkAgg(self.priceFig, master=self.priceFrame)
-        self.priceCanvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.priceFrame = tk.LabelFrame(self.topWorkspace, text="Price history", padx=4, pady=4)
+        self.topWorkspace.add(self.priceFrame, stretch="always", minsize=650)
+
+        # Dedicated layout container so the chart cannot consume the slider's space
+        self.priceFrame.rowconfigure(0, weight=1)   # chart expands
+        self.priceFrame.rowconfigure(1, weight=0)   # slider fixed
+        self.priceFrame.columnconfigure(0, weight=1)
+
+        self.priceChartFrame = tk.Frame(self.priceFrame)
+        self.priceChartFrame.grid(row=0, column=0, sticky="nsew")
+
+        self.priceChartFrame.rowconfigure(0, weight=1)
+        self.priceChartFrame.columnconfigure(0, weight=1)
+
+        self.priceFig, self.priceAx = plt.subplots(figsize=(8, 2.8))
+        self.priceCanvas = FigureCanvasTkAgg(self.priceFig, master=self.priceChartFrame)
+        self.priceCanvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         self.priceCanvas.mpl_connect("scroll_event", self._onPriceScroll)
 
+        self.zoomSliderFrame = tk.Frame(self.priceFrame)
+        self.zoomSliderFrame.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self.zoomSliderFrame.columnconfigure(0, weight=1)
+
         self.zoomSlider = tk.Scale(
-            self.priceFrame,
+            self.zoomSliderFrame,
             from_=1,
             to=1,
             orient=tk.HORIZONTAL,
@@ -198,43 +290,54 @@ class FrontEnd:
             showvalue=False,
             command=self._onSliderChange,
         )
-        self.zoomSlider.pack(fill=tk.X, padx=10, pady=(0, 40))
+        self.zoomSlider.grid(row=0, column=0, sticky="ew", padx=10)
 
-        # ====================================
-        # === 6. Prediction results panel
-        self.resultFrame = tk.Frame(self.mainTab)
-        self.resultFrame.pack(fill=tk.X)
+        self.resultFrame = tk.Frame(self.topWorkspace)
+        self.topWorkspace.add(self.resultFrame, minsize=280)
 
-        self.modelRes = tk.LabelFrame(self.resultFrame, text="Model Prediction", padx=10, pady=10)
-        self.modelRes.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=20, pady=5)
+        self.modelRes = tk.LabelFrame(self.resultFrame, text="Prediction Summary", padx=14, pady=14)
+        self.modelRes.pack(fill=tk.BOTH, expand=True)
 
         self.modelNameLabel = tk.Label(
             self.modelRes,
             text=f"Model: {self.modelVar.get()}",
-            font=("Helvetica", 12, "bold"),
+            font=("Helvetica", 10),
+            anchor="w",
         )
-        self.modelNameLabel.pack()
+        self.modelNameLabel.pack(fill=tk.X, anchor="w")
+
         self.modelStatus = tk.Label(
             self.modelRes,
             text="Trending: —",
-            font=("Helvetica", 12, "bold"),
+            font=("Helvetica", 18, "bold"),
             fg="black",
+            anchor="w",
         )
-        self.modelStatus.pack()
+        self.modelStatus.pack(fill=tk.X, anchor="w", pady=(12, 4))
 
         self.modelConf = tk.Label(
             self.modelRes,
             text="Confidence: —",
+            font=("Helvetica", 11),
+            anchor="w",
         )
-        self.modelConf.pack()
+        self.modelConf.pack(fill=tk.X, anchor="w")
 
-        # ====================================
-        # === 7. Bottom pane: graph + feature table
-        self.bottom_pane = tk.PanedWindow(self.mainTab, orient=tk.VERTICAL)
-        self.bottom_pane.pack(fill=tk.BOTH, expand=True)
+        self.summaryHelp = tk.Label(
+            self.modelRes,
+            text="Run a single-stock compute job or use the queue for multi-stock runs.",
+            fg="gray",
+            justify=tk.LEFT,
+            wraplength=260,
+            anchor="w",
+        )
+        self.summaryHelp.pack(fill=tk.X, anchor="w", pady=(18, 0))
 
-        self.graphFrame = tk.LabelFrame(self.bottom_pane, text="Graph Output")
-        self.bottom_pane.add(self.graphFrame, minsize=200)
+        self.bottomWorkspace = tk.PanedWindow(self.workspace, orient=tk.HORIZONTAL, sashrelief=tk.RAISED)
+        self.workspace.add(self.bottomWorkspace, minsize=420)
+
+        self.graphFrame = tk.LabelFrame(self.bottomWorkspace, text="Graph Output")
+        self.bottomWorkspace.add(self.graphFrame, stretch="always", minsize=650)
 
         self.graph_container = tk.Frame(self.graphFrame)
         self.graph_container.pack(fill=tk.BOTH, expand=True)
@@ -252,8 +355,8 @@ class FrontEnd:
         self.legend_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=10, pady=10)
         tk.Label(self.legend_frame, text="(sector map not loaded)").pack(anchor="w")
 
-        self.table_pane = tk.Frame(self.bottom_pane, height=150)
-        self.bottom_pane.add(self.table_pane, minsize=150)
+        self.table_pane = tk.LabelFrame(self.bottomWorkspace, text="Feature Table", padx=4, pady=4)
+        self.bottomWorkspace.add(self.table_pane, minsize=360)
 
         cols = ("Stock", "Return", "Volatility", "Volume", "Momentum")
         self.table = ttk.Treeview(self.table_pane, columns=cols, show="headings")
@@ -268,8 +371,9 @@ class FrontEnd:
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.table.configure(yscrollcommand=scroll.set)
 
-        # ====================================
-        # === 8. Evaluation tab (single active model)
+        # ------------------------------------------------------------------
+        # Evaluation tab
+        # ------------------------------------------------------------------
         self.evalTab = tk.Frame(self.notebook)
         self.notebook.add(self.evalTab, text="Evaluation")
 
@@ -298,8 +402,9 @@ class FrontEnd:
         self.loss_pane = tk.Frame(self.loss_pane_frame)
         self.loss_pane.pack(fill=tk.BOTH, expand=True)
 
-        # ====================================
-        # === 9. Backtesting tab (single active model)
+        # ------------------------------------------------------------------
+        # Backtesting tab
+        # ------------------------------------------------------------------
         self.backtestTab = ttk.Frame(self.notebook)
         self.notebook.add(self.backtestTab, text="Backtesting")
 
@@ -314,8 +419,9 @@ class FrontEnd:
         self.backtest_pane = tk.Frame(self.backtest_frame)
         self.backtest_pane.pack(fill=tk.BOTH, expand=True)
 
-        # ====================================
-        # === 10. Metrics tab (single active model)
+        # ------------------------------------------------------------------
+        # Metrics tab
+        # ------------------------------------------------------------------
         self.metricsTab = tk.Frame(self.notebook)
         self.notebook.add(self.metricsTab, text="Metrics")
 
@@ -338,36 +444,53 @@ class FrontEnd:
 
         self.threshold_pane = tk.LabelFrame(self.metrics_model_pane, text="Threshold Curve")
         self.metrics_model_pane.add(self.threshold_pane)
+
         self.set_active_model_titles(self.modelVar.get())
+        self._sync_graph_backend_state()
 
-        # ====================================
-        # === 11. State
-        self._compute_callback = None
-        self._trainers = {}
-        self._main_app = None
-
-        self.priceHistory = {}
-        self.currentWindowIdx = 0
-
-        self._last_drawn_tickers = []
-        self._last_drawn_pos = {}
-        self._last_pruned_edges = []
-        self._last_mst_edges = []
-        self._last_edge_labels = []
-        self._sector_to_colour = {}
-        self._highlight_markers = []
-        self.ticker_to_sector = {}
-        self._selected_ticker = None
-
-        self._queue_add_callback = None
-        self._queue_run_callback = None
-        self._queue_remove_callback = None
-        self._queue_clear_callback = None
-
-        # ====================================
-        # === 12. Evaluation logic
         self.evaluator = EvaluationMethods(self)
         self.evaluator.reset_histories()
+
+        self.root.after(100, self._schedule_rebalance())
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.root.bind(
+            "<Configure>",
+            lambda e: self._schedule_rebalance() if e.widget == self.root else None,
+            add="+"
+        )
+
+    def _rebalance_main_workspace(self):
+        """Set sensible initial sash positions after widgets have sizes."""
+        try:
+            self.workspace.update_idletasks()
+            h = self.workspace.winfo_height()
+            if h > 10:
+                self.workspace.sash_place(0, 0, int(h * 0.38))
+        except Exception:
+            pass
+
+        try:
+            self.topWorkspace.update_idletasks()
+            w = self.topWorkspace.winfo_width()
+            if w > 10:
+                self.topWorkspace.sash_place(0, int(w * 0.78), 0)
+        except Exception:
+            pass
+
+        try:
+            self.bottomWorkspace.update_idletasks()
+            w = self.bottomWorkspace.winfo_width()
+            if w > 10:
+                self.bottomWorkspace.sash_place(0, int(w * 0.70), 0)
+        except Exception:
+            pass
+
+    def ui_call(self, fn, *args, **kwargs):
+        try:
+            self.root.after(0, lambda: fn(*args, **kwargs))
+        except RuntimeError:
+            pass
 
     def bindMainApp(self, main_app):
         self._main_app = main_app
@@ -417,7 +540,6 @@ class FrontEnd:
             "stgnn": "STGNN",
         }
 
-
         key = str(model_name).strip().lower()
         pretty = labels.get(key, key.upper())
 
@@ -446,7 +568,6 @@ class FrontEnd:
     def setComputeCallback(self, cb):
         self._compute_callback = cb
 
-
     def setQueueAddCallback(self, cb):
         self._queue_add_callback = cb
 
@@ -459,8 +580,31 @@ class FrontEnd:
     def setQueueClearCallback(self, cb):
         self._queue_clear_callback = cb
 
+    def _is_graph_backend_applicable(self, model_name: str) -> bool:
+        return str(model_name).strip().lower() == "stgnn"
+
+    def _sync_graph_backend_state(self):
+        selected_model = str(self.modelVar.get()).strip().lower()
+        enabled = self._is_graph_backend_applicable(selected_model)
+        self.graphModelMenu.config(state="readonly" if enabled else "disabled")
+        if not enabled:
+            self.graphModelVar.set("GCN")
+
+    def _parse_selected_tickers(self) -> List[str]:
+        seed_raw = str(self.seedVar.get()).strip()
+        first_seed = 42
+        if seed_raw:
+            first_seed = int(seed_raw.split(",")[0].split("-")[0].strip())
+
+        return parse_ticker_spec(
+            ticker_spec=str(self.stockVar.get()).strip(),
+            available_tickers=list(self.stockMenu.cget("values")),
+            rng_seed=first_seed,
+        )
+
     def _build_current_jobs(self) -> List[QueueJob]:
         seed_values = parse_seed_spec(str(self.seedVar.get()).strip())
+        ticker_values = self._parse_selected_tickers()
 
         model_name = str(self.modelVar.get()).strip().lower()
         graph_model = (
@@ -470,21 +614,26 @@ class FrontEnd:
         )
 
         jobs: List[QueueJob] = []
-        for seed in seed_values:
-            jobs.append(
-                QueueJob(
-                    job_id=JobQueueController.make_job_id(),
-                    created_at="now",
-                    prediction_window=str(self.windowVar.get()).strip(),
-                    ticker=str(self.stockVar.get()).strip().upper(),
-                    model=model_name,
-                    seed=int(seed),
-                    graph_model=graph_model,
+        for ticker in ticker_values:
+            for seed in seed_values:
+                jobs.append(
+                    QueueJob(
+                        job_id=JobQueueController.make_job_id(),
+                        created_at="now",
+                        prediction_window=str(self.windowVar.get()).strip(),
+                        ticker=ticker,
+                        model=model_name,
+                        seed=int(seed),
+                        graph_model=graph_model,
+                    )
                 )
-            )
         return jobs
 
     def _onAddToQueue(self):
+        if self._background_busy:
+            self.set_status("Please wait until loading finishes.")
+            return
+
         if self._queue_add_callback is None:
             return
         try:
@@ -508,6 +657,32 @@ class FrontEnd:
     def _onClearQueue(self):
         if self._queue_clear_callback is not None:
             self._queue_clear_callback()
+
+    def _clear_dead_queue_popout_refs(self):
+        try:
+            if self.queue_popout is not None and not self.queue_popout.winfo_exists():
+                self.queue_popout = None
+                self.queue_popout_table = None
+                return
+        except tk.TclError:
+            self.queue_popout = None
+            self.queue_popout_table = None
+            return
+
+        try:
+            if self.queue_popout_table is not None and not self.queue_popout_table.winfo_exists():
+                self.queue_popout_table = None
+        except tk.TclError:
+            self.queue_popout_table = None
+
+    def _on_queue_popout_closed(self):
+        self.queue_popout_table = None
+        try:
+            if self.queue_popout is not None and self.queue_popout.winfo_exists():
+                self.queue_popout.destroy()
+        except tk.TclError:
+            pass
+        self.queue_popout = None
 
     def refresh_queue_table(self, jobs):
         def _apply():
@@ -567,45 +742,29 @@ class FrontEnd:
         self.queue_popout.protocol("WM_DELETE_WINDOW", self._on_queue_popout_closed)
 
         cols = ("Job ID", "Window", "Ticker", "Model", "Seed", "Graph")
-        self.queue_popout_table = ttk.Treeview(
-            self.queue_popout,
-            columns=cols,
-            show="headings",
-        )
+        self.queue_popout_table = ttk.Treeview(self.queue_popout, columns=cols, show="headings")
         for c in cols:
             self.queue_popout_table.heading(c, text=c)
             self.queue_popout_table.column(c, width=130, anchor=tk.CENTER)
         self.queue_popout_table.pack(fill=tk.BOTH, expand=True)
 
-    def _clear_dead_queue_popout_refs(self):
-        try:
-            if self.queue_popout is not None and not self.queue_popout.winfo_exists():
-                self.queue_popout = None
-                self.queue_popout_table = None
-                return
-        except tk.TclError:
-            self.queue_popout = None
-            self.queue_popout_table = None
+    def _onCompute(self):
+        if self._background_busy:
+            self.set_status("Please wait until loading finishes.")
             return
 
-        try:
-            if self.queue_popout_table is not None and not self.queue_popout_table.winfo_exists():
-                self.queue_popout_table = None
-        except tk.TclError:
-            self.queue_popout_table = None
-
-
-    def _on_queue_popout_closed(self):
-        self.queue_popout_table = None
-        try:
-            if self.queue_popout is not None and self.queue_popout.winfo_exists():
-                self.queue_popout.destroy()
-        except tk.TclError:
-            pass
-        self.queue_popout = None
-
-    def _onCompute(self):
         selected_model = self.get_selected_model()
+
+        try:
+            tickers = self._parse_selected_tickers()
+        except Exception as exc:
+            self.set_status(str(exc))
+            return
+
+        if len(tickers) != 1:
+            self.set_status("Compute ▶ supports one ticker only. Use Add To Queue for multi-stock specs.")
+            return
+
         self.set_status(f"Queued {selected_model.upper()} run...")
 
         self.stop_event.clear()
@@ -615,7 +774,7 @@ class FrontEnd:
 
         worker = threading.Thread(
             target=self._run_and_capture,
-            args=(self.windowVar.get(), self.stockVar.get()),
+            args=(self.windowVar.get(), tickers[0]),
             daemon=True,
         )
         worker.start()
@@ -686,7 +845,7 @@ class FrontEnd:
         self.priceAx.set_xlabel("Date")
         self.priceAx.set_ylabel("Closing Price (USD)")
         self.priceFig.tight_layout(pad=1.0)
-        self.priceCanvas.draw()
+        self.priceCanvas.draw_idle()
 
     def _onSelectionChange(self, event=None):
         if self._main_app is None:
@@ -918,7 +1077,7 @@ class FrontEnd:
         )
         canvas = FigureCanvasTkAgg(legend_fig, master=self.legend_frame)
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        canvas.draw()
+        canvas.draw_idle()
 
     def _sector_palette(self, sectors: List[str]):
         unique = sorted(set(sectors))
@@ -968,6 +1127,111 @@ class FrontEnd:
     def clear_status(self):
         self.root.after(0, lambda: self.statusVar.set("Idle"))
 
+    def _set_loading_state(self, busy: bool, message: str = ""):
+        """
+        Keep the UI responsive during heavier data work such as universe reloads
+        and custom CSV imports.
+        """
+        def _apply():
+            self._background_busy = bool(busy)
+
+            if message:
+                self.statusVar.set(message)
+            elif not busy:
+                self.statusVar.set("Idle")
+
+            controls = [
+                getattr(self, "universeMenu", None),
+                getattr(self, "stockMenu", None),
+                getattr(self, "windowMenu", None),
+                getattr(self, "modelMenu", None),
+                getattr(self, "seedEntry", None),
+                getattr(self, "graphModelMenu", None),
+                getattr(self, "btnImport", None),
+                getattr(self, "btnCompute", None),
+                getattr(self, "btnQueueAdd", None),
+                getattr(self, "btnRunQueue", None),
+                getattr(self, "btnQueuePopout", None),
+            ]
+
+            for widget in controls:
+                if widget is None:
+                    continue
+                try:
+                    if busy:
+                        widget.configure(state=tk.DISABLED)
+                    else:
+                        if widget is self.btnImport:
+                            widget.configure(state=tk.NORMAL if self.universeVar.get() == "Custom" else tk.DISABLED)
+                        elif widget is self.graphModelMenu:
+                            selected_model = str(self.modelVar.get()).strip().lower()
+                            widget.configure(state="readonly" if self._is_graph_backend_applicable(selected_model) else tk.DISABLED)
+                        elif widget in (self.universeMenu, self.windowMenu, self.modelMenu):
+                            widget.configure(state="readonly")
+                        elif widget is self.stockMenu:
+                            widget.configure(state="normal")
+                        else:
+                            widget.configure(state=tk.NORMAL)
+                except tk.TclError:
+                    pass
+
+            try:
+                if busy:
+                    self.progressBar.configure(mode="indeterminate", maximum=100)
+                    self.progressBar.start(12)
+                else:
+                    self.progressBar.stop()
+                    self.progressBar.configure(mode="determinate", maximum=1.0)
+                    self.progressVar.set(0.0)
+            except tk.TclError:
+                pass
+
+        self.ui_call(_apply)
+
+    def _run_background_task(self, *, title: str, work, on_success=None, on_error=None):
+        """
+        Run blocking IO/data preparation away from the Tk event loop.
+
+        `work` runs on a worker thread. `on_success` and `on_error` run on
+        the Tk thread.
+        """
+        if self._background_busy:
+            self.set_status("Another loading task is already running.")
+            return
+
+        self._set_loading_state(True, title)
+
+        def _worker():
+            try:
+                result = work()
+            except Exception as exc:
+                def _fail(exc=exc):
+                    self._set_loading_state(False, f"{title} failed")
+                    if on_error is not None:
+                        on_error(exc)
+                self.ui_call(_fail)
+                return
+
+            def _finish(result=result):
+                try:
+                    if on_success is not None:
+                        on_success(result)
+                finally:
+                    self._set_loading_state(False, "Idle")
+            self.ui_call(_finish)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_loaded_universe(self, selected_label: str, valid_tickers):
+        valid_tickers = list(valid_tickers or [])
+        self.stockMenu.configure(values=valid_tickers)
+
+        if valid_tickers:
+            self.stockVar.set(valid_tickers[0])
+            self._onSelectionChange()
+
+        self.set_status(f"Loaded universe: {selected_label} ({len(valid_tickers)} ticker(s))")
+
     def clear_axis(self, pane):
         if pane is None:
             return
@@ -985,7 +1249,7 @@ class FrontEnd:
             print(f"[WARNING] updateResults failed during UI reset: {exc}")
 
         self.graphAx.clear()
-        self.graphCanvas.draw()
+        self.graphCanvas.draw_idle()
 
         for row in self.table.get_children():
             self.table.delete(row)
@@ -1035,7 +1299,6 @@ class FrontEnd:
         self.root.after(50, _rebalance)
 
     def _on_graph_keypress(self, event):
-        # Placeholder for future graph keyboard interactions
         return
 
     def _on_table_select(self, event):
@@ -1147,13 +1410,13 @@ class FrontEnd:
     @property
     def backtestSTGNN(self):
         return self.backtest_pane
-    
+
     def set_sector_map(self, ticker_to_sector):
         self.ticker_to_sector = dict(ticker_to_sector or {})
         sectors = list(self.ticker_to_sector.values())
         self._sector_to_colour = self._sector_palette(sectors) if sectors else {}
         self.update_sector_legend()
-        
+
     def _on_model_selection_change(self, event=None):
         if self.btnCompute["state"] == tk.DISABLED:
             return
@@ -1167,21 +1430,151 @@ class FrontEnd:
 
         self.ui_call(_update)
 
-    def ui_call(self, fn, *args, **kwargs):
-        try:
-            self.root.after(0, lambda: fn(*args, **kwargs))
-        except RuntimeError:
-            pass
+    def _on_universe_change(self, event=None):
+        """
+        Handle universe dropdown selection change without blocking Tk.
+        """
+        selected = self.universeVar.get()
 
-    def _is_graph_backend_applicable(self, model_name: str) -> bool:
-        key = str(model_name).strip().lower()
-        return key == "stgnn"
+        if selected == "Custom":
+            self.btnImport.configure(state=tk.NORMAL)
+        else:
+            self.btnImport.configure(state=tk.DISABLED)
 
+        if self._main_app is None:
+            return
 
-    def _sync_graph_backend_state(self):
-        selected_model = str(self.modelVar.get()).strip().lower()
-        enabled = self._is_graph_backend_applicable(selected_model)
+        universe_map = {
+            "S&P 500": "sp500",
+            "NASDAQ 100": "nasdaq100",
+            "Custom": "custom",
+        }
+        universe_id = universe_map.get(selected, "sp500")
 
-        self.graphModelMenu.config(state="readonly" if enabled else "disabled")
-        if not enabled:
-            self.graphModelVar.set("GCN")
+        def _work():
+            return self._main_app.reload_universe(universe_id)
+
+        def _success(valid_tickers):
+            self._apply_loaded_universe(selected, valid_tickers)
+
+        def _error(exc):
+            self.set_status(f"Error loading universe: {exc}")
+
+        self._run_background_task(
+            title=f"Loading {selected} universe...",
+            work=_work,
+            on_success=_success,
+            on_error=_error,
+        )
+
+    def _on_import_csv(self, event=None):
+        """
+        Import a custom ticker CSV without blocking the UI.
+
+        Expected CSV columns:
+          - ticker
+          - sector
+        """
+        if self._background_busy:
+            self.set_status("Please wait until loading finishes.")
+            return
+
+        filepath = filedialog.askopenfilename(
+            title="Select Ticker CSV File",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+
+        if not filepath:
+            return
+
+        filepath = str(filepath)
+
+        def _work():
+            df = pd.read_csv(filepath)
+
+            required = {"ticker", "sector"}
+            missing = sorted(required - set(df.columns))
+            if missing:
+                raise ValueError(
+                    f"CSV must include columns: {', '.join(sorted(required))}. Missing: {', '.join(missing)}"
+                )
+
+            clean = df.copy()
+            clean["ticker"] = clean["ticker"].astype(str).str.strip().str.upper()
+            clean["sector"] = clean["sector"].astype(str).str.strip()
+            clean = clean[(clean["ticker"] != "") & (clean["sector"] != "")]
+            clean = clean.drop_duplicates(subset=["ticker"], keep="first")
+
+            if clean.empty:
+                raise ValueError("CSV contains no usable ticker rows after cleaning.")
+
+            custom_path = self.project_root / "static" / "universes" / "custom_tickers.csv"
+            custom_path.parent.mkdir(parents=True, exist_ok=True)
+            clean.to_csv(custom_path, index=False)
+
+            custom_tickers = clean["ticker"].tolist()
+
+            if self._main_app is None:
+                valid_tickers = custom_tickers
+            else:
+                valid_tickers = self._main_app.reload_universe("custom", custom_tickers)
+
+            return {
+                "valid_tickers": valid_tickers,
+                "imported_count": len(custom_tickers),
+                "custom_path": custom_path,
+            }
+
+        def _success(result):
+            valid_tickers = list(result.get("valid_tickers") or [])
+            imported_count = int(result.get("imported_count") or 0)
+
+            self.universeVar.set("Custom")
+            self.btnImport.configure(state=tk.NORMAL)
+            self.stockMenu.configure(values=valid_tickers)
+
+            if valid_tickers:
+                self.stockVar.set(valid_tickers[0])
+                self._onSelectionChange()
+
+            self.set_status(
+                f"Imported {imported_count} ticker(s); {len(valid_tickers)} valid ticker(s) loaded."
+            )
+
+        def _error(exc):
+            self.set_status(f"Error importing CSV: {exc}")
+
+        self._run_background_task(
+            title="Importing custom universe...",
+            work=_work,
+            on_success=_success,
+            on_error=_error,
+        )
+
+    def _schedule_rebalance(self):
+        # Cancel previous job safely
+        job = getattr(self, "_rebalance_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+
+        # Schedule safely via wrapper (prevents stale callback errors)
+        def _run():
+            self._rebalance_job = None
+            try:
+                self._rebalance_main_workspace()
+            except Exception:
+                pass  # prevents Tk "invalid command" crash
+
+        self._rebalance_job = self.root.after(120, _run)
+
+    def _on_close(self):
+        job = getattr(self, "_rebalance_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self.root.destroy()

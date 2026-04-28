@@ -63,7 +63,7 @@ class StaticCsvUniverseProvider(BaseUniverseProvider):
             ),
             "nasdaq100": StaticUniverseConfig(
                 universe_id="nasdaq100",
-                csv_filename="nasdaq100_snapshot_2026-04-08.csv",
+                csv_filename="nasdaq100_ticker.csv",
                 source_note="static_snapshot_nasdaq100",
                 universe_role="secondary",
             ),

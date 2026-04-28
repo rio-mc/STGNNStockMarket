@@ -76,7 +76,7 @@ class ConfigManager:
         parser.add_argument(
             "--top_n",
             type=int,
-            default=50,
+            default=100,
             help="Top N assets to select where applicable"
         )
         parser.add_argument(
