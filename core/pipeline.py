@@ -1,29 +1,50 @@
+import logging
+from pathlib import Path
+from typing import Dict, Optional
+
 import pandas as pd
 import torch
 
+from core.utils.utils import Utils
 from features.feature_extractor import FeatureExtractor
 from graph.graph_builder import GraphBuilder
-from core.utils.utils import Utils
 
 
 class Pipeline:
-    def __init__(self, app):
-        self.app = app
-        self.args = app.args
-        self.logger = app.logger
+    """
+    Runs data splitting, feature engineering, graph construction, and tensor config.
+
+    Can be initialised with either:
+    - MainApp instance for GUI compatibility
+    - argparse namespace plus raw_feature_dfs for headless mode
+    """
+
+    def __init__(self, app_or_args, raw_feature_dfs: Optional[Dict[str, pd.DataFrame]] = None):
+        if hasattr(app_or_args, "args"):
+            self.app = app_or_args
+            self.args = app_or_args.args
+            self.logger = app_or_args.logger
+            self.raw_feature_dfs = app_or_args.raw_feature_dfs
+        else:
+            self.app = None
+            self.args = app_or_args
+            self.raw_feature_dfs = raw_feature_dfs
+            self.logger = logging.getLogger("Pipeline")
+            if not self.logger.handlers:
+                handler = logging.StreamHandler()
+                handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+                self.logger.addHandler(handler)
+            self.logger.setLevel(logging.INFO)
+
+        if not self.raw_feature_dfs:
+            raise RuntimeError("Pipeline requires non-empty raw_feature_dfs.")
 
     def run(self, stock: str, gui_window: str, stop_event=None):
-        """
-        Runs the full data + graph + tensor pipeline.
-        Returns a state object (dict) used by model runners.
-        """
+        stock = str(stock).strip().upper()
+        if stock not in self.raw_feature_dfs:
+            raise ValueError(f"Target stock '{stock}' not found in raw_feature_dfs.")
 
-        app = self.app
-
-        # ====================================
-        # STEP 1: Determine horizon
-        price_df = app.raw_feature_dfs[stock]
-
+        price_df = self.raw_feature_dfs[stock]
         deltas = price_df.index.to_series().diff().dropna()
         if deltas.empty:
             raise RuntimeError("Not enough data to infer sampling interval")
@@ -33,23 +54,21 @@ class Pipeline:
         bars_per_day = max(1, int(pd.Timedelta("1D") / sample_interval))
 
         horizon = Utils.parse_window(gui_window, bars_per_day)
-        seq_len = int(app.args.seq_len)
+        seq_len = int(self.args.seq_len)
 
-        # Make the state explicit early so downstream helpers never depend
-        # on an attribute that has not yet been attached back onto MainApp.
-        app.horizon = horizon
-        app.seq_len = seq_len
+        # Single source of truth: graph_window is always seq_len.
+        graph_window = seq_len
+        self.args.graph_window = graph_window
 
-        if stop_event is not None:
-            app._check_stop(stop_event)
+        if self.app is not None:
+            self.app.horizon = horizon
+            self.app.seq_len = seq_len
+            self.app.graph_window = graph_window
 
-        # ====================================
-        # STEP 2: Train / validation split
-        shared_index = set.intersection(
-            *(set(df.index) for df in app.raw_feature_dfs.values())
-        )
+        self._check_stop(stop_event)
+
+        shared_index = set.intersection(*(set(df.index) for df in self.raw_feature_dfs.values()))
         shared_index = sorted(shared_index)
-
         if len(shared_index) < 2:
             raise RuntimeError("Not enough shared timestamps across tickers to build a split.")
 
@@ -61,20 +80,11 @@ class Pipeline:
         train_end_idx = max(0, cutoff_idx - embargo_bars)
         train_end_date = shared_index[train_end_idx]
 
-        train_raw_map = {
-            t: df[df.index < train_end_date].copy()
-            for t, df in app.raw_feature_dfs.items()
-        }
-        val_raw_map = {
-            t: df[df.index >= cutoff_date].copy()
-            for t, df in app.raw_feature_dfs.items()
-        }
+        train_raw_map = {ticker: df[df.index < train_end_date].copy() for ticker, df in self.raw_feature_dfs.items()}
+        val_raw_map = {ticker: df[df.index >= cutoff_date].copy() for ticker, df in self.raw_feature_dfs.items()}
 
-        if stop_event is not None:
-            app._check_stop(stop_event)
+        self._check_stop(stop_event)
 
-        # ====================================
-        # STEP 3: Feature engineering
         feat_ext_train = FeatureExtractor(
             train_raw_map,
             rollingVolWindow=seq_len,
@@ -103,38 +113,31 @@ class Pipeline:
 
         min_train_len = min(len(df) for df in train_feats.values())
         min_val_len = min(len(df) for df in val_feats.values())
+        train_feats = {ticker: df.iloc[-min_train_len:].copy() for ticker, df in train_feats.items()}
+        val_feats = {ticker: df.iloc[-min_val_len:].copy() for ticker, df in val_feats.items()}
 
-        train_feats = {
-            t: df.iloc[-min_train_len:].copy()
-            for t, df in train_feats.items()
-        }
-        val_feats = {
-            t: df.iloc[-min_val_len:].copy()
-            for t, df in val_feats.items()
-        }
+        self._check_stop(stop_event)
 
-        if stop_event is not None:
-            app._check_stop(stop_event)
+        tf_train = self._build_tensor_factory(horizon=horizon, seq_len=seq_len)
+        tf_val = self._build_tensor_factory(horizon=horizon, seq_len=seq_len)
 
-        # ====================================
-        # STEP 4: Tensor factories
-        tf_train = app.build_tensor_factory(horizon=horizon, seq_len=seq_len)
-        tf_val = app.build_tensor_factory(horizon=horizon, seq_len=seq_len)
-
-        # ====================================
-        # STEP 5: Graph construction
         ticker_to_sector = Utils.load_ticker_to_sector("sp500_tickers.csv")
+        max_k = int(getattr(self.args, "k", 10))
 
-        graphBuilder = GraphBuilder(
+        graph_builder = GraphBuilder(
             dfFeats=train_feats,
-            max_k=app.get_max_k(),
+            max_k=max_k,
             n_pca=3,
             ticker_to_sector=ticker_to_sector,
             graph_embed=self.args.graph_embed,
             ablate_feature=self.args.ablate_feature,
+            graph_window=graph_window,
+            graph_mode=self.args.graph_mode,
         )
 
-        tickers, coords3d, pruned, mst = graphBuilder.getLightGraph()
+        tickers, coords3d, pruned, mst = graph_builder.getLightGraph()
+        graph_stats_path = Path(getattr(self.args, "results_dir", "./results")) / "graph_logging" / "graph_stats.json"
+        graph_builder.save_graph_stats(str(graph_stats_path))
 
         edge_pairs = [(i, j) for i, j, _ in pruned]
         if edge_pairs:
@@ -146,17 +149,14 @@ class Pipeline:
             idx = torch.arange(len(tickers), dtype=torch.long)
             edge_index = torch.stack([idx, idx], dim=0)
 
-        if stop_event is not None:
-            app._check_stop(stop_event)
+        self._check_stop(stop_event)
 
-        # ====================================
-        # STEP 6: Return pipeline state
-        return {
+        state = {
             "train_feats": train_feats,
             "val_feats": val_feats,
             "tf_train": tf_train,
             "tf_val": tf_val,
-            "graphBuilder": graphBuilder,
+            "graphBuilder": graph_builder,
             "edge_index": edge_index,
             "tickers": tickers,
             "coords": coords3d,
@@ -164,4 +164,50 @@ class Pipeline:
             "mst": mst,
             "horizon": horizon,
             "seq_len": seq_len,
+            "graph_window": graph_window,
+            "graph_stats": graph_builder.graph_stats,
+            "graph_stats_path": str(graph_stats_path),
+            "target_ticker": stock,
+            "target_stock": stock,
         }
+        return state
+
+    def _check_stop(self, stop_event):
+        if stop_event is not None and self.app is not None:
+            self.app._check_stop(stop_event)
+
+    def _build_tensor_factory(self, horizon: int, seq_len: int = None):
+        engineered = ["return", "volatility", "momentum"]
+        if getattr(self.args, "ablate_feature", "none") in engineered:
+            engineered = [f for f in engineered if f != self.args.ablate_feature]
+        feature_cols = ["close"] + engineered
+
+        class ConfiguredTensorFactory:
+            def __init__(self, horizon, seq_len, feature_cols):
+                self.horizon = int(horizon)
+                self.seq_len = int(seq_len)
+                self.feature_cols = list(feature_cols)
+
+            def build_recurrent_windows(self, features, tickers, target_ticker):
+                from data.tensor_factory import TensorFactory
+                return TensorFactory.build_recurrent_windows(
+                    features=features,
+                    tickers=tickers,
+                    target_ticker=target_ticker,
+                    feature_cols=self.feature_cols,
+                    seq_len=self.seq_len,
+                    prediction_horizon=self.horizon,
+                )
+
+            def build_stgnn_windows(self, features, tickers, target_ticker):
+                from data.tensor_factory import TensorFactory
+                return TensorFactory.build_stgnn_windows(
+                    features=features,
+                    tickers=tickers,
+                    target_ticker=target_ticker,
+                    feature_cols=self.feature_cols,
+                    seq_len=self.seq_len,
+                    prediction_horizon=self.horizon,
+                )
+
+        return ConfiguredTensorFactory(horizon, seq_len, feature_cols)

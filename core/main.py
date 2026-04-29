@@ -10,6 +10,7 @@ import torch
 
 from config.config_manager import ConfigManager
 from core.experiment_runner import ExperimentRunner
+from core.headless_app import HeadlessEvaluator
 from core.experiment_store import ExperimentStore, RunRecord
 from core.job_queue import JobQueueController, QueueJob
 from core.pipeline import Pipeline
@@ -545,10 +546,17 @@ class MainApp:
 
             self.logger.info("[ModelSelection] %s", selected_model)
 
-            evaluator = self.frontendApp.evaluator
-            evaluator.reset_histories()
+            use_headless_evaluator = (
+                self._active_queue_job_id is not None
+                or threading.current_thread() is not threading.main_thread()
+            )
+            if use_headless_evaluator:
+                evaluator = HeadlessEvaluator()
+            else:
+                evaluator = self.frontendApp.evaluator
+                evaluator.reset_histories()
+                self.frontendApp.root.after(0, self.frontendApp._reset_ui)
 
-            self.frontendApp.root.after(0, self.frontendApp._reset_ui)
             self.frontendApp.set_status(f"Starting {selected_model.upper()}...")
 
             pipeline = Pipeline(self)
@@ -852,6 +860,12 @@ class MainApp:
         seed = int(run_seed) if run_seed is not None else int(self.args.base_seed)
         used = Utils.set_seed(seed, deterministic=self.args.deterministic)
         self.current_seed = int(used)
+
+        # DataLoader generator expected by model runners.
+        # Keeps GUI queue runs deterministic and compatible with headless adapter runs.
+        self.dl_gen = torch.Generator()
+        self.dl_gen.manual_seed(self.current_seed)
+
         self.logger.info(
             f"[Seed] Using seed={self.current_seed} "
             f"(deterministic={self.args.deterministic})"

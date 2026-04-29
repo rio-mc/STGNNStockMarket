@@ -1,58 +1,90 @@
+import json
 import logging
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import networkx as nx
 import numpy as np
 import pandas as pd
-import networkx as nx
-from typing import Dict, List, Tuple, Optional
+import torch
 from sklearn.decomposition import PCA
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import StandardScaler
-import torch
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+GRAPH_MODE_CHOICES = ("knn", "mst", "knn_mst")
+
+
+def add_graph_args(parser):
+    """Register graph-construction CLI arguments on an existing parser.
+
+    graph_window is intentionally not exposed here. Pipeline enforces:
+        graph_window == seq_len
+    so there is one temporal-window source of truth.
+    """
+    parser.add_argument("--graph_mode", choices=GRAPH_MODE_CHOICES, default="knn_mst")
+    return parser
+
 
 class GraphBuilder:
     """
     Builds a graph between stocks using scalar statistical features or learned embeddings.
-    Outputs a lightweight, pruned similarity graph for downstream STGNN processing.
+
+    The graph feature window is supplied by Pipeline and is enforced there to equal seq_len.
+    GraphBuilder treats graph_window as a resolved integer, not as an independent config knob.
     """
-    def __init__(self,
-                dfFeats: Dict[str, pd.DataFrame],
-                max_k: int,
-                n_pca: int = 3,
-                ticker_to_sector: Optional[Dict[str, str]] = None,
-                graph_embed: str = "pca",
-                ablate_feature: str = "none"):
-    
-        # === STEP 1: Initialise Configuration ===
-        # ------------------------------------
+
+    def __init__(
+        self,
+        dfFeats: Dict[str, pd.DataFrame],
+        max_k: int,
+        n_pca: int = 3,
+        ticker_to_sector: Optional[Dict[str, str]] = None,
+        graph_embed: str = "pca",
+        ablate_feature: str = "none",
+        graph_window: int = 10,
+        graph_mode: str = "knn_mst",
+    ):
+        graph_window = int(graph_window)
+        if graph_window <= 0:
+            raise ValueError("graph_window must be a positive integer.")
+        if graph_mode not in GRAPH_MODE_CHOICES:
+            raise ValueError(f"graph_mode must be one of {GRAPH_MODE_CHOICES}.")
+
         self.dfFeats = dfFeats
-        self.max_k = max_k
-        self.n_pca = n_pca
+        self.max_k = int(max_k)
+        self.n_pca = int(n_pca)
         self._embeddings: Optional[np.ndarray] = None
         self.ticker_to_sector: Dict[str, str] = ticker_to_sector or {}
         self.graph_embed = graph_embed
         self.ablate_feature = ablate_feature
+        self.graph_window = graph_window
+        self.graph_mode = graph_mode
+        self.effective_k = None
+        self.graph_stats: Dict[str, object] = {}
+        self.edge_weights: Optional[List[Tuple[int, int, float]]] = None
         self._update_tickers()
-    
+
+    def _rolling_scalar(self, df: pd.DataFrame, column: str) -> float:
+        if column not in df.columns:
+            return 0.0
+        values = pd.to_numeric(df[column], errors="coerce").dropna().tail(self.graph_window)
+        if values.empty:
+            return 0.0
+        return float(values.mean())
+
     def _compute_scalars(self):
-        # === STEP 1: Clear Current Scalars ===
-        # ------------------------------------
         vectors = []
         valid_tickers = []
 
-		# === STEP 2: Build Vectors ===
-        # ------------------------------------
-        for t in self.tickers:
-            #   1. Grab scalars (features) per stock
-            df = self.dfFeats[t]
+        for ticker in self.tickers:
+            df = self.dfFeats[ticker]
             try:
-                #   2. Store individual scalars
-                #   Default: read values if present (some may be missing due to ablation)
-                ret = float(df["return"].iloc[-1]) if "return" in df.columns else 0.0
-                vol = float(df["volatility"].iloc[-1]) if "volatility" in df.columns else 0.0
-                mom = float(df["momentum"].iloc[-1]) if "momentum" in df.columns else 0.0
+                ret = self._rolling_scalar(df, "return")
+                vol = self._rolling_scalar(df, "volatility")
+                mom = self._rolling_scalar(df, "momentum")
 
-                # Ablate exactly one feature by zeroing it out (keeps 3D geometry consistent)
                 if self.ablate_feature == "return":
                     ret = 0.0
                 elif self.ablate_feature == "volatility":
@@ -60,232 +92,182 @@ class GraphBuilder:
                 elif self.ablate_feature == "momentum":
                     mom = 0.0
 
-                #   3. Create and store vector from scalars
                 vectors.append([ret, vol, mom])
-                valid_tickers.append(t)
-
-            except Exception as e:
-                logging.warning("[GraphBuilder] Error extracting features for %s: %s", t, e)
+                valid_tickers.append(ticker)
+            except Exception as exc:
+                logging.warning("[GraphBuilder] Error extracting features for %s: %s", ticker, exc)
 
         if not vectors:
             raise ValueError("[GraphBuilder] No valid scalar features found for graph construction.")
 
-        #   4.  Pass all vectors for graph building
-        mat = np.array(vectors)
-        return valid_tickers, mat
+        return valid_tickers, np.array(vectors, dtype=float)
 
     def _embed_pca(self, mat: np.ndarray) -> np.ndarray:
-        """
-        Embeds the scalar matrix into a coordinate space used for similarity.
-
-        Modes (controlled by self.graph_embed):
-        - "pca": StandardScaler + PCA(n_components=min(self.n_pca, n_samples, n_features))
-        - "raw": StandardScaler only (no PCA), padded to self.n_pca dims if needed
-
-        NOTE: We intentionally keep this method name for backward compatibility.
-        """
-
-        # === STEP 1: Normalisation ===
         scaler = StandardScaler()
         mat_scaled = scaler.fit_transform(mat)
 
-        # === STEP 2: Component Counting ===
         n_samples, n_features = mat_scaled.shape
         n_comp = min(self.n_pca, n_samples, n_features)
 
-        # === STEP 3: PCA Projection OR RAW ablation ===
-        if getattr(self, "graph_embed", "pca") == "raw":
-            # RAW ablation: no PCA, just use scaled scalars
+        if self.graph_embed == "raw":
             proj = mat_scaled
-
-            # force consistent dimensionality for downstream (e.g., cosine in fixed dim)
             if proj.shape[1] < self.n_pca:
                 pad = np.zeros((proj.shape[0], self.n_pca - proj.shape[1]))
                 proj = np.hstack([proj, pad])
-
             logging.info("[GraphBuilder] graph_embed=raw (StandardScaler only), dims=%s", proj.shape)
             return proj
 
-        # Default: PCA path
         pca = PCA(n_components=n_comp)
         proj = pca.fit_transform(mat_scaled)
         logging.info("[GraphBuilder] graph_embed=pca | PCA variance explained: %s", pca.explained_variance_ratio_)
 
-        # force consistent dimensionality if PCA returns fewer comps
         if proj.shape[1] < self.n_pca:
             pad = np.zeros((proj.shape[0], self.n_pca - proj.shape[1]))
             proj = np.hstack([proj, pad])
 
         return proj
 
-    def _prune_cosine_graph(self, coords: np.ndarray) -> List[Tuple[int, int, float]]:
+    def _similarity_matrix(self, coords: np.ndarray) -> np.ndarray:
         sim = cosine_similarity(coords)
-        np.fill_diagonal(sim, -1)  # prevent self-loops
+        np.fill_diagonal(sim, -1.0)
+        return sim
 
-        # Effective k actually used
-        k = min(self.max_k, sim.shape[0] - 1)
-        self.effective_k = k  # <--- add this so we can log it outside
+    def _dedupe_edges(self, edges: List[Tuple[int, int, float]]) -> List[Tuple[int, int, float]]:
+        edge_map = {}
+        for i, j, w in edges:
+            if i == j:
+                continue
+            a, b = sorted((int(i), int(j)))
+            edge_map[(a, b)] = max(float(w), edge_map.get((a, b), float("-inf")))
+        return [(i, j, w) for (i, j), w in sorted(edge_map.items())]
 
-        edge_set = set()
+    def _density(self, n_nodes: int, edges: List[Tuple[int, int, float]]) -> float:
+        possible = n_nodes * (n_nodes - 1) / 2
+        return (len(self._dedupe_edges(edges)) / possible) if possible > 0 else 0.0
 
-        for i in range(sim.shape[0]):
-            # IMPORTANT: use k, not self.max_k
+    def _prune_cosine_graph(self, coords: np.ndarray) -> List[Tuple[int, int, float]]:
+        sim = self._similarity_matrix(coords)
+        n = sim.shape[0]
+        k = min(self.max_k, n - 1)
+        self.effective_k = k
+
+        if k <= 0:
+            return []
+
+        edges = []
+        for i in range(n):
             topk = np.argpartition(-sim[i], k)[:k]
             for j in topk:
                 if sim[i, j] > 0:
-                    a, b = sorted((i, j))
-                    edge_set.add((a, b, float(sim[i, j])))
+                    a, b = sorted((i, int(j)))
+                    edges.append((a, b, float(sim[i, j])))
 
-        edges = list(edge_set)
-
-        # Extra graph stats for defensibility
-        n = sim.shape[0]
-        possible_undirected = n * (n - 1) / 2
-        density = (len(edges) / possible_undirected) if possible_undirected > 0 else 0.0
-
+        edges = self._dedupe_edges(edges)
         logging.info(
-            "[GraphBuilder] Pruned graph: requested_k=%d effective_k=%d edges=%d density=%.6f",
-            self.max_k, k, len(edges), density
+            "[GraphBuilder] kNN graph: requested_k=%d effective_k=%d edges=%d density=%.6f",
+            self.max_k,
+            k,
+            len(edges),
+            self._density(n, edges),
         )
-
         return edges
 
-    # Prune -> MST
-    def getLightGraph(
-        self,
-        coords_override: Optional[np.ndarray] = None
-    ) -> Tuple[List[str], np.ndarray, List[Tuple[int, int, float]], List[Tuple[int, int, float]]]:
-		# === STEP 1: Check For Passed Coordinates (For Graph Rebuilding) ===
-        # ------------------------------------
-        if coords_override is not None:
-            coords = coords_override
-            logging.info("[GraphBuilder] Using override coordinates")
-        elif self._embeddings is not None:
-            coords = self._embeddings
-            logging.info("[GraphBuilder] Using learned embeddings")
-        else:
-            self.tickers, scalar_mat = self._compute_scalars()
-            coords = self._embed_pca(scalar_mat)
+    def _mst_edges(self, coords: np.ndarray) -> List[Tuple[int, int, float]]:
+        sim = self._similarity_matrix(coords)
+        n = sim.shape[0]
+        graph = nx.Graph()
+        graph.add_nodes_from(range(n))
 
-        # === STEP 2: Prune Edges Via Max-k ===
-        # ------------------------------------
-        pruned = self._prune_cosine_graph(coords)
-        self.edge_weights = pruned  # Store for later use in edge weight tensor
-
-        # === STEP 3: Build Graph From Nodes And Edges ===
-        # ------------------------------------
-
-        #   1. Define graph
-        G = nx.Graph()
-
-        #   2. Add nodes
-        for i in range(len(self.tickers)):
-            G.add_node(i)
-
-        #   3. Add edges
-        for i, j, w in pruned:
-            distance = 1 - w  # Convert similarity to distance
-            G.add_edge(i, j, weight=distance)
-
-        #   4. Add MST edges (Mantegna et al. 1999)
-        mst = nx.minimum_spanning_tree(G, weight='weight')
-        mst_edges = [(u, v, 1 - G[u][v]['weight']) for u, v in mst.edges()]
-        logging.info("[GraphBuilder] MST contains %d edges", len(mst_edges))
-
-        #   5. Return graph nodes (stocks), coords, max-k edges, MST edges
-        return self.tickers, coords, pruned, mst_edges
-
-    """
-    # MST -> Prune
-    def getLightGraph(
-        self,
-        coords_override: Optional[np.ndarray] = None
-    ) -> Tuple[List[str], np.ndarray, List[Tuple[int, int, float]], List[Tuple[int, int, float]]]:
-        """
-        #   Returns:
-        #   - tickers
-        #   - coords (Nx3): node embeddings or PCA-projected scalars
-        #   - all_edges: MST + top-k augmentations (non-duplicate)
-        #   - mst_edges: pure minimum spanning tree edges
-    """
-        if coords_override is not None:
-            coords = coords_override
-            logging.info("[GraphBuilder] Using override coordinates")
-        elif self._embeddings is not None:
-            coords = self._embeddings
-            logging.info("[GraphBuilder] Using learned embeddings")
-        else:
-            self.tickers, scalar_mat = self._compute_scalars()
-            coords = self._embed_pca(scalar_mat)
-
-        sim = cosine_similarity(coords)
-        np.fill_diagonal(sim, -1)
-
-        # Build full graph for MST
-        full_G = nx.Graph()
-        for i in range(len(self.tickers)):
-            full_G.add_node(i)
-        for i in range(sim.shape[0]):
-            for j in range(i + 1, sim.shape[1]):
+        for i in range(n):
+            for j in range(i + 1, n):
                 if sim[i, j] > 0:
-                    full_G.add_edge(i, j, weight=1 - sim[i, j])
+                    graph.add_edge(i, j, weight=1 - float(sim[i, j]))
 
-        mst = nx.minimum_spanning_tree(full_G, weight='weight')
-        mst_edges = [(u, v, 1 - full_G[u][v]['weight']) for u, v in mst.edges()]
+        mst = nx.minimum_spanning_tree(graph, weight="weight")
+        edges = [(u, v, 1 - graph[u][v]["weight"]) for u, v in mst.edges()]
+        edges = self._dedupe_edges(edges)
+        logging.info("[GraphBuilder] MST graph contains %d edges", len(edges))
+        return edges
 
-        logging.info("[GraphBuilder] MST contains %d edges", len(mst_edges))
+    def _select_edges_by_mode(self, coords: np.ndarray):
+        knn_edges = self._prune_cosine_graph(coords)
+        mst_edges = self._mst_edges(coords)
 
-        # Now: add top-k edges per node from similarity matrix
-        k = min(self.max_k, sim.shape[0] - 1)
-        extra_edges = set()
+        if self.graph_mode == "knn":
+            return knn_edges, mst_edges
+        if self.graph_mode == "mst":
+            return mst_edges, mst_edges
+        return self._dedupe_edges(mst_edges + knn_edges), mst_edges
 
-        for i in range(sim.shape[0]):
-            topk = np.argpartition(-sim[i], k)[:k]
-            for j in topk:
-                if i == j or sim[i, j] <= 0:
-                    continue
-                a, b = sorted((i, j))
-                extra_edges.add((a, b, float(sim[i, j])))
+    def compute_graph_stats(self, tickers, edges, mst_edges=None) -> Dict[str, object]:
+        n_nodes = len(tickers)
+        stats = {
+            "num_nodes": n_nodes,
+            "num_edges": len(self._dedupe_edges(edges)),
+            "density": self._density(n_nodes, edges),
+            "homophily": self.sector_homophily_from_edges(tickers, edges),
+            "graph_mode": self.graph_mode,
+            "graph_window": self.graph_window,
+            "requested_k": self.max_k,
+            "effective_k": self.effective_k,
+        }
+        if mst_edges is not None:
+            stats["num_mst_edges"] = len(self._dedupe_edges(mst_edges))
+        return stats
 
-        # Avoid duplicates with MST
-        mst_set = {(min(u, v), max(u, v)) for u, v, _ in mst_edges}
-        augmented = [e for e in extra_edges if (e[0], e[1]) not in mst_set]
+    def save_graph_stats(self, output_path: str = "results/graph_logging/graph_stats.json") -> None:
+        if not self.graph_stats:
+            raise RuntimeError("No graph_stats available. Call getLightGraph() before saving stats.")
 
-        combined_edges = mst_edges + augmented
-        self.edge_weights = combined_edges  # used for torch edge_index later
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        serialisable = {
+            key: (None if isinstance(value, float) and np.isnan(value) else value)
+            for key, value in self.graph_stats.items()
+        }
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(serialisable, handle, indent=2)
+        logging.info("[GraphBuilder] Saved graph stats to %s", path)
 
-        logging.info("[GraphBuilder] Augmented with %d extra top-k edges", len(augmented))
-        logging.info("[GraphBuilder] Total edges after MST+top-k: %d", len(combined_edges))
+    def getLightGraph(self, coords_override: Optional[np.ndarray] = None):
+        if coords_override is not None:
+            coords = coords_override
+            logging.info("[GraphBuilder] Using override coordinates")
+        elif self._embeddings is not None:
+            coords = self._embeddings
+            logging.info("[GraphBuilder] Using learned embeddings")
+        else:
+            self.tickers, scalar_mat = self._compute_scalars()
+            coords = self._embed_pca(scalar_mat)
 
-        return self.tickers, coords, combined_edges, mst_edges
-        """
-        
+        selected_edges, mst_edges = self._select_edges_by_mode(coords)
+        self.edge_weights = selected_edges
+        self.graph_stats = self.compute_graph_stats(self.tickers, selected_edges, mst_edges)
+
+        logging.info(
+            "[GraphBuilder] Final graph stats | nodes=%d edges=%d density=%.6f homophily=%s mode=%s window=%d",
+            self.graph_stats["num_nodes"],
+            self.graph_stats["num_edges"],
+            self.graph_stats["density"],
+            self.graph_stats["homophily"],
+            self.graph_mode,
+            self.graph_window,
+        )
+        return self.tickers, coords, selected_edges, mst_edges
+
     def buildNetworkX(self, tickers, coords, edges):
-        G = nx.Graph()
-        for i, t in enumerate(tickers):
-            sector = self.ticker_to_sector.get(t, "Unknown")
-            G.add_node(t, pos=tuple(coords[i]), sector=sector)  # <-- store sector
+        graph = nx.Graph()
+        for i, ticker in enumerate(tickers):
+            sector = self.ticker_to_sector.get(ticker, "Unknown")
+            graph.add_node(ticker, pos=tuple(coords[i]), sector=sector)
         for i, j, w in edges:
-            G.add_edge(tickers[i], tickers[j], weight=round(w, 2))
-        return G
+            graph.add_edge(tickers[i], tickers[j], weight=round(w, 2))
+        return graph
 
-    def sector_homophily_from_edges(
-        self,
-        tickers: List[str],
-        edges: List[Tuple[int, int, float]],
-        ignore_unknown: bool = True,
-        ignore_self_loops: bool = True,
-    ) -> float:
-        """
-        Fraction of (undirected) edges whose endpoints share the same sector.
-        Computed post-hoc; not used in training.
-
-        edges: list of (i, j, w) with i/j indexing into tickers.
-        """
+    def sector_homophily_from_edges(self, tickers, edges, ignore_unknown=True, ignore_self_loops=True) -> float:
         if not edges:
             return float("nan")
 
-        # dedupe undirected edges
         undirected = set()
         for i, j, _ in edges:
             a, b = (i, j) if i <= j else (j, i)
@@ -303,96 +285,52 @@ class GraphBuilder:
             total += 1
             if si == sj:
                 same += 1
-
         return (same / total) if total > 0 else float("nan")
 
-    def sector_homophily_from_edge_index(
-        self,
-        tickers: List[str],
-        edge_index: torch.Tensor,
-        ignore_unknown: bool = True,
-        ignore_self_loops: bool = True,
-    ) -> float:
-        """
-        Same as above, but computed from a PyG edge_index (2 x E).
-        Treats edges as undirected by canonicalizing (min,max).
-        """
+    def sector_homophily_from_edge_index(self, tickers, edge_index: torch.Tensor, ignore_unknown=True, ignore_self_loops=True) -> float:
         if edge_index is None or edge_index.numel() == 0:
             return float("nan")
 
         edges = set()
-        ei = edge_index.detach().cpu()
-        for src, dst in ei.t().tolist():
+        for src, dst in edge_index.detach().cpu().t().tolist():
             a, b = (src, dst) if src <= dst else (dst, src)
             edges.add((a, b))
 
-        same = 0
-        total = 0
-        for i, j in edges:
-            if ignore_self_loops and i == j:
-                continue
-            si = self.ticker_to_sector.get(tickers[i], "Unknown")
-            sj = self.ticker_to_sector.get(tickers[j], "Unknown")
-            if ignore_unknown and ("Unknown" in (si, sj) or si is None or sj is None):
-                continue
-            total += 1
-            if si == sj:
-                same += 1
-
-        return (same / total) if total > 0 else float("nan")
-
+        return self.sector_homophily_from_edges(tickers, [(i, j, 1.0) for i, j in edges], ignore_unknown, ignore_self_loops)
 
     def build_edge_weight_tensor(self, edge_index: torch.Tensor) -> torch.Tensor:
-        # ====================================
-		# === Helper to build tensor from edge weights
-        if not hasattr(self, 'edge_weights') or self.edge_weights is None:
-            raise AttributeError("GraphBuilder has no edge_weights attribute. Ensure you store edge weights during pruning.")
+        if self.edge_weights is None:
+            raise AttributeError("GraphBuilder has no edge_weights attribute. Call getLightGraph() first.")
 
-        #   1. Create edge weight map
-        edge_weight_map = {(i, j): w for i, j, w in self.edge_weights}
-
-        #   2. Extract weights from edge_index
+        edge_weight_map = {(min(i, j), max(i, j)): w for i, j, w in self.edge_weights}
         weights = []
         for src, dst in edge_index.T.tolist():
             key = (min(src, dst), max(src, dst))
-            weight = edge_weight_map.get(key, 0.0)
-            weights.append(weight)
-
-        #   3. Unsqueeze to add feature dimension
+            weights.append(edge_weight_map.get(key, 0.0))
         return torch.tensor(weights, dtype=torch.float32).unsqueeze(-1)
-    
+
     def updateFeatures(self, newFeats: Dict[str, pd.DataFrame]) -> None:
-        # ====================================
-		# === Helper to update graph features
         self.dfFeats = newFeats
         self._update_tickers()
         logging.info("[GraphBuilder] Updated features for %d tickers", len(self.tickers))
 
     def set_node_embeddings(self, embeddings: np.ndarray) -> None:
-        # ====================================
-		# === Helper to set node embeddings
         if embeddings.shape[0] != len(self.tickers):
             raise ValueError("Embeddings must have one row per ticker.")
         self._embeddings = embeddings
         logging.info("[GraphBuilder] Stored learned node embeddings of shape %s", embeddings.shape)
 
     def get_node_embeddings(self) -> np.ndarray:
-        # ====================================
-		# === Helper to get node embeddings
         if self._embeddings is None:
             raise RuntimeError("No learned embeddings have been set.")
         return self._embeddings
 
     def _update_tickers(self) -> None:
-        # ====================================
-		# === Helper to update tickers list
         self.tickers = list(self.dfFeats.keys())
 
     def get_max_k(self):
-        # ====================================
-		# === Helper to get max-k (for graph efficiency)
         return self.max_k
-    
+
     def set_sector_map(self, ticker_to_sector: Dict[str, str]) -> None:
         self.ticker_to_sector = ticker_to_sector or {}
         logging.info("[GraphBuilder] Sector map set for %d tickers", len(self.ticker_to_sector))

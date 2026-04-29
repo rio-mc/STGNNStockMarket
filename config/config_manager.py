@@ -234,11 +234,14 @@ class ConfigManager:
             choices=["knn", "mst", "knn_mst"],
             help="Graph construction strategy"
         )
+        # Deprecated compatibility argument. Graph window is now enforced
+        # to equal --seq_len so there is a single source of truth.
+        # The CLI value is accepted for old commands but ignored after parsing.
         parser.add_argument(
             "--graph_window",
             type=int,
-            default=10,
-            help="Rolling window size used when aggregating graph features"
+            default=None,
+            help=argparse.SUPPRESS,
         )
 
         # ====================================
@@ -366,11 +369,13 @@ class ConfigManager:
         if args.run_mode == "headless" and args.target_stock is not None:
             args.target_stock = args.target_stock.strip().upper()
 
-        if args.graph_window < 1:
-            raise ValueError("--graph_window must be >= 1")
-
         if args.seq_len < 1:
             raise ValueError("--seq_len must be >= 1")
+
+        # Single source of truth: graph construction uses the same temporal
+        # window as the model input sequence. Any legacy --graph_window value
+        # is intentionally ignored.
+        args.graph_window = int(args.seq_len)
 
         if args.k < 0:
             raise ValueError("--k must be >= 0")
