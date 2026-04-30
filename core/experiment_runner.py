@@ -73,6 +73,10 @@ class ExperimentRunner:
                 evaluator=evaluator,
                 stop_event=stop_event,
             )
+            if hasattr(result, "eval_result") and result.eval_result is not None:
+                result.eval_result.ticker = stock
+                result.eval_result.target_stock = stock
+                result.eval_result.target_ticker = stock
         except Exception:
             self.logger.exception("Experiment failed: %s", model_name)
             raise

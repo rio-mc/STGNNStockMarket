@@ -7,12 +7,10 @@ This allows model runners to work without the GUI dependency.
 
 import logging
 import random
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import numpy as np
 import torch
-
-from core.utils.utils import Utils
 
 from types import SimpleNamespace
 from sklearn.metrics import (
@@ -27,30 +25,33 @@ class HeadlessEvaluator:
     """
     Lightweight evaluator for CLI/headless runs.
 
-    Mirrors the GUI evaluator enough for model runners, but avoids Tkinter.
+    Computes dense predictive metrics and trade-aligned backtest metrics without
+    touching Tkinter.
     """
 
     def evaluate(self, model_name: str, result, price_df=None):
+        from backtesting.engine import BacktestEngine
+
         y_true = np.asarray(getattr(result, "y_true", []) or [], dtype=int)
         probs = np.asarray(getattr(result, "probs", []) or [], dtype=float)
 
+        ticker = (
+            getattr(result, "ticker", None)
+            or getattr(result, "target_stock", None)
+            or getattr(result, "target_ticker", None)
+        )
+
+        horizon = getattr(result, "horizon", None)
+
+        empty = self._empty_metrics(
+            model_name=model_name,
+            ticker=ticker,
+            horizon=horizon,
+            val_loss_dense=getattr(result, "dense_val_loss", None),
+        )
+
         if y_true.size == 0 or probs.size == 0:
-            return SimpleNamespace(
-                model=str(model_name).upper(),
-                threshold_fixed=0.5,
-                threshold_macro_f1_dense=0.5,
-                val_loss_dense=getattr(result, "dense_val_loss", None),
-                accuracy_dense=0.0,
-                f1_dense=0.0,
-                macro_f1_dense=0.0,
-                roc_auc_dense=None,
-                ap_dense=None,
-                accuracy_dense_macro_f1_threshold=0.0,
-                f1_dense_macro_f1_threshold=0.0,
-                macro_f1_dense_macro_f1_threshold=0.0,
-                n_predictions_dense=0,
-                horizon=getattr(result, "horizon", None),
-            )
+            return empty
 
         fixed_thr = float(getattr(result, "decision_threshold", 0.5) or 0.5)
         dense_pred = (probs >= fixed_thr).astype(int)
@@ -81,8 +82,18 @@ class HeadlessEvaluator:
         result.y_pred = dense_pred.astype(int).tolist()
         result.metadata["decision_threshold_policy"] = "fixed"
 
+        trade_metrics = self._compute_backtest_metrics(
+            model_name=model_name,
+            result=result,
+            price_df=price_df,
+            y_true=y_true,
+            probs=probs,
+            dense_thr=fixed_thr,
+        )
+
         return SimpleNamespace(
             model=str(model_name).upper(),
+
             threshold_fixed=fixed_thr,
             threshold_macro_f1_dense=best_thr,
             val_loss_dense=getattr(result, "dense_val_loss", None),
@@ -95,13 +106,144 @@ class HeadlessEvaluator:
 
             accuracy_dense_macro_f1_threshold=float(accuracy_score(y_true, tuned_pred)),
             f1_dense_macro_f1_threshold=float(tuned_f1_pos),
-            macro_f1_dense_macro_f1_threshold=float(f1_score(y_true, tuned_pred, average="macro")),
+            macro_f1_dense_macro_f1_threshold=float(
+                f1_score(y_true, tuned_pred, average="macro")
+            ),
+
+            accuracy_trade_aligned=trade_metrics["accuracy_trade_aligned"],
+            f1_trade_aligned=trade_metrics["f1_trade_aligned"],
+            macro_f1_trade_aligned=trade_metrics["macro_f1_trade_aligned"],
+            roc_auc_trade_aligned=trade_metrics["roc_auc_trade_aligned"],
+            ap_trade_aligned=trade_metrics["ap_trade_aligned"],
+
+            sharpe=trade_metrics["sharpe"],
+            n_trades=trade_metrics["n_trades"],
+            mean_trade_return=trade_metrics["mean_trade_return"],
+            hit_rate=trade_metrics["hit_rate"],
+            final_equity=trade_metrics["final_equity"],
+            max_drawdown=trade_metrics["max_drawdown"],
+
+            ticker=ticker,
+            n_predictions_dense=int(len(y_true)),
+            n_predictions_trade_aligned=trade_metrics["n_predictions_trade_aligned"],
+            horizon=horizon,
+        )
+
+    def _compute_backtest_metrics(
+        self,
+        *,
+        model_name: str,
+        result,
+        price_df,
+        y_true,
+        probs,
+        dense_thr: float,
+    ) -> dict:
+        from backtesting.engine import BacktestEngine
+
+        defaults = {
+            "accuracy_trade_aligned": 0.0,
+            "f1_trade_aligned": 0.0,
+            "macro_f1_trade_aligned": 0.0,
+            "roc_auc_trade_aligned": None,
+            "ap_trade_aligned": None,
+            "sharpe": None,
+            "n_trades": 0,
+            "mean_trade_return": None,
+            "hit_rate": None,
+            "final_equity": None,
+            "max_drawdown": None,
+            "n_predictions_trade_aligned": 0,
+        }
+
+        if price_df is None:
+            return defaults
+
+        if getattr(result, "horizon", None) is None:
+            return defaults
+
+        if not getattr(result, "prediction_dates", None):
+            return defaults
+
+        backtest = BacktestEngine(tc_per_side=0.0, rf_annual=0.0).run(
+            model_name=model_name,
+            evaluation_result=result,
+            price_df=price_df,
+            threshold=dense_thr,
+        )
+
+        if backtest is None:
+            return defaults
+
+        exec_idx = list(getattr(backtest, "executed_indices", []) or [])
+        result.trade_aligned_indices = exec_idx
+
+        metrics = {
+            **defaults,
+            "sharpe": getattr(backtest, "sharpe", None),
+            "n_trades": int(getattr(backtest, "n_trades", 0)),
+            "mean_trade_return": getattr(backtest, "mean_trade_return", None),
+            "hit_rate": getattr(backtest, "hit_rate", None),
+            "final_equity": getattr(backtest, "final_equity", None),
+            "max_drawdown": getattr(backtest, "max_drawdown", None),
+            "n_predictions_trade_aligned": int(len(exec_idx)),
+        }
+
+        if not exec_idx:
+            return metrics
+
+        y_true_trade = np.asarray(y_true)[exec_idx]
+        probs_trade = np.asarray(probs)[exec_idx]
+        y_pred_trade = (probs_trade >= dense_thr).astype(int)
+
+        metrics["accuracy_trade_aligned"] = float(
+            accuracy_score(y_true_trade, y_pred_trade)
+        )
+        _, _, f1_trade, _ = precision_recall_fscore_support(
+            y_true_trade,
+            y_pred_trade,
+            average="binary",
+            zero_division=0,
+        )
+        metrics["f1_trade_aligned"] = float(f1_trade)
+        metrics["macro_f1_trade_aligned"] = float(
+            f1_score(y_true_trade, y_pred_trade, average="macro")
+        )
+
+        if len(np.unique(y_true_trade)) > 1:
+            metrics["roc_auc_trade_aligned"] = float(
+                roc_auc_score(y_true_trade, probs_trade)
+            )
+            metrics["ap_trade_aligned"] = float(
+                average_precision_score(y_true_trade, probs_trade)
+            )
+
+        return metrics
+
+    @staticmethod
+    def _empty_metrics(model_name, ticker=None, horizon=None, val_loss_dense=None):
+        return SimpleNamespace(
+            model=str(model_name).upper(),
+            threshold_fixed=0.5,
+            threshold_macro_f1_dense=0.5,
+            val_loss_dense=val_loss_dense,
+
+            accuracy_dense=0.0,
+            f1_dense=0.0,
+            macro_f1_dense=0.0,
+            roc_auc_dense=None,
+            ap_dense=None,
+
+            accuracy_dense_macro_f1_threshold=0.0,
+            f1_dense_macro_f1_threshold=0.0,
+            macro_f1_dense_macro_f1_threshold=0.0,
 
             accuracy_trade_aligned=0.0,
             f1_trade_aligned=0.0,
             macro_f1_trade_aligned=0.0,
             roc_auc_trade_aligned=None,
             ap_trade_aligned=None,
+
             sharpe=None,
             n_trades=0,
             mean_trade_return=None,
@@ -109,10 +251,10 @@ class HeadlessEvaluator:
             final_equity=None,
             max_drawdown=None,
 
-            ticker=None,
-            n_predictions_dense=int(len(y_true)),
+            ticker=ticker,
+            n_predictions_dense=0,
             n_predictions_trade_aligned=0,
-            horizon=getattr(result, "horizon", None),
+            horizon=horizon,
         )
 
     @staticmethod
@@ -133,8 +275,7 @@ class HeadlessEvaluator:
                 best_score = score
                 best_thr = float(thr)
 
-        return best_thr
-    
+        return best_thr 
 
 class HeadlessApp:
     """
@@ -248,14 +389,21 @@ class HeadlessApp:
 
 
 class FrontendMock:
-    """Mock frontend for headless execution."""
-    
+    """No-op frontend used by Trainer and runners during headless execution."""
+
     def set_status(self, message: str):
-        """No-op status update for headless mode."""
         pass
-    
-    def update_progress(self, current: int, total: int):
-        """No-op progress update for headless mode."""
+
+    def updateProgress(self, progress: float):
+        pass
+
+    def update_progress(self, current: int, total=None):
+        pass
+
+    def ui_call(self, func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    def refresh_selected_tabs(self):
         pass
 
 

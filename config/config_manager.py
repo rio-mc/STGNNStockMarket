@@ -36,7 +36,13 @@ class ConfigManager:
             choices=["1d", "2d", "5d", "1w"],
             help="Prediction horizon label used by the pipeline"
         )
-
+        parser.add_argument(
+            "--price_provider",
+            type=str,
+            default="yahoo",
+            choices=["yahoo", "yfinance", "csv"],
+            help="Price data provider used for loading market data."
+        )
         # ====================================
         # === Result Saving
         parser.add_argument(
