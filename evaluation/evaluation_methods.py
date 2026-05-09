@@ -127,9 +127,9 @@ class EvaluationMethods:
         self.log_dense_metrics(
             model_name=model_name,
             dense_thr=dense["dense_thr"],
-            best_thr_macro_f1=dense["best_thr_macro_f1"],
+            macro_f1_optimal_threshold=dense["macro_f1_optimal_threshold"],
             dense_metrics=dense["dense_metrics"],
-            tuned_dense_metrics=dense["tuned_dense_metrics"],
+            macro_f1_optimised_metrics=dense["macro_f1_optimised_metrics"],
         )
 
         self.frontend.ui_call(
@@ -139,7 +139,7 @@ class EvaluationMethods:
             dense["probs"],
             dense["dense_pred"],
             dense["dense_thr"],
-            dense["best_thr_macro_f1"],
+            dense["macro_f1_optimal_threshold"],
         )
 
         backtest_result, trade_metrics, strategy_metrics = self.run_backtest_and_trade_metrics(
@@ -168,9 +168,9 @@ class EvaluationMethods:
             result=result,
             price_df=price_df,
             dense_thr=dense["dense_thr"],
-            best_thr_macro_f1=dense["best_thr_macro_f1"],
+            macro_f1_optimal_threshold=dense["macro_f1_optimal_threshold"],
             dense_metrics=dense["dense_metrics"],
-            tuned_dense_metrics=dense["tuned_dense_metrics"],
+            macro_f1_optimised_metrics=dense["macro_f1_optimised_metrics"],
             trade_metrics=trade_metrics,
             strategy_metrics=strategy_metrics,
         )
@@ -243,7 +243,7 @@ class EvaluationMethods:
         probs,
         dense_pred,
         dense_thr,
-        best_thr_macro_f1,
+        macro_f1_optimal_threshold,
     ) -> None:
         self.plot_confusion_matrix(
             y_true=y_true,
@@ -263,7 +263,7 @@ class EvaluationMethods:
             model_name=model_name,
             selected_thr=dense_thr,
             selected_label="Fixed threshold",
-            best_thr=best_thr_macro_f1,
+            best_thr=macro_f1_optimal_threshold,
         )
         self.frontend.refresh_selected_tabs()
 
@@ -471,22 +471,36 @@ class EvaluationMethods:
                 label="_nolegend_",
             )
 
-    def _best_threshold_macro_f1(self, truths, probs) -> float:
+    def _select_threshold(self, truths, probs, metric: str = "macro_f1") -> float:
         probs = np.asarray(probs, dtype=float)
         y = np.asarray(truths, dtype=int)
 
         thr_grid = np.unique(probs)
         if thr_grid.size == 0:
             return 0.5
-        thr_grid = np.concatenate(([0.0], thr_grid, [1.0]))
 
-        best_thr, best_score = 0.5, -1.0
+        thr_grid = np.concatenate(([0.0], thr_grid, [0.5], [1.0]))
+        thr_grid = np.unique(thr_grid)
+
+        best_thr = 0.5
+        best_score = -1.0
+
         for thr in thr_grid:
             pred = (probs >= thr).astype(int)
-            score = f1_score(y, pred, average="macro")
+
+            if metric == "macro_f1":
+                score = f1_score(y, pred, average="macro", zero_division=0)
+            elif metric == "f1":
+                score = f1_score(y, pred, average="binary", zero_division=0)
+            elif metric == "accuracy":
+                score = accuracy_score(y, pred)
+            else:
+                raise ValueError(f"Unsupported threshold selection metric: {metric}")
+
             if score > best_score:
-                best_score = score
+                best_score = float(score)
                 best_thr = float(thr)
+
         return best_thr
 
     def _classification_metrics(self, y_true, y_pred, probs=None):
@@ -533,15 +547,27 @@ class EvaluationMethods:
         dense_thr = float(getattr(result, "decision_threshold", 0.5) or 0.5)
         dense_pred = (probs >= dense_thr).astype(int)
 
-        best_thr_macro_f1 = self._best_threshold_macro_f1(y_true, probs)
-        tuned_pred = (probs >= best_thr_macro_f1).astype(int)
+        threshold_selection_metric = getattr(
+            result,
+            "threshold_selection_metric",
+            "macro_f1",
+        )
+
+        macro_f1_optimal_threshold = self._select_threshold(
+            truths=y_true,
+            probs=probs,
+            metric=threshold_selection_metric,
+        )
+
+        tuned_pred = (probs >= macro_f1_optimal_threshold).astype(int)
 
         dense_metrics = self._classification_metrics(
             y_true=y_true,
             y_pred=dense_pred,
             probs=probs,
         )
-        tuned_dense_metrics = self._classification_metrics(
+
+        macro_f1_optimised_metrics = self._classification_metrics(
             y_true=y_true,
             y_pred=tuned_pred,
             probs=probs,
@@ -552,9 +578,10 @@ class EvaluationMethods:
             "probs": probs,
             "dense_thr": dense_thr,
             "dense_pred": dense_pred,
-            "best_thr_macro_f1": best_thr_macro_f1,
+            "threshold_selection_metric": threshold_selection_metric,
+            "macro_f1_optimal_threshold": macro_f1_optimal_threshold,
             "dense_metrics": dense_metrics,
-            "tuned_dense_metrics": tuned_dense_metrics,
+            "macro_f1_optimised_metrics": macro_f1_optimised_metrics,
         }
 
     def run_backtest_and_trade_metrics(
@@ -578,6 +605,8 @@ class EvaluationMethods:
             "sharpe": 0.0,
             "hit_rate": 0.0,
             "mean_trade_return": 0.0,
+            "final_equity": None,
+            "max_drawdown": None,
         }
 
         if backtest_result is None:
@@ -597,7 +626,11 @@ class EvaluationMethods:
                 probs=probs_exec,
             )
 
-        trade_returns = np.asarray(getattr(backtest_result, "trade_returns", []), dtype=float)
+        trade_returns = np.asarray(
+            getattr(backtest_result, "trade_returns", []),
+            dtype=float,
+        )
+
         if trade_returns.size > 0:
             hit_rate = float(np.mean(trade_returns > 0))
             mean_trade_ret = float(np.mean(trade_returns))
@@ -609,6 +642,8 @@ class EvaluationMethods:
             "sharpe": float(getattr(backtest_result, "sharpe", 0.0) or 0.0),
             "hit_rate": hit_rate,
             "mean_trade_return": mean_trade_ret,
+            "final_equity": getattr(backtest_result, "final_equity", None),
+            "max_drawdown": getattr(backtest_result, "max_drawdown", None),
         }
 
         return backtest_result, trade_metrics, strategy_metrics
@@ -619,34 +654,51 @@ class EvaluationMethods:
         result: EvaluationResult,
         price_df: pd.DataFrame,
         dense_thr: float,
-        best_thr_macro_f1: float,
+        macro_f1_optimal_threshold: float,
         dense_metrics: dict,
-        tuned_dense_metrics: dict,
+        macro_f1_optimised_metrics: dict,
         trade_metrics: dict,
         strategy_metrics: dict,
     ):
         payload = {
-            "model_name": str(model_name).upper(),
-            "decision_threshold": float(dense_thr),
-            "best_macro_f1_threshold": float(best_thr_macro_f1),
-            "dense_accuracy": dense_metrics["accuracy"],
-            "dense_f1": dense_metrics["f1"],
-            "dense_macro_f1": dense_metrics["macro_f1"],
-            "dense_roc_auc": dense_metrics["roc_auc"],
-            "dense_ap": dense_metrics["ap"],
-            "tuned_dense_accuracy": tuned_dense_metrics["accuracy"],
-            "tuned_dense_f1": tuned_dense_metrics["f1"],
-            "tuned_dense_macro_f1": tuned_dense_metrics["macro_f1"],
-            "trade_accuracy": trade_metrics["accuracy"],
-            "trade_f1": trade_metrics["f1"],
-            "trade_macro_f1": trade_metrics["macro_f1"],
-            "trade_roc_auc": trade_metrics["roc_auc"],
-            "trade_ap": trade_metrics["ap"],
-            "trade_sharpe": strategy_metrics["sharpe"],
-            "trade_hit_rate": strategy_metrics["hit_rate"],
-            "trade_mean_return": strategy_metrics["mean_trade_return"],
-            "n_samples": len(getattr(result, "y_true", []) or []),
-            "n_trade_samples": len(getattr(result, "trade_aligned_indices", []) or []),
+            "model": str(model_name).upper(),
+
+            "threshold_fixed": float(dense_thr),
+            "threshold_macro_f1_dense": float(macro_f1_optimal_threshold),
+            "threshold_selection_metric": getattr(
+                result,
+                "threshold_selection_metric",
+                "macro_f1",
+            ),
+
+            "val_loss_dense": getattr(result, "dense_val_loss", None),
+
+            "accuracy_dense": dense_metrics["accuracy"],
+            "f1_dense": dense_metrics["f1"],
+            "macro_f1_dense": dense_metrics["macro_f1"],
+            "roc_auc_dense": dense_metrics["roc_auc"],
+            "ap_dense": dense_metrics["ap"],
+
+            "accuracy_dense_macro_f1_threshold": macro_f1_optimised_metrics["accuracy"],
+            "f1_dense_macro_f1_threshold": macro_f1_optimised_metrics["f1"],
+            "macro_f1_dense_macro_f1_threshold": macro_f1_optimised_metrics["macro_f1"],
+
+            "accuracy_trade_aligned": trade_metrics["accuracy"],
+            "f1_trade_aligned": trade_metrics["f1"],
+            "macro_f1_trade_aligned": trade_metrics["macro_f1"],
+            "roc_auc_trade_aligned": trade_metrics["roc_auc"],
+            "ap_trade_aligned": trade_metrics["ap"],
+
+            "sharpe": strategy_metrics["sharpe"],
+            "n_trades": len(getattr(result, "trade_aligned_indices", []) or []),
+            "mean_trade_return": strategy_metrics["mean_trade_return"],
+            "hit_rate": strategy_metrics["hit_rate"],
+            "final_equity": strategy_metrics.get("final_equity"),
+            "max_drawdown": strategy_metrics.get("max_drawdown"),
+
+            "ticker": (getattr(result, "metadata", {}) or {}).get("ticker"),
+            "n_predictions_dense": len(getattr(result, "y_true", []) or []),
+            "n_predictions_trade_aligned": len(getattr(result, "trade_aligned_indices", []) or []),
             "horizon": getattr(result, "horizon", None),
         }
 
@@ -659,9 +711,9 @@ class EvaluationMethods:
         self,
         model_name: str,
         dense_thr: float,
-        best_thr_macro_f1: float,
+        macro_f1_optimal_threshold: float,
         dense_metrics: dict,
-        tuned_dense_metrics: dict,
+        macro_f1_optimised_metrics: dict,
     ) -> None:
         print(
             f"[{model_name} Evaluation][Dense] thr={dense_thr:.3f} (fixed) | "
@@ -672,10 +724,10 @@ class EvaluationMethods:
             f"AP={dense_metrics['ap'] if dense_metrics['ap'] is not None else float('nan'):.3f}"
         )
         print(
-            f"[{model_name} Evaluation][Dense Supplementary] best macro-F1 threshold={best_thr_macro_f1:.3f} | "
-            f"Acc={tuned_dense_metrics['accuracy']:.3f} | "
-            f"F1(pos)={tuned_dense_metrics['f1']:.3f} | "
-            f"F1(macro)={tuned_dense_metrics['macro_f1']:.3f}"
+            f"[{model_name} Evaluation][Dense Supplementary] best macro-F1 threshold={macro_f1_optimal_threshold:.3f} | "
+            f"Acc={macro_f1_optimised_metrics['accuracy']:.3f} | "
+            f"F1(pos)={macro_f1_optimised_metrics['f1']:.3f} | "
+            f"F1(macro)={macro_f1_optimised_metrics['macro_f1']:.3f}"
         )
 
     def log_trade_metrics(

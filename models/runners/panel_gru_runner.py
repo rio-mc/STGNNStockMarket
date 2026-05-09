@@ -77,7 +77,12 @@ class PanelGRURunner(BaseModelRunner):
             worker_init_fn=app._seed_worker,
         )
 
-        trainer.train(dl, app.args.lstm_epochs, stop_event=stop_event)
+        trainer.train(
+            dl, 
+            app.args.lstm_epochs, 
+            stop_event=stop_event,
+            patience=app.args.early_stopping_patience,
+        )
 
         eval_result = trainer.evaluate_rolling(val_ds)
         self._attach_metadata(app, eval_result)

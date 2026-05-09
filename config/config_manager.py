@@ -154,6 +154,7 @@ class ConfigManager:
                 "panel_gru",
                 "panel_lstm",
                 "gcn",
+                "gat",
                 "nnconv",
                 "graphsage",
                 "stgnn",
@@ -269,8 +270,13 @@ class ConfigManager:
         # === Generic Training
         parser.add_argument("--batch_size", type=int, default=256, help="Mini-batch size")
         parser.add_argument("--dropout", type=float, default=0.15, help="Dropout rate")
-
-        epoch_count = 50
+        parser.add_argument(
+            "--early_stopping_patience",
+            type=int,
+            default=5,
+            help="Training-loss early stopping patience"
+        )
+        epoch_count = 200
         lr = 1e-4
 
         parser.add_argument(

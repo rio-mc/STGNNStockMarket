@@ -69,7 +69,13 @@ class Trainer:
         self.train_loss_history = []
         self.val_loss_history = []
 
-    def train(self, dataloader, num_epochs, stop_event=None):
+    def train(
+        self,
+        dataloader,
+        num_epochs,
+        stop_event=None,
+        patience=5,
+    ):
         self._init_energy_monitoring()
 
         total_energy_Wh = 0.0
@@ -89,6 +95,11 @@ class Trainer:
         )
 
         epoch_bar = tqdm(range(num_epochs), desc="Training", position=0)
+
+        best_train_loss = float("inf")
+        epochs_without_improvement = 0
+        best_state = None
+        min_delta = 1e-6
 
         for epoch in epoch_bar:
             epoch_samples = 0
@@ -150,6 +161,26 @@ class Trainer:
 
             # Store training loss locally for this single active model run
             self.train_loss_history.append(float(avg_loss))
+
+            if avg_loss < best_train_loss - min_delta:
+                best_train_loss = float(avg_loss)
+                epochs_without_improvement = 0
+                best_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in self.model.state_dict().items()
+                }
+            else:
+                epochs_without_improvement += 1
+
+            if epochs_without_improvement >= patience:
+                tqdm.write(
+                    f"[EarlyStopping] Stopped after {epoch + 1} epochs "
+                    f"(best_train_loss={best_train_loss:.6f}, patience={patience})"
+                )
+                break
+
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
 
         self.total_energy_Wh = total_energy_Wh
         self.total_train_seconds = total_train_seconds
@@ -255,6 +286,7 @@ class Trainer:
             metadata={
                 "evaluation_mode": "dense_rolling",
                 "decision_threshold_policy": "fixed",
+                "ticker": self.targetTicker,
             },
         )
 

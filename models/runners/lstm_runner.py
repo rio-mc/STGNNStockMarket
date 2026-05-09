@@ -93,6 +93,7 @@ class LSTMRunner(BaseModelRunner):
             dl_lstm_train,
             app.args.lstm_epochs,
             stop_event=stop_event,
+            patience=app.args.early_stopping_patience,
         )
         app.logger.info("[LSTMRunner] Training completed in %.2fs", time.time() - start)
         Utils.log_gpu_memory("After LSTM")

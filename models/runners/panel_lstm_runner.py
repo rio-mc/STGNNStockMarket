@@ -101,7 +101,12 @@ class PanelLSTMRunner(BaseModelRunner):
         )
 
         start = time.time()
-        trainer.train(dl, app.args.lstm_epochs, stop_event=stop_event)
+        trainer.train(
+            dl, 
+            app.args.lstm_epochs, 
+            stop_event=stop_event,
+            patience=app.args.early_stopping_patience,
+        )
         app.logger.info("[PanelLSTMRunner] Training completed in %.2fs", time.time() - start)
         Utils.log_gpu_memory("After PANEL_LSTM")
 

@@ -33,6 +33,8 @@ class EvaluationResult:
     hist_val: List[Dict[str, Any]] = field(default_factory=list)
 
     decision_threshold: float = 0.5
+    threshold_selection_metric: str = "macro_f1"
+
     dense_val_loss: Optional[float] = None
 
     horizon: Optional[int] = None
@@ -72,7 +74,22 @@ class EvaluationResult:
             self.decision_threshold = float(self.decision_threshold)
         except Exception as exc:
             raise ValueError(f"decision_threshold must be numeric, got {self.decision_threshold!r}") from exc
+        
+        allowed_threshold_metrics = {
+            "macro_f1",
+            "f1",
+            "accuracy",
+            "balanced_accuracy",
+            "youden_j",
+            "sharpe",
+        }
 
+        if self.threshold_selection_metric not in allowed_threshold_metrics:
+            raise ValueError(
+                f"Unsupported threshold_selection_metric="
+                f"{self.threshold_selection_metric!r}"
+            )
+        
         if not (0.0 <= self.decision_threshold <= 1.0):
             raise ValueError(
                 f"decision_threshold must be in [0, 1], got {self.decision_threshold}"
@@ -98,7 +115,8 @@ class EvaluationMetrics:
 
     threshold_fixed: float
     threshold_macro_f1_dense: float
-
+    threshold_selection_metric: str
+    
     val_loss_dense: Optional[float]
 
     accuracy_dense: float
@@ -128,3 +146,10 @@ class EvaluationMetrics:
     n_predictions_dense: int
     n_predictions_trade_aligned: int
     horizon: Optional[int]
+
+    energy_wh: Optional[float]
+    train_seconds: Optional[float]
+    avg_power_w: Optional[float]
+    energy_per_sample_wh: Optional[float]
+    train_samples: Optional[int]
+    gpu_peak_memory_mb: Optional[float]

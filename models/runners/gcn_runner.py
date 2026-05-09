@@ -1,6 +1,3 @@
-
-# file: models/runners/gcn_runner.py
-import gc
 import time
 
 import torch
@@ -20,10 +17,7 @@ class GCNRunner(BaseModelRunner):
 
     def run(self, app, stock: str, price_df, evaluator, stop_event) -> ModelRunResult:
         app.frontendApp.set_status("Training GCN baseline...")
-
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-        Utils.log_gpu_memory("Before GCN")
+        self._prepare_memory_logging(self.model_name)
 
         train_ds = STGNNDataset(
             graph_builder=app.graphBuilder,
@@ -72,8 +66,7 @@ class GCNRunner(BaseModelRunner):
             head_hidden=app.args.head_hidden,
         ).to(app.device)
 
-        params = Utils.count_parameters(model)
-        app.logger.info("GCN parameters: %s", f"{params:,}")
+        app.logger.info("GCN parameters: %s", f"{Utils.count_parameters(model):,}")
 
         trainer = Trainer(
             model,
@@ -109,41 +102,21 @@ class GCNRunner(BaseModelRunner):
             dl,
             num_epochs=app.args.stgnn_epochs,
             stop_event=stop_event,
+            patience=app.args.early_stopping_patience,
         )
         app.logger.info("[GCNRunner] Training completed in %.2fs", time.time() - start)
-        Utils.log_gpu_memory("After GCN")
+        self._log_after_memory(self.model_name)
 
-        app._check_stop(stop_event)
-
-        app.frontendApp.set_status("Evaluating GCN baseline...")
-        eval_result = trainer.evaluate_rolling(val_ds)
-        self._attach_metadata(app, eval_result)
-
-        if hasattr(model, "classifier") and hasattr(model.classifier, "set_temperature"):
-            model.classifier.set_temperature(app.args.head_temperature)
-
-        metrics = evaluator.evaluate(
-            model_name=self.model_name,
-            result=eval_result,
-            price_df=price_df,
-        )
-
-        app._check_stop(stop_event)
-
-        app.frontendApp.set_status("Predicting with GCN baseline...")
-
-        live_graph = val_ds[len(val_ds) - 1]
-        x_live = live_graph.x.unsqueeze(0).to(app.device)
-        edge_index_live = live_graph.edge_index.to(app.device)
-        edge_attr_live = (
-            live_graph.edge_attr.to(app.device)
-            if getattr(live_graph, "edge_attr", None) is not None
-            else None
-        )
-
-        model.eval()
-        with torch.no_grad():
-            prob = torch.sigmoid(
+        def live_predict():
+            live_graph = val_ds[len(val_ds) - 1]
+            x_live = live_graph.x.unsqueeze(0).to(app.device)
+            edge_index_live = live_graph.edge_index.to(app.device)
+            edge_attr_live = (
+                live_graph.edge_attr.to(app.device)
+                if getattr(live_graph, "edge_attr", None) is not None
+                else None
+            )
+            return torch.sigmoid(
                 model(
                     x_live,
                     edge_index=edge_index_live,
@@ -152,33 +125,19 @@ class GCNRunner(BaseModelRunner):
                 ).view(-1)[0]
             ).item()
 
-        threshold = self._resolve_threshold(
-            metrics,
-            policy=getattr(app.args, "decision_threshold_policy", "fixed"),
-        )
-
-        if prob >= threshold:
-            direction = "Upwards"
-            confidence = prob * 100.0
-        else:
-            direction = "Downwards"
-            confidence = (1.0 - prob) * 100.0
-
-        app.logger.info("[GCNRunner] %s (%.1f%%)", direction, confidence)
-
-        result = ModelRunResult(
-            model_name=self.model_name,
-            direction=direction,
-            confidence=confidence,
-            metrics=metrics,
-            eval_result=eval_result,
-            trainer=trainer,
+        result = self._evaluate_and_predict(
+            app=app,
+            stock=stock,
+            price_df=price_df,
+            evaluator=evaluator,
+            stop_event=stop_event,
             model=model,
+            trainer=trainer,
+            val_ds=val_ds,
+            live_predict_fn=live_predict,
+            eval_status="Evaluating GCN baseline...",
+            predict_status="Predicting with GCN baseline...",
         )
 
-        del dl, train_ds, val_ds
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
+        self._cleanup(dl, train_ds, val_ds)
         return result

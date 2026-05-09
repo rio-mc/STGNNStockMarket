@@ -93,6 +93,7 @@ class GRURunner(BaseModelRunner):
             dl_gru_train,
             app.args.lstm_epochs,
             stop_event=stop_event,
+            patience=app.args.early_stopping_patience,
         )
         app.logger.info("[GRURunner] Training completed in %.2fs", time.time() - start)
         Utils.log_gpu_memory("After GRU")

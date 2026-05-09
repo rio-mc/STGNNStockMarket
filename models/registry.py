@@ -6,7 +6,7 @@ from .runners.nnconv_runner import NNConvRunner
 from .runners.panel_gru_runner import PanelGRURunner
 from .runners.panel_lstm_runner import PanelLSTMRunner
 from .runners.stgnn_runner import STGNNRunner
-
+from .runners.gat_runner import GATRunner
 
 class ModelRegistry:
     _registry = {
@@ -18,6 +18,7 @@ class ModelRegistry:
         "nnconv": NNConvRunner,
         "graphsage": GraphSAGERunner,
         "stgnn": STGNNRunner,
+        "gat": GATRunner,
     }
 
     @classmethod

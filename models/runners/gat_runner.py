@@ -4,7 +4,7 @@ import torch
 from torch.nn import BCEWithLogitsLoss
 from torch_geometric.loader import DataLoader as GeoDataLoader
 
-from architectures.nnconv_graph_classifier import NNConvGraphClassifier
+from architectures import GATGraphClassifier
 from core.utils.utils import Utils
 from data import STGNNDataset
 from training.trainer import Trainer
@@ -12,11 +12,11 @@ from training.trainer import Trainer
 from ..base_runner import BaseModelRunner, ModelRunResult
 
 
-class NNConvRunner(BaseModelRunner):
-    model_name = "NNCONV"
+class GATRunner(BaseModelRunner):
+    model_name = "GAT"
 
     def run(self, app, stock: str, price_df, evaluator, stop_event) -> ModelRunResult:
-        app.frontendApp.set_status("Training NNConv graph baseline...")
+        app.frontendApp.set_status("Training GAT baseline...")
         self._prepare_memory_logging(self.model_name)
 
         train_ds = STGNNDataset(
@@ -46,16 +46,16 @@ class NNConvRunner(BaseModelRunner):
         aligned_tickers = train_ds.tickers
         num_nodes = len(aligned_tickers)
 
-        app.logger.info("[NNConvRunner] train_ds size=%d", len(train_ds))
-        app.logger.info("[NNConvRunner] val_ds size=%d", len(val_ds))
-        app.logger.info("[NNConvRunner] aligned_tickers=%s", aligned_tickers)
+        app.logger.info("[GATRunner] train_ds size=%d", len(train_ds))
+        app.logger.info("[GATRunner] val_ds size=%d", len(val_ds))
+        app.logger.info("[GATRunner] aligned_tickers=%s", aligned_tickers)
 
         if len(train_ds) == 0:
-            raise RuntimeError("NNCONV training dataset is empty.")
+            raise RuntimeError("GAT training dataset is empty.")
         if len(val_ds) == 0:
-            raise RuntimeError("NNCONV validation dataset is empty.")
+            raise RuntimeError("GAT validation dataset is empty.")
 
-        model = NNConvGraphClassifier(
+        model = GATGraphClassifier(
             edge_index=app.init_edge_index,
             num_nodes=num_nodes,
             feature_dim=len(app.raw_feature_cols) + 1,
@@ -66,7 +66,7 @@ class NNConvRunner(BaseModelRunner):
             head_hidden=app.args.head_hidden,
         ).to(app.device)
 
-        app.logger.info("NNCONV parameters: %s", f"{Utils.count_parameters(model):,}")
+        app.logger.info("GAT parameters: %s", f"{Utils.count_parameters(model):,}")
 
         trainer = Trainer(
             model,
@@ -104,7 +104,7 @@ class NNConvRunner(BaseModelRunner):
             stop_event=stop_event,
             patience=app.args.early_stopping_patience,
         )
-        app.logger.info("[NNConvRunner] Training completed in %.2fs", time.time() - start)
+        app.logger.info("[GATRunner] Training completed in %.2fs", time.time() - start)
         self._log_after_memory(self.model_name)
 
         def live_predict():
@@ -135,8 +135,8 @@ class NNConvRunner(BaseModelRunner):
             trainer=trainer,
             val_ds=val_ds,
             live_predict_fn=live_predict,
-            eval_status="Evaluating NNConv graph baseline...",
-            predict_status="Predicting with NNConv graph baseline...",
+            eval_status="Evaluating GAT baseline...",
+            predict_status="Predicting with GAT baseline...",
         )
 
         self._cleanup(dl, train_ds, val_ds)

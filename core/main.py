@@ -7,6 +7,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import torch
+from dataclasses import asdict, is_dataclass
 
 from config.config_manager import ConfigManager
 from core.experiment_runner import ExperimentRunner
@@ -677,7 +678,14 @@ class MainApp:
 
             if getattr(result, "metrics", None):
                 print("Metrics:")
-                for key, value in result.metrics.items():
+
+                metrics_payload = (
+                    asdict(result.metrics)
+                    if is_dataclass(result.metrics)
+                    else dict(result.metrics)
+                )
+
+                for key, value in metrics_payload.items():
                     print(f"  {key}: {value}")
 
             return result

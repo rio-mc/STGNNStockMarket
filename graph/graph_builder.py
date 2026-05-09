@@ -180,18 +180,22 @@ class GraphBuilder:
 
         for i in range(n):
             for j in range(i + 1, n):
-                if sim[i, j] > 0:
-                    graph.add_edge(i, j, weight=1 - float(sim[i, j]))
+                similarity = float(sim[i, j])
+                graph.add_edge(i, j, weight=1.0 - similarity, similarity=similarity)
 
         mst = nx.minimum_spanning_tree(graph, weight="weight")
-        edges = [(u, v, 1 - graph[u][v]["weight"]) for u, v in mst.edges()]
+        edges = [(u, v, float(graph[u][v]["similarity"])) for u, v in mst.edges()]
         edges = self._dedupe_edges(edges)
+
         logging.info("[GraphBuilder] MST graph contains %d edges", len(edges))
         return edges
 
     def _select_edges_by_mode(self, coords: np.ndarray):
         knn_edges = self._prune_cosine_graph(coords)
         mst_edges = self._mst_edges(coords)
+
+        if self.max_k <= 0:
+            return [], mst_edges
 
         if self.graph_mode == "knn":
             return knn_edges, mst_edges

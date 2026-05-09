@@ -145,6 +145,7 @@ class STGNNRunner(BaseModelRunner):
             dl_stgnn_train,
             num_epochs=app.args.stgnn_epochs,
             stop_event=stop_event,
+            patience=app.args.early_stopping_patience,
         )
         app.logger.info("[STGNNRunner] Training completed in %.2fs", time.time() - start)
         Utils.log_gpu_memory("After STGNN")

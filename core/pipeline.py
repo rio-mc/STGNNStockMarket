@@ -136,15 +136,41 @@ class Pipeline:
         )
 
         tickers, coords3d, pruned, mst = graph_builder.getLightGraph()
-        graph_stats_path = Path(getattr(self.args, "results_dir", "./results")) / "graph_logging" / "graph_stats.json"
+
+        graph_stats_path = (
+            Path(getattr(self.args, "results_dir", "./results"))
+            / "graph_logging"
+            / f"graph_stats_{stock}_{self.args.model}_k{max_k}_seed{self.args.seed}.json"
+        )
         graph_builder.save_graph_stats(str(graph_stats_path))
 
+        # Build PyG edge_index.
+        # GraphBuilder returns conceptual undirected edges, but PyG message
+        # passing is directional, so add reverse edges explicitly.
         edge_pairs = [(i, j) for i, j, _ in pruned]
+
         if edge_pairs:
             edge_index = torch.tensor(edge_pairs, dtype=torch.long).t().contiguous()
+
+            reverse_edges = edge_index[[1, 0], :]
+            edge_index = torch.cat([edge_index, reverse_edges], dim=1)
+
+            num_nodes = len(tickers)
+            edge_keys = edge_index[0] * num_nodes + edge_index[1]
+            unique_keys = torch.unique(edge_keys, sorted=True)
+
+            edge_index = torch.stack(
+                [
+                    unique_keys // num_nodes,
+                    unique_keys % num_nodes,
+                ],
+                dim=0,
+            )
         else:
             edge_index = torch.zeros((2, 0), dtype=torch.long)
 
+        # If no cross-asset edges remain, retain identity self-loops so
+        # graph operators remain well-defined without relational mixing.
         if edge_index.numel() == 0:
             idx = torch.arange(len(tickers), dtype=torch.long)
             edge_index = torch.stack([idx, idx], dim=0)
