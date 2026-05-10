@@ -5,7 +5,7 @@ __pycache__
 *$py.class
 
 # Ignore all experiment outputs
-/results/
+/results*/
 /summaries/
 /exports/
 # C extensions

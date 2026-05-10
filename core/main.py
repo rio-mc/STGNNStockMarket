@@ -405,6 +405,233 @@ class MainApp:
 
         return {"value": str(metrics_obj)}
 
+
+    def _serialise_metadata(self, eval_result):
+        if eval_result is None:
+            return {}
+        return dict(getattr(eval_result, "metadata", {}) or {})
+
+    def _extract_compute_payload(self, metadata_payload):
+        keys = [
+            "energy_wh",
+            "train_seconds",
+            "avg_power_w",
+            "energy_per_sample_wh",
+            "train_samples",
+            "gpu_peak_memory_mb",
+        ]
+        return {key: metadata_payload.get(key) for key in keys}
+    
+
+    def _fmt_float(self, value, digits=3, missing="n/a"):
+        try:
+            if value is None:
+                return missing
+            value = float(value)
+            if value != value:
+                return missing
+            if value in (float("inf"), float("-inf")):
+                return missing
+            return f"{value:.{digits}f}"
+        except Exception:
+            return missing
+
+    def _fmt_int(self, value, missing="n/a"):
+        try:
+            if value is None:
+                return missing
+            return str(int(value))
+        except Exception:
+            return missing
+
+    def _box_line(self, text="", width=96):
+        text = str(text)
+        usable = width - 4
+        if len(text) > usable:
+            text = text[: usable - 1] + "…"
+        return "║ " + text.ljust(usable) + " ║"
+
+    def _box_rule(self, kind="middle", width=96):
+        if kind == "top":
+            return "╔" + ("═" * (width - 2)) + "╗"
+        if kind == "bottom":
+            return "╚" + ("═" * (width - 2)) + "╝"
+        return "╠" + ("═" * (width - 2)) + "╣"
+
+    def _metrics_dict(self, metrics):
+        if not metrics:
+            return {}
+        if is_dataclass(metrics):
+            return asdict(metrics)
+        if isinstance(metrics, dict):
+            return dict(metrics)
+        if hasattr(metrics, "__dict__"):
+            return dict(metrics.__dict__)
+        return {"value": str(metrics)}
+
+    def _format_headless_report(self, result) -> str:
+        metrics = self._metrics_dict(getattr(result, "metrics", None))
+        metadata = self._serialise_metadata(getattr(result, "eval_result", None))
+        compute = self._extract_compute_payload(metadata)
+
+        model = str(getattr(result, "model_name", metrics.get("model", "MODEL"))).upper()
+        ticker = str(metrics.get("ticker") or metadata.get("ticker") or "").upper()
+        direction = str(getattr(result, "direction", "UNKNOWN")).upper()
+        confidence = self._fmt_float(getattr(result, "confidence", None), 2)
+
+        horizon = metrics.get("horizon", "n/a")
+        seed = metadata.get("seed", getattr(self.args, "seed", "n/a"))
+        universe_id = metadata.get("universe_id", getattr(self.args, "universe_id", "n/a"))
+        interval = metadata.get("interval", getattr(self.args, "interval", "n/a"))
+
+        graph_backend = metadata.get("graph_backend") or metrics.get("graph_backend")
+        graph_model = metadata.get("graph_model") or metrics.get("graph_model")
+
+        if graph_backend and model == "STGNN":
+            model_label = f"{model}+{str(graph_backend).upper()}"
+        else:
+            model_label = model
+
+        threshold_policy = (
+            metrics.get("threshold_selection_metric")
+            or metadata.get("decision_threshold_policy")
+            or "n/a"
+        )
+
+        width = 96
+
+        lines = [
+            self._box_rule("top", width),
+            self._box_line("EXPERIMENT RESULT", width),
+            self._box_rule("middle", width),
+            self._box_line(
+                f"RUN        {model_label} | {ticker} | horizon {horizon} bars | "
+                f"seed {seed} | {universe_id} | {interval}",
+                width,
+            ),
+            self._box_line(f"SIGNAL     {direction} {confidence}%", width),
+            self._box_line(
+                "THRESHOLD  "
+                f"fixed={self._fmt_float(metrics.get('threshold_fixed'), 3)} | "
+                f"best_macro_f1={self._fmt_float(metrics.get('threshold_macro_f1_dense'), 3)} | "
+                f"policy={threshold_policy}",
+                width,
+            ),
+        ]
+
+        if graph_backend or graph_model:
+            lines.append(
+                self._box_line(
+                    f"GRAPH      backend={graph_backend or 'n/a'} | graph_model={graph_model or 'n/a'}",
+                    width,
+                )
+            )
+
+        lines.extend(
+            [
+                self._box_rule("middle", width),
+
+                self._box_line("DENSE CLASSIFICATION", width),
+                self._box_line(
+                    f"  acc {self._fmt_float(metrics.get('accuracy_dense'))} | "
+                    f"f1_pos {self._fmt_float(metrics.get('f1_dense'))} | "
+                    f"f1_macro {self._fmt_float(metrics.get('macro_f1_dense'))} | "
+                    f"roc_auc {self._fmt_float(metrics.get('roc_auc_dense'))} | "
+                    f"ap {self._fmt_float(metrics.get('ap_dense'))}",
+                    width,
+                ),
+                self._box_line(
+                    f"  loss {self._fmt_float(metrics.get('val_loss_dense'))} | "
+                    f"n {self._fmt_int(metrics.get('n_predictions_dense'))}",
+                    width,
+                ),
+
+                self._box_line("", width),
+
+                self._box_line("BEST MACRO-F1 THRESHOLD", width),
+                self._box_line(
+                    f"  acc {self._fmt_float(metrics.get('accuracy_dense_macro_f1_threshold'))} | "
+                    f"f1_pos {self._fmt_float(metrics.get('f1_dense_macro_f1_threshold'))} | "
+                    f"f1_macro {self._fmt_float(metrics.get('macro_f1_dense_macro_f1_threshold'))}",
+                    width,
+                ),
+
+                self._box_line("", width),
+
+                self._box_line("TRADE-ALIGNED", width),
+                self._box_line(
+                    f"  acc {self._fmt_float(metrics.get('accuracy_trade_aligned'))} | "
+                    f"f1_pos {self._fmt_float(metrics.get('f1_trade_aligned'))} | "
+                    f"f1_macro {self._fmt_float(metrics.get('macro_f1_trade_aligned'))} | "
+                    f"roc_auc {self._fmt_float(metrics.get('roc_auc_trade_aligned'))} | "
+                    f"ap {self._fmt_float(metrics.get('ap_trade_aligned'))}",
+                    width,
+                ),
+                self._box_line(
+                    f"  trades {self._fmt_int(metrics.get('n_trades'))} | "
+                    f"hit_rate {self._fmt_float(metrics.get('hit_rate'))} | "
+                    f"mean_ret {self._fmt_float(metrics.get('mean_trade_return'), 6)}",
+                    width,
+                ),
+
+                self._box_line("", width),
+
+                self._box_line("STRATEGY", width),
+                self._box_line(
+                    f"  sharpe {self._fmt_float(metrics.get('sharpe'))} | "
+                    f"final_equity {self._fmt_float(metrics.get('final_equity'))} | "
+                    f"max_drawdown {self._fmt_float(metrics.get('max_drawdown'))}",
+                    width,
+                ),
+
+                self._box_line("", width),
+
+                self._box_line("COMPUTE", width),
+                self._box_line(
+                    f"  train {self._fmt_float(compute.get('train_seconds'), 2)}s | "
+                    f"energy {self._fmt_float(compute.get('energy_wh'), 4)} Wh | "
+                    f"avg_power {self._fmt_float(compute.get('avg_power_w'), 2)} W | "
+                    f"peak_gpu {self._fmt_float(compute.get('gpu_peak_memory_mb'), 2)} MB",
+                    width,
+                ),
+                self._box_line(
+                    f"  samples {self._fmt_int(compute.get('train_samples'))} | "
+                    f"energy_per_sample {self._fmt_float(compute.get('energy_per_sample_wh'), 8)} Wh",
+                    width,
+                ),
+
+                self._box_rule("bottom", width),
+            ]
+        )
+
+        return "\n".join(lines)
+
+
+    def _is_graph_aware_model(self, selected_model: str, graph_backend=None) -> bool:
+        model = str(selected_model or "").strip().lower()
+        return model in {"gcn", "gat", "graphsage", "nnconv", "stgnn"} or graph_backend is not None
+
+    def _resolve_record_graph_backend(self, selected_model: str, metadata_payload: dict):
+        graph_backend = metadata_payload.get("graph_backend")
+        if graph_backend:
+            return str(graph_backend).strip().lower()
+        model = str(selected_model or "").strip().lower()
+        if model == "stgnn":
+            return str(getattr(self.args, "graph_model", "gcn")).strip().lower()
+        if model in {"gcn", "gat", "graphsage", "nnconv"}:
+            return model
+        return None
+
+    def _extract_graph_stats(self, *, selected_model: str, graph_backend, state=None):
+        if not self._is_graph_aware_model(selected_model, graph_backend):
+            return None
+        if isinstance(state, dict) and state.get("graph_stats") is not None:
+            return state.get("graph_stats")
+        graph_builder = getattr(self, "graphBuilder", None)
+        if graph_builder is not None and getattr(graph_builder, "graph_stats", None) is not None:
+            return graph_builder.graph_stats
+        return None
+
     def _store_run_result(
         self,
         *,
@@ -417,80 +644,139 @@ class MainApp:
         job_id=None,
         queue_run_id=None,
         error_message=None,
+        state=None,
     ) -> None:
-        run_id = self.experiment_store.make_run_id()
+        eval_result = getattr(result, "eval_result", None) if result is not None else None
+
+        metadata_payload = self._serialise_metadata(eval_result)
+        compute_payload = self._extract_compute_payload(metadata_payload)
+
+        model_key = str(selected_model or "").strip().lower()
+        graph_backend = self._resolve_record_graph_backend(model_key, metadata_payload)
+
+        if model_key == "stgnn":
+            record_graph_model = str(
+                graph_backend or getattr(self.args, "graph_model", "gcn")
+            ).strip().lower()
+        elif model_key in {"gcn", "gat", "graphsage", "nnconv"}:
+            record_graph_model = model_key
+        else:
+            record_graph_model = ""
+            graph_backend = None
+
+        graph_stats_payload = self._extract_graph_stats(
+            selected_model=model_key,
+            graph_backend=graph_backend,
+            state=state,
+        )
+
+        run_id = self.experiment_store.make_run_id(
+            model=model_key,
+            ticker=stock,
+            seed=int(self.args.seed),
+            graph_backend=graph_backend,
+        )
+
         ts_end = self.experiment_store.utc_now_iso()
 
         start_dt = datetime.fromisoformat(ts_start)
         end_dt = datetime.fromisoformat(ts_end)
         duration_sec = (end_dt - start_dt).total_seconds()
 
-        history_path = None
-        eval_result = getattr(result, "eval_result", None) if result is not None else None
+        metrics_payload = self._serialise_metrics(
+            getattr(result, "metrics", None) if result is not None else None
+        )
 
-        # For queue research suites, keep outputs seed-level rather than
-        # per-iteration/per-date loss histories. Single manual runs still save
-        # histories as before.
+        common_payload = {
+            "run_id": run_id,
+            "job_id": job_id,
+            "queue_run_id": queue_run_id,
+            "status": status,
+            "timestamp_start": ts_start,
+            "timestamp_end": ts_end,
+            "duration_sec": duration_sec,
+            "ticker": str(stock).upper(),
+            "prediction_window": str(gui_window),
+            "model": model_key,
+            "seed": int(self.args.seed),
+            "graph_backend": graph_backend,
+            "graph_model": record_graph_model or None,
+            "direction": str(getattr(result, "direction", "")) if result is not None else "",
+            "confidence": float(getattr(result, "confidence", 0.0)) if result is not None else 0.0,
+            "metrics": metrics_payload,
+            "metadata": metadata_payload,
+            "compute": compute_payload,
+            "graph_stats": graph_stats_payload,
+            "error_message": error_message,
+        }
+
+        canonical_result_path = self.experiment_store.save_run_payload(
+            run_id=run_id,
+            filename="result.json",
+            model=model_key,
+            graph_backend=graph_backend,
+            payload=common_payload,
+        )
+
+        config_snapshot_path = self.experiment_store.save_run_payload(
+            run_id=run_id,
+            filename="config.json",
+            model=model_key,
+            graph_backend=graph_backend,
+            payload=vars(self.args),
+        )
+
+        graph_stats_path = None
+        if graph_stats_payload is not None:
+            graph_stats_path = self.experiment_store.save_run_payload(
+                run_id=run_id,
+                filename="graph_stats.json",
+                model=model_key,
+                graph_backend=graph_backend,
+                payload=graph_stats_payload,
+            )
+
+        history_path = None
         if eval_result is not None and not queue_run_id:
             history_path = self.experiment_store.save_history(
                 run_id=run_id,
                 hist_train=getattr(eval_result, "hist_train", None),
                 hist_val=getattr(eval_result, "hist_val", None),
+                model=model_key,
+                graph_model=record_graph_model,
             )
-
-        metrics_payload = self._serialise_metrics(
-            getattr(result, "metrics", None) if result is not None else None
-        )
 
         queue_group = None
         job_payload_path = None
+
         if queue_run_id and job_id:
             queue_group = self.experiment_store.model_group(
-                selected_model,
-                str(getattr(self.args, "graph_model", "gcn")).lower(),
+                model_key,
+                record_graph_model,
             )
+
+            queue_payload = {
+                **common_payload,
+                "canonical_result_path": canonical_result_path,
+                "queue_group": queue_group,
+            }
+
             job_payload_path = self.experiment_store.save_job_payload(
                 queue_run_id=queue_run_id,
                 job_id=job_id,
-                model=selected_model,
-                graph_model=str(getattr(self.args, "graph_model", "gcn")).lower(),
+                model=model_key,
+                graph_model=record_graph_model,
                 filename="result.json",
-                payload={
-                    "run_id": run_id,
-                    "job_id": job_id,
-                    "queue_run_id": queue_run_id,
-                    "status": status,
-                    "ticker": str(stock).upper(),
-                    "prediction_window": str(gui_window),
-                    "model": str(selected_model).lower(),
-                    "seed": int(self.args.seed),
-                    "graph_model": str(getattr(self.args, "graph_model", "gcn")).lower(),
-                    "direction": str(getattr(result, "direction", "")) if result is not None else "",
-                    "confidence": float(getattr(result, "confidence", 0.0)) if result is not None else 0.0,
-                    "metrics": metrics_payload,
-                    "error_message": error_message,
-                },
+                payload=queue_payload,
             )
 
-        if queue_run_id and job_id:
-            self._active_queue_job_summaries.append(
-                {
-                    "run_id": run_id,
-                    "job_id": job_id,
-                    "queue_run_id": queue_run_id,
-                    "queue_group": queue_group,
-                    "status": status,
-                    "ticker": str(stock).upper(),
-                    "prediction_window": str(gui_window),
-                    "model": str(selected_model).lower(),
-                    "seed": int(self.args.seed),
-                    "graph_model": str(getattr(self.args, "graph_model", "gcn")).lower(),
-                    "direction": str(getattr(result, "direction", "")) if result is not None else "",
-                    "confidence": float(getattr(result, "confidence", 0.0)) if result is not None else 0.0,
-                    "metrics": metrics_payload,
-                    "error_message": error_message,
-                }
-            )
+            self._active_queue_job_summaries.append(queue_payload)
+
+        run_dir = self.experiment_store.run_dir(
+            run_id,
+            model=model_key,
+            graph_backend=graph_backend,
+        )
 
         record = RunRecord(
             run_id=run_id,
@@ -503,9 +789,9 @@ class MainApp:
             duration_sec=duration_sec,
             ticker=str(stock).upper(),
             prediction_window=str(gui_window),
-            model=str(selected_model).lower(),
+            model=model_key,
             seed=int(self.args.seed),
-            graph_model=str(getattr(self.args, "graph_model", "gcn")).lower(),
+            graph_model=record_graph_model,
             universe_id=str(getattr(self.args, "universe_id", "unknown")),
             interval=str(getattr(self.args, "interval", "unknown")),
             k=int(getattr(self.args, "k", 0)),
@@ -517,14 +803,22 @@ class MainApp:
             confidence=float(getattr(result, "confidence", 0.0)) if result is not None else 0.0,
             metrics=metrics_payload,
             extras={
+                "run_dir": str(run_dir),
+                "canonical_result_path": canonical_result_path,
+                "config_snapshot_path": config_snapshot_path,
                 "history_path": history_path,
+                "graph_stats_path": graph_stats_path,
                 "job_payload_path": job_payload_path,
                 "queue_run": queue_run_id is not None,
                 "queue_run_id": queue_run_id,
                 "queue_group": queue_group,
+                "metadata": metadata_payload,
+                "compute": compute_payload,
                 "error_message": error_message,
+                "graph_backend": graph_backend,
             },
         )
+
         self.experiment_store.append_run(record)
 
     def startPipeline(self, gui_window: str, stock: str, stop_event: threading.Event):
@@ -536,6 +830,7 @@ class MainApp:
         ts_start = self.experiment_store.utc_now_iso()
         selected_model = self.frontendApp.get_selected_model()
         result = None
+        state = None
 
         try:
             self.args.model = selected_model
@@ -581,6 +876,7 @@ class MainApp:
                 ts_start=ts_start,
                 job_id=self._active_queue_job_id,
                 queue_run_id=self._active_queue_run_id,
+                state=state,
             )
 
             self.frontendApp.root.after(
@@ -610,6 +906,7 @@ class MainApp:
                 job_id=self._active_queue_job_id,
                 queue_run_id=self._active_queue_run_id,
                 error_message="Pipeline interrupted",
+                state=state,
             )
             self.frontendApp.root.after(0, self.frontendApp._reset_ui)
             return (self.frontendApp.modelVar.get(), "-", 0.0)
@@ -626,6 +923,7 @@ class MainApp:
                 job_id=self._active_queue_job_id,
                 queue_run_id=self._active_queue_run_id,
                 error_message=str(exc),
+                state=state,
             )
             raise
 
@@ -671,24 +969,8 @@ class MainApp:
                 result.confidence,
             )
 
-            print("\n=== Experiment Result ===")
-            print(f"Model      : {result.model_name}")
-            print(f"Direction  : {result.direction}")
-            print(f"Confidence : {result.confidence:.2f}%")
-
-            if getattr(result, "metrics", None):
-                print("Metrics:")
-
-                metrics_payload = (
-                    asdict(result.metrics)
-                    if is_dataclass(result.metrics)
-                    else dict(result.metrics)
-                )
-
-                for key, value in metrics_payload.items():
-                    print(f"  {key}: {value}")
-
-            return result
+            print()
+            print(self._format_headless_report(result))
 
         raise ValueError(
             f"Unknown run_mode '{self.args.run_mode}'. "
@@ -772,6 +1054,8 @@ class MainApp:
         evaluator = self.frontendApp.evaluator
         evaluator.reset_histories()
 
+        ts_start = self.experiment_store.utc_now_iso()
+
         pipeline = Pipeline(self)
         state = pipeline.run(selected_stock, selected_window, stop_event=None)
 
@@ -782,6 +1066,16 @@ class MainApp:
             state=state,
             evaluator=evaluator,
             stop_event=None,
+        )
+
+        self._store_run_result(
+            stock=selected_stock,
+            gui_window=selected_window,
+            selected_model=selected_model,
+            result=result,
+            status="success",
+            ts_start=ts_start,
+            state=state,
         )
 
         try:

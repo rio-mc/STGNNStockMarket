@@ -60,10 +60,32 @@ class ExperimentStore:
         self.csv_path = self.runs_dir / "experiments.csv"
 
     @staticmethod
-    def make_run_id() -> str:
+    def make_run_id(
+        *,
+        model: str | None = None,
+        ticker: str | None = None,
+        seed: int | None = None,
+        graph_backend: str | None = None,
+    ) -> str:
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        return f"RUN-{ts}-{uuid4().hex[:8]}"
 
+        parts = ["RUN", ts]
+
+        if model:
+            parts.append(str(model).strip().lower())
+
+        if graph_backend:
+            parts.append(str(graph_backend).strip().lower())
+
+        if ticker:
+            parts.append(str(ticker).strip().upper())
+
+        if seed is not None:
+            parts.append(f"seed{int(seed)}")
+
+        parts.append(uuid4().hex[:8])
+        return "-".join(parts)
+    
     @staticmethod
     def make_queue_run_id() -> str:
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -519,3 +541,44 @@ class ExperimentStore:
             return value
 
         return str(value)
+    
+    def run_dir(
+        self,
+        run_id: str,
+        *,
+        model: str = "",
+        graph_backend: str | None = None,
+    ) -> Path:
+        model_key = str(model or "unknown").strip().lower() or "unknown"
+        backend_key = str(graph_backend or "").strip().lower()
+
+        group = self.model_group(model_key, backend_key)
+
+        if model_key == "stgnn" and backend_key:
+            path = self.runs_dir / group / model_key / backend_key / str(run_id)
+        else:
+            path = self.runs_dir / group / model_key / str(run_id)
+
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+
+    def save_run_payload(
+        self,
+        *,
+        run_id: str,
+        filename: str,
+        model: str = "",
+        graph_backend: str | None = None,
+        payload: Any,
+    ) -> str:
+        path = self.run_dir(
+            run_id,
+            model=model,
+            graph_backend=graph_backend,
+        ) / filename
+
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(self._normalise(payload), f, ensure_ascii=False, indent=2)
+
+        return str(path)

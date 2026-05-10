@@ -153,3 +153,6 @@ class EvaluationMetrics:
     energy_per_sample_wh: Optional[float]
     train_samples: Optional[int]
     gpu_peak_memory_mb: Optional[float]
+
+    graph_backend: Optional[str] = None
+    graph_model: Optional[str] = None

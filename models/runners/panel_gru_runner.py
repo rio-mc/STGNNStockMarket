@@ -1,132 +1,57 @@
-import time
-import torch
-from torch.nn import BCEWithLogitsLoss
-
-from training.trainer import Trainer
-from data import STGNNDataset
 from architectures.panel_gru_classifier import PanelGRUClassifier
 from core.utils.utils import Utils
-from torch_geometric.loader import DataLoader as GeoDataLoader
+
 from ..base_runner import BaseModelRunner, ModelRunResult
 
 
 class PanelGRURunner(BaseModelRunner):
     model_name = "PANEL_GRU"
 
-    def run(self, app, stock: str, price_df, evaluator, stop_event):
-
+    def run(self, app, stock: str, price_df, evaluator, stop_event) -> ModelRunResult:
         app.frontendApp.set_status("Training PANEL GRU...")
+        self._prepare_memory_logging(self.model_name)
 
-        train_ds = STGNNDataset(
-            graph_builder=app.graphBuilder,
-            feature_dict=app.train_feats,
-            tickers=app.args.tickers,
-            edge_index=app.init_edge_index,
-            target_ticker=stock,
-            feature_cols=app.raw_feature_cols,
-            seq_len=app.seq_len,
-            horizon=app.horizon,
-            include_target_flag=True,
-        )
-
-        val_ds = STGNNDataset(
-            graph_builder=app.graphBuilder,
-            feature_dict=app.val_feats,
-            tickers=app.args.tickers,
-            edge_index=app.init_edge_index,
-            target_ticker=stock,
-            feature_cols=app.raw_feature_cols,
-            seq_len=app.seq_len,
-            horizon=app.horizon,
-            include_target_flag=True,
-        )
+        train_ds, val_ds, aligned_tickers, _num_nodes = self._build_graph_datasets(app, stock)
+        self._log_dataset_summary(app, train_ds, val_ds, aligned_tickers)
 
         model = PanelGRUClassifier(
-            feature_dim=len(app.raw_feature_cols) + 1,  # includes target flag
+            feature_dim=len(app.raw_feature_cols) + 1,
             hidden_dim=app.args.lstm_hidden,
             num_layers=app.args.lstm_layers,
             dropout=app.args.dropout,
             rep_dim=app.args.rep_dim,
             head_hidden=app.args.head_hidden,
         ).to(app.device)
+        app.logger.info("PANEL_GRU parameters: %s", f"{Utils.count_parameters(model):,}")
 
-        trainer = Trainer(
-            model,
-            Utils.make_adamw(model, lr=app.args.lstm_lr, weight_decay=app.args.weight_decay),
-            BCEWithLogitsLoss(),
-            app.device,
-            graphBuilder=None,   # IMPORTANT
-            features=None,
-            tickers=app.args.tickers,
-            targetTicker=stock,
-            frontend=app.frontendApp,
-            evaluator=evaluator,
-            prediction_horizon=app.horizon,
-            seq_len=app.seq_len,
-            model_name=self.model_name,
-        )
-        trainer.targetIdx = train_ds.target_idx
-        model.target_node_index = train_ds.target_idx
-        dl = GeoDataLoader(
-            train_ds,
-            batch_size=app.args.batch_size,
-            shuffle=True,
-            num_workers=0,
-            pin_memory=False,
-            generator=app.dl_gen,
-            worker_init_fn=app._seed_worker,
-        )
-
-        trainer.train(
-            dl, 
-            app.args.lstm_epochs, 
-            stop_event=stop_event,
-            patience=app.args.early_stopping_patience,
-        )
-
-        eval_result = trainer.evaluate_rolling(val_ds)
-        self._attach_metadata(app, eval_result)
-
-        metrics = evaluator.evaluate(
-            model_name=self.model_name,
-            result=eval_result,
-            price_df=price_df,
-        )
-
-        app._check_stop(stop_event)
-
-        app.frontendApp.set_status("Predicting with PANEL GRU...")
-        
-        if hasattr(model, "classifier") and hasattr(model.classifier, "set_temperature"):
-            model.classifier.set_temperature(app.args.head_temperature)
-            
-        live_graph = val_ds[len(val_ds) - 1]
-        x_live = live_graph.x.unsqueeze(0).to(app.device)
-
-        model.eval()
-        with torch.no_grad():
-            prob = torch.sigmoid(model(x_live)[0]).item()
-
-        threshold = self._resolve_threshold(
-            metrics,
-            policy=getattr(app.args, "decision_threshold_policy", "fixed"),
-        )
-
-        if prob >= threshold:
-            direction = "Upwards"
-            confidence = prob * 100.0
-        else:
-            direction = "Downwards"
-            confidence = (1.0 - prob) * 100.0
-
-        app.logger.info("[PanelGRURunner] %s (%.1f%%)", direction, confidence)
-
-        return ModelRunResult(
-            model_name=self.model_name,
-            direction=direction,
-            confidence=confidence,
-            metrics=metrics,
-            eval_result=eval_result,
-            trainer=trainer,
+        trainer = self._make_trainer(
+            app=app,
             model=model,
+            stock=stock,
+            evaluator=evaluator,
+            lr=app.args.lstm_lr,
+            graph_builder=None,
+            features=None,
+            tickers=aligned_tickers,
         )
+        self._set_target_from_dataset(trainer, model, train_ds)
+
+        dl = self._make_geo_loader(app, train_ds)
+        self._train_model(app=app, trainer=trainer, dataloader=dl, epochs=app.args.lstm_epochs, stop_event=stop_event)
+
+        result = self._evaluate_and_predict(
+            app=app,
+            stock=stock,
+            price_df=price_df,
+            evaluator=evaluator,
+            stop_event=stop_event,
+            model=model,
+            trainer=trainer,
+            val_ds=val_ds,
+            live_predict_fn=lambda: self._live_panel_probability(app, model, val_ds, pass_target_index=False),
+            eval_status="Evaluating PANEL GRU...",
+            predict_status="Predicting with PANEL GRU...",
+        )
+
+        self._cleanup(dl, train_ds, val_ds)
+        return result

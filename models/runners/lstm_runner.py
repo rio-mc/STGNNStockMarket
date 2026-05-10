@@ -1,11 +1,3 @@
-import gc
-import time
-import numpy as np
-import torch
-from torch.nn import BCEWithLogitsLoss
-
-from training.trainer import Trainer
-from data import RecurrentDataset
 from architectures import LSTMClassifier
 from core.utils.utils import Utils
 
@@ -17,46 +9,10 @@ class LSTMRunner(BaseModelRunner):
 
     def run(self, app, stock: str, price_df, evaluator, stop_event) -> ModelRunResult:
         app.frontendApp.set_status("Training LSTM...")
+        self._prepare_memory_logging(self.model_name)
 
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-        Utils.log_gpu_memory("Before LSTM")
-
-        train_df_stock = app.train_feats[stock].iloc[-app.min_train_len:]
-        val_df_stock = app.val_feats[stock].iloc[-app.min_val_len:]
-
-        lstm_train_ds = RecurrentDataset(
-            feature_dict={stock: train_df_stock},
-            tickers=[stock],
-            target_ticker=stock,
-            feature_cols=app.raw_feature_cols,
-            seq_len=app.seq_len,
-            prediction_horizon=app.horizon,
-        )
-
-        lstm_val_ds = RecurrentDataset(
-            feature_dict={stock: val_df_stock},
-            tickers=[stock],
-            target_ticker=stock,
-            feature_cols=app.raw_feature_cols,
-            seq_len=app.seq_len,
-            prediction_horizon=app.horizon,
-        )
-
-        app.logger.info(
-            "[LSTMRunner] train_ds size=%d | val_ds size=%d | aligned_tickers=%s",
-            len(lstm_train_ds),
-            len(lstm_val_ds),
-            lstm_train_ds.aligned_tickers,
-        )
-
-        dl_lstm_train = torch.utils.data.DataLoader(
-            lstm_train_ds,
-            batch_size=app.args.batch_size,
-            shuffle=True,
-            generator=app.dl_gen,
-            worker_init_fn=app._seed_worker,
-        )
+        train_ds, val_ds, _train_df_stock, val_df_stock = self._build_recurrent_datasets(app, stock)
+        self._log_dataset_summary(app, train_ds, val_ds, getattr(train_ds, "aligned_tickers", [stock]))
 
         model = LSTMClassifier(
             feature_dim=len(app.raw_feature_cols),
@@ -68,87 +24,35 @@ class LSTMRunner(BaseModelRunner):
             rep_dim=app.args.rep_dim,
             head_hidden=app.args.head_hidden,
         ).to(app.device)
+        app.logger.info("LSTM parameters: %s", f"{Utils.count_parameters(model):,}")
 
-        params = Utils.count_parameters(model)
-        app.logger.info("LSTM parameters: %s", f"{params:,}")
-
-        trainer = Trainer(
-            model,
-            Utils.make_adamw(model, lr=app.args.lstm_lr, weight_decay=app.args.weight_decay),
-            BCEWithLogitsLoss(),
-            app.device,
-            graphBuilder=None,
+        trainer = self._make_trainer(
+            app=app,
+            model=model,
+            stock=stock,
+            evaluator=evaluator,
+            lr=app.args.lstm_lr,
+            graph_builder=None,
             features=None,
             tickers=[stock],
-            targetTicker=stock,
-            frontend=app.frontendApp,
-            evaluator=evaluator,
-            prediction_horizon=app.horizon,
-            seq_len=app.seq_len,
-            model_name=self.model_name,
         )
 
-        start = time.time()
-        trainer.train(
-            dl_lstm_train,
-            app.args.lstm_epochs,
-            stop_event=stop_event,
-            patience=app.args.early_stopping_patience,
-        )
-        app.logger.info("[LSTMRunner] Training completed in %.2fs", time.time() - start)
-        Utils.log_gpu_memory("After LSTM")
+        dl = self._make_torch_loader(app, train_ds)
+        self._train_model(app=app, trainer=trainer, dataloader=dl, epochs=app.args.lstm_epochs, stop_event=stop_event)
 
-        app._check_stop(stop_event)
-
-        app.frontendApp.set_status("Evaluating LSTM...")
-        eval_result = trainer.evaluate_rolling(lstm_val_ds)
-        self._attach_metadata(app, eval_result)
-        
-        if hasattr(model, "classifier") and hasattr(model.classifier, "set_temperature"):
-            model.classifier.set_temperature(app.args.head_temperature)
-
-        metrics = evaluator.evaluate(
-            model_name=self.model_name,
-            result=eval_result,
+        result = self._evaluate_and_predict(
+            app=app,
+            stock=stock,
             price_df=price_df,
-        )
-
-        app._check_stop(stop_event)
-
-        app.frontendApp.set_status("Predicting with LSTM...")
-        live_x = val_df_stock[app.raw_feature_cols].iloc[-app.seq_len:].values.astype(np.float32)
-        arr_x = torch.tensor(live_x, dtype=torch.float32, device=app.device).unsqueeze(0)
-
-        with torch.no_grad():
-            prob = torch.sigmoid(model(arr_x)[0]).item()
-
-        threshold = self._resolve_threshold(
-            metrics,
-            policy=getattr(app.args, "decision_threshold_policy", "fixed"),
-        )
-
-        if prob >= threshold:
-            direction = "Upwards"
-            confidence = prob * 100.0
-        else:
-            direction = "Downwards"
-            confidence = (1.0 - prob) * 100.0
-
-        app.logger.info("[LSTMRunner] %s (%.1f%%)", direction, confidence)
-
-        result = ModelRunResult(
-            model_name=self.model_name,
-            direction=direction,
-            confidence=confidence,
-            metrics=metrics,
-            eval_result=eval_result,
-            trainer=trainer,
+            evaluator=evaluator,
+            stop_event=stop_event,
             model=model,
+            trainer=trainer,
+            val_ds=val_ds,
+            live_predict_fn=lambda: self._live_recurrent_probability(app, model, val_df_stock),
+            eval_status="Evaluating LSTM...",
+            predict_status="Predicting with LSTM...",
         )
 
-        del dl_lstm_train, lstm_train_ds, lstm_val_ds
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
+        self._cleanup(dl, train_ds, val_ds)
         return result

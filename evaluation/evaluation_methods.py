@@ -660,6 +660,8 @@ class EvaluationMethods:
         trade_metrics: dict,
         strategy_metrics: dict,
     ):
+        metadata = getattr(result, "metadata", {}) or {}
+
         payload = {
             "model": str(model_name).upper(),
 
@@ -696,10 +698,20 @@ class EvaluationMethods:
             "final_equity": strategy_metrics.get("final_equity"),
             "max_drawdown": strategy_metrics.get("max_drawdown"),
 
-            "ticker": (getattr(result, "metadata", {}) or {}).get("ticker"),
+            "ticker": metadata.get("ticker"),
             "n_predictions_dense": len(getattr(result, "y_true", []) or []),
             "n_predictions_trade_aligned": len(getattr(result, "trade_aligned_indices", []) or []),
             "horizon": getattr(result, "horizon", None),
+
+            "energy_wh": metadata.get("energy_wh"),
+            "train_seconds": metadata.get("train_seconds"),
+            "avg_power_w": metadata.get("avg_power_w"),
+            "energy_per_sample_wh": metadata.get("energy_per_sample_wh"),
+            "train_samples": metadata.get("train_samples"),
+            "gpu_peak_memory_mb": metadata.get("gpu_peak_memory_mb"),
+
+            "graph_backend": metadata.get("graph_backend"),
+            "graph_model": metadata.get("graph_model"),
         }
 
         try:
