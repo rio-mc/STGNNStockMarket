@@ -1,289 +1,929 @@
-# **STGNN Stock Market Prediction**
+# STGNN STOCK MARKET PREDICTION
 
-*A controlled experimental framework for evaluating temporal vs graph-based representations in financial time series.*
+> **Controlled experimental framework.**
+> Temporal vs panel vs graph-aware models.
+> Same data. Same features. Same target. Only representation changes.
 
 ---
 
-## **1. Core Objective**
+## 01 / OBJECTIVE
 
-This project is not centred on model implementation.
+This project is **not** about collecting models.
 
-Its purpose is to:
+It is about isolating one thing:
 
-> **Isolate and evaluate the contribution of graph structure under controlled experimental conditions.**
-
-All experiments enforce:
+> **Does graph structure improve predictive and trading performance under controlled experimental conditions?**
 
 ```text
-Same data + Same features + Same target
-                    |
-        Representation varies only
-                    |
- Temporal baseline vs Graph-aware model
+SAME DATA
+SAME FEATURES
+SAME TARGET
+    |
+REPRESENTATION CHANGES ONLY
+    |
+TEMPORAL BASELINE
+vs
+PANEL TEMPORAL BASELINE
+vs
+GRAPH-AWARE MODEL
 ```
 
 ---
 
-## **2. Model Library**
+## 02 / MODEL LIBRARY
 
-All models are accessed via a unified interface:
+All models run through one registry.
 
 ```python
 runner = ModelRegistry.get_runner(model_name)
 ```
 
-This guarantees consistency across architectures.
+### 02.1 / MODEL CATEGORIES
 
-### **2.1 Model Categories**
+| Category | Models | Purpose |
+|---|---|---|
+| Temporal / Single Asset | `lstm`, `gru` | Target asset only |
+| Panel Temporal / Multi-Asset | `panel_lstm`, `panel_gru` | Multi-asset context, no graph |
+| Graph Neural Networks | `gcn`, `gat`, `graphsage`, `nnconv` | Static graph-aware baselines |
+| Spatio-Temporal GNN | `stgnn` | Temporal + relational modelling |
 
-|                                 Category |            Models            | Description                                             |
-|------------------------------------------|------------------------------|---------------------------------------------------------|
-|    **Temporal Baselines (Single Asset)** |         `lstm`, `gru`        | Standard sequence models                                |
-|  **Panel Temporal Models (Multi-Asset)** |   `panel_lstm`, `panel_gru`  | Cross-sectional temporal modelling (no graph structure) |
-|                **Graph Neural Networks** | `gcn`, `graphsage`, `nnconv` | Static relational modelling                             |
-|                  **Spatio-Temporal GNN** |           `stgnn`            | Joint temporal + relational modelling                   |
-
----
-
-## **3. System Architecture**
+Registered model names:
 
 ```text
-Dataset → Pipeline → ExperimentRunner → Model → Evaluation → Backtest → Results
+lstm
+gru
+panel_lstm
+panel_gru
+gcn
+gat
+graphsage
+nnconv
+stgnn
 ```
 
 ---
 
-## **4. Configuration Space**
+## 03 / SYSTEM ARCHITECTURE
 
-The configuration space is the primary research interface.
-
-### **4.1 Temporal Parameters**
-
-|             Parameter | Description           |
-|-----------------------|-----------------------|
-|           `--seq_len` | Input sequence length |
-| `--prediction_window` | Forecast horizon      |
-
----
-
-### **4.2 Graph Construction**
-
-|       Parameter |         Options         | Description          |
-|-----------------|-------------------------|----------------------|
-|           `--k` |         Integer         | Number of neighbours |
-|  `--graph_mode` | `knn`, `mst`, `knn_mst` | Graph topology       |
-| `--graph_embed` |       `pca`, `raw`      | Feature embedding    |
-
-Graph construction is based on rolling statistics of:
-
-- returns  
-- volatility  
-- momentum  
-
----
-
-## **5. Ablation Framework**
-
-### **5.1 Graph Ablation**
-
-|       Mode | Effect                   |
-|------------|--------------------------|
-|     `none` | Full graph               |
-| `identity` | Removes cross-node edges |
-|    `empty` | Removes graph entirely   |
-
----
-
-### **5.2 Feature Ablation**
-
-```bash
---ablate_feature return | volatility | momentum
+```text
+UNIVERSE
+  ↓
+PRICE LOADER
+  ↓
+PIPELINE
+  ↓
+FEATURE ENGINEERING
+  ↓
+GRAPH CONSTRUCTION
+  ↓
+EXPERIMENT RUNNER
+  ↓
+MODEL RUNNER
+  ↓
+EVALUATION
+  ↓
+BACKTEST
+  ↓
+RESULTS STORE
 ```
 
----
+Headless execution:
 
-### **5.3 Embedding Ablation**
-
-```bash
---graph_embed pca | raw
+```powershell
+python -m core.main --run_mode headless
 ```
 
----
-
-### **5.4 Reproducibility**
-
-|         Parameter | Description             |
-|-------------------|-------------------------|
-|          `--seed` | Random seed             |
-|     `--num_seeds` | Number of runs          |
-| `--deterministic` | Deterministic execution |
+Headless mode loads data, runs the pipeline, executes the selected model, stores results, and prints a terminal report.
 
 ---
 
-## **6. Running Experiments**
+## 04 / CONFIGURATION SPACE
 
-### **6.1 Single Run**
+The configuration space is the research interface.
 
-```bash
-python -m scripts.run_experiment \
-    --model stgnn \
-    --dataset_name sp500 \
-    --seq_len 10 \
-    --k 3 \
-    --seed 42
+### 04.1 / CORE RUNTIME PARAMETERS
+
+| Parameter | Description |
+|---|---|
+| `--run_mode` | Execution mode, usually `headless` |
+| `--model` | Model to run |
+| `--target_stock` | Target ticker |
+| `--dataset_name` | Dataset or universe identifier |
+| `--custom_tickers` | Explicit ticker list |
+| `--interval` | Price interval, for example `1h` |
+| `--prediction_window` | Forecast horizon, for example `1d` |
+| `--results_dir` | Output directory |
+| `--experiment_name` | Human-readable experiment label |
+| `--seed` | Random seed |
+
+### 04.2 / TEMPORAL PARAMETERS
+
+| Parameter | Description |
+|---|---|
+| `--seq_len` | Input sequence length |
+| `--prediction_window` | Forecast horizon |
+| `--batch_size` | Training batch size |
+| `--lstm_epochs` | Epochs for recurrent and panel recurrent models |
+| `--stgnn_epochs` | Epochs for graph and spatio-temporal models |
+
+### 04.3 / GRAPH CONSTRUCTION
+
+| Parameter | Options | Description |
+|---|---|---|
+| `--k` | Integer | Number of neighbours |
+| `--graph_mode` | `knn`, `mst`, `knn_mst` | Graph topology |
+| `--graph_embed` | `pca`, `raw` | Feature embedding for graph construction |
+
+Graph construction uses rolling statistics of:
+
+```text
+returns
+volatility
+momentum
 ```
 
----
+### 04.4 / STGNN GRAPH BACKEND
 
-### **6.2 Baseline Comparison**
-
-```bash
-python -m scripts.run_experiment --model lstm
-python -m scripts.run_experiment --model panel_gru
-python -m scripts.run_experiment --model stgnn --k 3
+```powershell
+--graph_model gcn
+--graph_model gat
+--graph_model graphsage
+--graph_model nnconv
 ```
 
+Same spatio-temporal framework. Different relational operators.
+
 ---
 
-### **6.3 Full Sweep**
+## 05 / ABLATION FRAMEWORK
 
-```bash
-python -m scripts.run_sweep \
-    --models lstm panel_gru stgnn \
-    --k_values 3 5 10 \
-    --num_seeds 5
+### 05.1 / GRAPH ABLATION
+
+| Mode | Effect |
+|---|---|
+| `none` | Full graph |
+| `identity` | Removes cross-node relational structure |
+| `empty` | Removes graph connectivity |
+
+```powershell
+--graph_ablation identity
 ```
 
----
+### 05.2 / FEATURE ABLATION
 
-## **7. Outputs (Research-Grade)**
+Remove one engineered node feature:
 
-Each run produces the following artefacts:
+```powershell
+--ablate_feature return
+--ablate_feature volatility
+--ablate_feature momentum
+```
 
-### **7.1 Results Table**
+### 05.3 / EMBEDDING ABLATION
 
-**Path:** `results/results.csv`
+```powershell
+--graph_embed pca
+--graph_embed raw
+```
 
-|         Field | Description            |
-|---------------|-------------           |
-|        model  | Model name             |
-|       seed    | Random seed            |
-|       seq_len | Sequence length        |
-|  graph config | Graph parameters       |
-| dense metrics | Classification metrics |
-| trade metrics | Strategy metrics       |
-|       runtime | Execution time         |
-|   graph stats | Structural metrics     |
+### 05.4 / REPRODUCIBILITY
 
----
+| Parameter | Description |
+|---|---|
+| `--seed` | Random seed |
+| `--deterministic` | Enables deterministic execution where supported |
 
-### **7.2 Raw Predictions**
-
-**Path:** `results/predictions/{run_id}.csv`
-
-|         Field | Description      |
-|---===---------|------------------|
-|        y_true | Ground truth     |
-|        y_pred | Predictions      |
-| probabilities | Model confidence |
-|    timestamps | Time index       |
+Seeds are set centrally. Model runners use a deterministic DataLoader generator where supported.
 
 ---
 
-### **7.3 Graph Diagnostics**
+## 06 / OUTPUTS
 
-**Path:** `results/graph_logging/graph_stats.json`
+Each successful run writes structured outputs to the selected results directory.
 
-|    Metric | Description        |
-|-----------|--------------------|
-|     nodes | Number of nodes    |
-|     edges | Number of edges    |
-|   density | Graph density      |
-| homophily | Feature similarity |
+```text
+results_smoke/
+  runs/
+    experiments.jsonl
+    experiments.csv
+    histories/
+    recurrent/
+    graph/
+    stgnn/
+  graph_logging/
+```
+
+### 06.1 / EXPERIMENT INDEX
+
+| File | Description |
+|---|---|
+| `runs/experiments.jsonl` | Full experiment records |
+| `runs/experiments.csv` | Tabular experiment summary |
+
+Each run record includes:
+
+```text
+model
+ticker
+seed
+prediction window
+graph configuration
+metrics
+metadata
+result paths
+```
+
+### 06.2 / CANONICAL RUN PAYLOAD
+
+| File | Description |
+|---|---|
+| `result.json` | Main result payload |
+| `config.json` | Configuration snapshot |
+| `graph_stats.json` | Graph diagnostics, where applicable |
+| `history.json` | Training and validation history, where applicable |
+
+### 06.3 / GRAPH DIAGNOSTICS
+
+| Metric | Description |
+|---|---|
+| `nodes` | Number of graph nodes |
+| `edges` | Number of graph edges |
+| `density` | Graph density |
+| `homophily` | Feature similarity measure |
+| `graph_mode` | Graph construction mode |
+| `graph_embed` | Embedding method |
 
 ---
 
-### **7.4 Backtesting Metrics**
+## 07 / EVALUATION PIPELINE
 
-- Sharpe ratio  
-- Hit rate  
-- Trade returns  
-- Equity curve  
-
----
-
-## **8. Evaluation Pipeline**
-
-Evaluation is structured as a multi-layer system.
-
-### **8.1 Dense Metrics**
-
-- Accuracy  
-- F1 (positive class)  
-- F1 (macro)  
-- ROC-AUC  
-- Average Precision  
-
----
-
-### **8.2 Trade-Aligned Metrics**
-
-Computed only on executed trades:
-
-- Accuracy  
-- Macro F1  
-- Sharpe ratio  
-- Hit rate  
-
----
-
-### **8.3 Strategy Metrics**
-
-- Equity curve  
-- Drawdown  
-- Return distribution  
-
----
-
-### **8.4 Evaluation Interface**
+Main interface:
 
 ```python
 EvaluationMethods.evaluate(...)
 ```
 
+Evaluation computes:
+
+```text
+dense classification metrics
+threshold diagnostics
+trade-aligned metrics
+backtesting metrics
+visual diagnostics for GUI runs
+```
+
+### 07.1 / DENSE METRICS
+
+```text
+Accuracy
+F1, positive class
+F1, macro
+ROC-AUC
+Average precision
+Dense validation loss
+```
+
+### 07.2 / THRESHOLD DIAGNOSTICS
+
+The system reports:
+
+```text
+fixed threshold performance, usually 0.500
+best dense macro-F1 threshold
+```
+
+### 07.3 / TRADE-ALIGNED METRICS
+
+Computed only on executed trades:
+
+```text
+Accuracy
+F1, positive class
+F1, macro
+ROC-AUC
+Average precision
+Number of trades
+Hit rate
+Mean trade return
+```
+
+### 07.4 / STRATEGY METRICS
+
+```text
+Sharpe ratio
+Final equity
+Maximum drawdown
+Trade returns
+Equity curve
+```
+
 ---
 
-## **9. Backtesting Engine**
+## 08 / BACKTESTING ASSUMPTIONS
 
-Key assumptions:
-
-|              Rule | Description    |
-|-------------------|----------------|
-| `prediction == 1` | Long position  |
+| Rule | Meaning |
+|---|---|
+| `prediction == 1` | Long position |
 | `prediction == 0` | Short position |
 
-### **Features**
+Backtesting is designed around:
 
-- Non-overlapping trades  
-- Horizon-aligned execution  
-- Transaction costs  
-- Annualised Sharpe calculation  
-- Trade-aligned evaluation  
+```text
+non-overlapping trades
+horizon-aligned execution
+transaction cost support
+annualised Sharpe calculation
+trade-aligned evaluation
+```
+
+---
+
+## 09 / EXPERIMENTAL WORKFLOW
+
+```text
+01 smoke test
+02 LSTM / GRU baseline
+03 panel baseline
+04 STGNN
+05 graph ablation
+06 feature ablation
+07 embedding ablation
+08 multi-seed sweep
+09 aggregate results
+```
+
+Commands are formatted for PowerShell.
 
 ---
 
-## **10. Experimental Workflow**
+## 09.1 / SMOKE TEST
 
-Recommended sequence:
+Purpose: verify the full headless pipeline end to end.
 
-1. Smoke test  
-2. LSTM / GRU baseline  
-3. Panel baseline  
-4. STGNN  
-5. Graph ablation  
-6. Feature ablation  
-7. Embedding ablation  
-8. Multi-seed sweep  
-9. Aggregate results  
+```powershell
+python -m core.main `
+  --run_mode headless `
+  --model lstm `
+  --target_stock AAPL `
+  --dataset_name custom `
+  --custom_tickers AAPL MSFT NVDA `
+  --prediction_window 1d `
+  --interval 1h `
+  --seq_len 8 `
+  --batch_size 16 `
+  --lstm_epochs 2 `
+  --save_results `
+  --results_dir ./results_smoke `
+  --experiment_name "smoke_lstm" `
+  --seed 42
+```
 
 ---
+
+## 09.2 / LSTM / GRU BASELINE
+
+Purpose: establish single-asset temporal baselines.
+
+### LSTM
+
+```powershell
+python -m core.main `
+  --run_mode headless `
+  --model lstm `
+  --target_stock AAPL `
+  --dataset_name custom `
+  --custom_tickers AAPL MSFT NVDA `
+  --prediction_window 1d `
+  --interval 1h `
+  --seq_len 8 `
+  --batch_size 16 `
+  --lstm_epochs 5 `
+  --save_results `
+  --results_dir ./results_baselines `
+  --experiment_name "baseline_lstm_seed42" `
+  --seed 42
+```
+
+### GRU
+
+```powershell
+python -m core.main `
+  --run_mode headless `
+  --model gru `
+  --target_stock AAPL `
+  --dataset_name custom `
+  --custom_tickers AAPL MSFT NVDA `
+  --prediction_window 1d `
+  --interval 1h `
+  --seq_len 8 `
+  --batch_size 16 `
+  --lstm_epochs 5 `
+  --save_results `
+  --results_dir ./results_baselines `
+  --experiment_name "baseline_gru_seed42" `
+  --seed 42
+```
+
+> `--lstm_epochs` is used by both LSTM and GRU recurrent runners.
+
+---
+
+## 09.3 / PANEL BASELINE
+
+Purpose: test multi-asset temporal context without explicit graph structure.
+
+### Panel LSTM
+
+```powershell
+python -m core.main `
+  --run_mode headless `
+  --model panel_lstm `
+  --target_stock AAPL `
+  --dataset_name custom `
+  --custom_tickers AAPL MSFT NVDA `
+  --prediction_window 1d `
+  --interval 1h `
+  --seq_len 8 `
+  --batch_size 16 `
+  --lstm_epochs 5 `
+  --save_results `
+  --results_dir ./results_panel `
+  --experiment_name "panel_lstm_seed42" `
+  --seed 42
+```
+
+### Panel GRU
+
+```powershell
+python -m core.main `
+  --run_mode headless `
+  --model panel_gru `
+  --target_stock AAPL `
+  --dataset_name custom `
+  --custom_tickers AAPL MSFT NVDA `
+  --prediction_window 1d `
+  --interval 1h `
+  --seq_len 8 `
+  --batch_size 16 `
+  --lstm_epochs 5 `
+  --save_results `
+  --results_dir ./results_panel `
+  --experiment_name "panel_gru_seed42" `
+  --seed 42
+```
+
+---
+
+## 09.4 / STGNN
+
+Purpose: test joint temporal and graph-aware modelling.
+
+```powershell
+python -m core.main `
+  --run_mode headless `
+  --model stgnn `
+  --graph_model gcn `
+  --target_stock AAPL `
+  --dataset_name custom `
+  --custom_tickers AAPL MSFT NVDA `
+  --prediction_window 1d `
+  --interval 1h `
+  --seq_len 8 `
+  --batch_size 16 `
+  --stgnn_epochs 5 `
+  --k 3 `
+  --graph_mode knn_mst `
+  --graph_embed pca `
+  --save_results `
+  --results_dir ./results_stgnn `
+  --experiment_name "stgnn_gcn_seed42" `
+  --seed 42
+```
+
+Alternative backends:
+
+```powershell
+--graph_model gat
+--graph_model graphsage
+--graph_model nnconv
+```
+
+---
+
+## 09.5 / GRAPH ABLATION
+
+Purpose: test whether graph connectivity contributes to performance.
+
+### Full Graph
+
+```powershell
+python -m core.main `
+  --run_mode headless `
+  --model stgnn `
+  --graph_model gcn `
+  --graph_ablation none `
+  --target_stock AAPL `
+  --dataset_name custom `
+  --custom_tickers AAPL MSFT NVDA `
+  --prediction_window 1d `
+  --interval 1h `
+  --seq_len 8 `
+  --batch_size 16 `
+  --stgnn_epochs 5 `
+  --k 3 `
+  --graph_mode knn_mst `
+  --graph_embed pca `
+  --save_results `
+  --results_dir ./results_graph_ablation `
+  --experiment_name "graph_ablation_none_seed42" `
+  --seed 42
+```
+
+### Identity Graph
+
+```powershell
+python -m core.main `
+  --run_mode headless `
+  --model stgnn `
+  --graph_model gcn `
+  --graph_ablation identity `
+  --target_stock AAPL `
+  --dataset_name custom `
+  --custom_tickers AAPL MSFT NVDA `
+  --prediction_window 1d `
+  --interval 1h `
+  --seq_len 8 `
+  --batch_size 16 `
+  --stgnn_epochs 5 `
+  --k 3 `
+  --graph_mode knn_mst `
+  --graph_embed pca `
+  --save_results `
+  --results_dir ./results_graph_ablation `
+  --experiment_name "graph_ablation_identity_seed42" `
+  --seed 42
+```
+
+### Empty Graph
+
+```powershell
+python -m core.main `
+  --run_mode headless `
+  --model stgnn `
+  --graph_model gcn `
+  --graph_ablation empty `
+  --target_stock AAPL `
+  --dataset_name custom `
+  --custom_tickers AAPL MSFT NVDA `
+  --prediction_window 1d `
+  --interval 1h `
+  --seq_len 8 `
+  --batch_size 16 `
+  --stgnn_epochs 5 `
+  --k 3 `
+  --graph_mode knn_mst `
+  --graph_embed pca `
+  --save_results `
+  --results_dir ./results_graph_ablation `
+  --experiment_name "graph_ablation_empty_seed42" `
+  --seed 42
+```
+
+---
+
+## 09.6 / FEATURE ABLATION
+
+Purpose: test which engineered node features contribute to prediction.
+
+### Remove Returns
+
+```powershell
+python -m core.main `
+  --run_mode headless `
+  --model stgnn `
+  --graph_model gcn `
+  --target_stock AAPL `
+  --dataset_name custom `
+  --custom_tickers AAPL MSFT NVDA `
+  --prediction_window 1d `
+  --interval 1h `
+  --seq_len 8 `
+  --batch_size 16 `
+  --stgnn_epochs 5 `
+  --k 3 `
+  --graph_mode knn_mst `
+  --graph_embed pca `
+  --ablate_feature return `
+  --save_results `
+  --results_dir ./results_feature_ablation `
+  --experiment_name "feature_ablation_return_seed42" `
+  --seed 42
+```
+
+### Remove Volatility
+
+```powershell
+python -m core.main `
+  --run_mode headless `
+  --model stgnn `
+  --graph_model gcn `
+  --target_stock AAPL `
+  --dataset_name custom `
+  --custom_tickers AAPL MSFT NVDA `
+  --prediction_window 1d `
+  --interval 1h `
+  --seq_len 8 `
+  --batch_size 16 `
+  --stgnn_epochs 5 `
+  --k 3 `
+  --graph_mode knn_mst `
+  --graph_embed pca `
+  --ablate_feature volatility `
+  --save_results `
+  --results_dir ./results_feature_ablation `
+  --experiment_name "feature_ablation_volatility_seed42" `
+  --seed 42
+```
+
+### Remove Momentum
+
+```powershell
+python -m core.main `
+  --run_mode headless `
+  --model stgnn `
+  --graph_model gcn `
+  --target_stock AAPL `
+  --dataset_name custom `
+  --custom_tickers AAPL MSFT NVDA `
+  --prediction_window 1d `
+  --interval 1h `
+  --seq_len 8 `
+  --batch_size 16 `
+  --stgnn_epochs 5 `
+  --k 3 `
+  --graph_mode knn_mst `
+  --graph_embed pca `
+  --ablate_feature momentum `
+  --save_results `
+  --results_dir ./results_feature_ablation `
+  --experiment_name "feature_ablation_momentum_seed42" `
+  --seed 42
+```
+
+---
+
+## 09.7 / EMBEDDING ABLATION
+
+Purpose: compare PCA-based graph construction against raw feature embeddings.
+
+### PCA Embedding
+
+```powershell
+python -m core.main `
+  --run_mode headless `
+  --model stgnn `
+  --graph_model gcn `
+  --target_stock AAPL `
+  --dataset_name custom `
+  --custom_tickers AAPL MSFT NVDA `
+  --prediction_window 1d `
+  --interval 1h `
+  --seq_len 8 `
+  --batch_size 16 `
+  --stgnn_epochs 5 `
+  --k 3 `
+  --graph_mode knn_mst `
+  --graph_embed pca `
+  --save_results `
+  --results_dir ./results_embedding_ablation `
+  --experiment_name "embedding_pca_seed42" `
+  --seed 42
+```
+
+### Raw Embedding
+
+```powershell
+python -m core.main `
+  --run_mode headless `
+  --model stgnn `
+  --graph_model gcn `
+  --target_stock AAPL `
+  --dataset_name custom `
+  --custom_tickers AAPL MSFT NVDA `
+  --prediction_window 1d `
+  --interval 1h `
+  --seq_len 8 `
+  --batch_size 16 `
+  --stgnn_epochs 5 `
+  --k 3 `
+  --graph_mode knn_mst `
+  --graph_embed raw `
+  --save_results `
+  --results_dir ./results_embedding_ablation `
+  --experiment_name "embedding_raw_seed42" `
+  --seed 42
+```
+
+---
+
+## 09.8 / MULTI-SEED SWEEP
+
+Purpose: estimate whether observed differences survive random initialisation.
+
+```powershell
+$seeds = @(42, 43, 44, 45, 46)
+
+foreach ($s in $seeds) {
+  python -m core.main `
+    --run_mode headless `
+    --model stgnn `
+    --graph_model gcn `
+    --target_stock AAPL `
+    --dataset_name custom `
+    --custom_tickers AAPL MSFT NVDA `
+    --prediction_window 1d `
+    --interval 1h `
+    --seq_len 8 `
+    --batch_size 16 `
+    --stgnn_epochs 5 `
+    --k 3 `
+    --graph_mode knn_mst `
+    --graph_embed pca `
+    --save_results `
+    --results_dir ./results_multiseed `
+    --experiment_name "stgnn_gcn_seed_$s" `
+    --seed $s
+}
+```
+
+---
+
+## 09.9 / AGGREGATE RESULTS
+
+Main aggregate files:
+
+```text
+./results_multiseed/runs/experiments.csv
+./results_multiseed/runs/experiments.jsonl
+```
+
+Minimal check:
+
+```powershell
+Get-Content ./results_multiseed/runs/experiments.csv
+```
+
+Load with Python:
+
+```powershell
+python -c "import pandas as pd; df=pd.read_csv('./results_multiseed/runs/experiments.csv'); print(df.head()); print(df.columns.tolist())"
+```
+
+Rank by dense macro-F1:
+
+```powershell
+python -c "import pandas as pd; df=pd.read_csv('./results_multiseed/runs/experiments.csv'); print(df.sort_values('metrics.macro_f1_dense', ascending=False)[['model','ticker','seed','graph_model','metrics.macro_f1_dense','metrics.sharpe','metrics.final_equity']].head(20))"
+```
+
+Inspect columns:
+
+```powershell
+python -c "import pandas as pd; df=pd.read_csv('./results_multiseed/runs/experiments.csv'); print('\n'.join(df.columns))"
+```
+
+---
+
+## 10 / VERIFICATION ORDER
+
+Use short runs first:
+
+```text
+epochs = 2
+tickers = AAPL MSFT NVDA
+seq_len = 8
+interval = 1h
+prediction_window = 1d
+```
+
+Recommended order:
+
+```text
+01 lstm
+02 gru
+03 panel_lstm
+04 panel_gru
+05 gcn
+06 gat
+07 graphsage
+08 nnconv
+09 stgnn --graph_model gcn
+10 stgnn --graph_model gat
+11 stgnn --graph_model graphsage
+12 stgnn --graph_model nnconv
+```
+
+---
+
+## 11 / SMOKE TEST MATRIX
+
+Run after changes to runners, evaluation, persistence, or graph construction.
+
+```powershell
+$baseModels = @(
+  "lstm",
+  "gru",
+  "panel_lstm",
+  "panel_gru",
+  "gcn",
+  "gat",
+  "graphsage",
+  "nnconv"
+)
+
+foreach ($m in $baseModels) {
+  Write-Host "RUNNING $m"
+
+  python -m core.main `
+    --run_mode headless `
+    --model $m `
+    --target_stock AAPL `
+    --dataset_name custom `
+    --custom_tickers AAPL MSFT NVDA `
+    --prediction_window 1d `
+    --interval 1h `
+    --seq_len 8 `
+    --batch_size 16 `
+    --stgnn_epochs 2 `
+    --lstm_epochs 2 `
+    --save_results `
+    --results_dir ./results_smoke `
+    --experiment_name "smoke_$m" `
+    --seed 42
+}
+
+$graphModels = @(
+  "gcn",
+  "gat",
+  "graphsage",
+  "nnconv"
+)
+
+foreach ($gm in $graphModels) {
+  Write-Host "RUNNING STGNN + $gm"
+
+  python -m core.main `
+    --run_mode headless `
+    --model stgnn `
+    --graph_model $gm `
+    --target_stock AAPL `
+    --dataset_name custom `
+    --custom_tickers AAPL MSFT NVDA `
+    --prediction_window 1d `
+    --interval 1h `
+    --seq_len 8 `
+    --batch_size 16 `
+    --stgnn_epochs 2 `
+    --save_results `
+    --results_dir ./results_smoke `
+    --experiment_name "smoke_stgnn_$gm" `
+    --seed 42
+}
+```
+
+---
+
+## 12 / INTERPRETATION NOTES
+
+Do **not** evaluate this framework on raw accuracy alone.
+
+Compare:
+
+```text
+dense classification metrics
+trade-aligned metrics
+strategy metrics
+graph diagnostics
+compute cost
+stability across seeds
+```
+
+A graph-aware model is only meaningfully better when it improves performance under comparable:
+
+```text
+data
+features
+target
+seed
+training conditions
+```
+
+One strong run is not evidence.
+
+Prefer:
+
+```text
+multi-seed comparisons
+ablations
+controlled baselines
+```
