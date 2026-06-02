@@ -6,6 +6,42 @@
 
 ---
 
+## QUICK START
+
+Install from a terminal with Git and a Python virtual environment.
+
+```powershell
+git clone https://github.com/rio-mc/STGNNStockMarket.git
+cd STGNNStockMarket
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
+```
+
+Install one PyTorch stack.
+
+CPU:
+
+```powershell
+python -m pip install -r requirements-local-cpu.txt `
+  --index-url https://download.pytorch.org/whl/cpu
+python -m pip install torch-geometric
+```
+
+Windows GPU:
+
+```powershell
+python -m pip install -r requirements-local-cu121.txt `
+  --index-url https://download.pytorch.org/whl/cu121
+python -m pip install pyg-lib torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geometric `
+  -f https://data.pyg.org/whl/torch-2.2.2+cu121.html
+```
+
+See [INSTALL.md](INSTALL.md) for the full setup and verification guide.
+
+---
+
 ## 01 / OBJECTIVE
 
 This project is **not** about collecting models.

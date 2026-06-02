@@ -1,18 +1,18 @@
 # Installation Guide
 
-This project supports three install paths:
+This project is intended to be installed directly from a terminal into a Python
+virtual environment.
 
 ```text
-Option A: Docker GPU        Recommended for reproducible GPU experiments
-Option B: Local Windows GPU Manual install with CUDA-enabled PyTorch
-Option C: Local CPU         No NVIDIA GPU required
+Option A: Local CPU         No NVIDIA GPU required
+Option B: Local Windows GPU CUDA-enabled PyTorch
 ```
+
+Do not install both CPU and GPU Torch stacks into the same environment.
 
 ---
 
 ## 1. Requirements
-
-### General
 
 ```text
 Python 3.12
@@ -20,207 +20,87 @@ Git
 PowerShell
 ```
 
-### For Docker GPU
-
-```text
-Docker Desktop
-WSL 2
-NVIDIA GPU driver
-NVIDIA GPU with Docker access
-```
-
-### For Local GPU
+For GPU runs, you also need:
 
 ```text
 NVIDIA GPU
 Recent NVIDIA driver
-Python 3.12 virtual environment
 ```
 
 ---
 
-## 2. Dependency Files
+## 2. Clone From GitHub
 
-The project separates dependencies by environment.
-
-```text
-requirements.txt              Shared app dependencies, no Torch
-requirements-docker.txt       Docker-only PyG packages, no Torch
-requirements-local-cu121.txt  Local Windows GPU Torch stack
-requirements-local-cpu.txt    Local CPU Torch stack
+```powershell
+git clone https://github.com/rio-mc/STGNNStockMarket.git
+cd STGNNStockMarket
 ```
 
-Do not install all requirement files at once.
+If you already cloned the repository:
+
+```powershell
+git pull
+```
 
 ---
 
-## 3. Option A: Docker GPU
-
-This is the recommended path for reproducible experiments.
-
-Docker uses a PyTorch base image:
-
-```dockerfile
-FROM pytorch/pytorch:2.9.0-cuda12.8-cudnn9-runtime
-```
-
-That image already includes:
-
-```text
-Python
-PyTorch
-CUDA runtime
-cuDNN
-```
-
-Because of this, Docker should not install `torch` from a requirements file.
-
-### 3.1 Verify Docker
-
-```powershell
-docker --version
-docker info
-```
-
-### 3.2 Verify GPU access from Docker
-
-```powershell
-docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu22.04 nvidia-smi
-```
-
-This should show your NVIDIA GPU.
-
-### 3.3 Build the image
+## 3. Create And Activate A Virtual Environment
 
 Run from the project root:
 
 ```powershell
-docker build -t stgnn-gpu .
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 ```
 
-### 3.4 Verify PyTorch CUDA
+Upgrade the installer tools:
 
 ```powershell
-docker run --rm --gpus all stgnn-gpu python -c "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+python -m pip install --upgrade pip setuptools wheel
 ```
 
-Expected:
+---
+
+## 4. Dependency Files
+
+The project separates shared dependencies from the PyTorch stack.
 
 ```text
-torch.cuda.is_available() -> True
+requirements.txt              Shared app dependencies, no Torch
+requirements-local-cpu.txt    Local CPU Torch stack
+requirements-local-cu121.txt  Local Windows GPU Torch stack
 ```
 
-### 3.5 Verify PyTorch Geometric
-
-```powershell
-docker run --rm --gpus all stgnn-gpu python -c "import torch_geometric; import torch_scatter; import torch_sparse; print('PyG OK')"
-```
-
-### 3.6 Run a smoke test
-
-```powershell
-docker run --rm --gpus all stgnn-gpu python -m core.main `
-  --run_mode headless `
-  --model lstm `
-  --target_stock AAPL `
-  --dataset_name custom `
-  --custom_tickers AAPL MSFT NVDA `
-  --prediction_window 1d `
-  --interval 1h `
-  --seq_len 8 `
-  --batch_size 16 `
-  --lstm_epochs 2 `
-  --save_results `
-  --results_dir ./results_smoke `
-  --experiment_name "docker_smoke_lstm" `
-  --seed 42
-```
-
----
-
-## 4. Option B: Local Windows GPU
-
-Use this if you want to run directly on Windows without Docker.
-
-### 4.1 Create virtual environment
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-### 4.2 Upgrade installer tools
-
-```powershell
-python -m pip install --upgrade pip setuptools wheel
-```
-
-### 4.3 Install shared dependencies
+Install `requirements.txt` first, then install exactly one Torch stack.
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-### 4.4 Install PyTorch GPU stack
-
-```powershell
-python -m pip install -r requirements-local-cu121.txt `
-  --index-url https://download.pytorch.org/whl/cu121
-```
-
-### 4.5 Install PyTorch Geometric GPU packages
-
-```powershell
-python -m pip install pyg-lib torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geometric `
-  -f https://data.pyg.org/whl/torch-2.2.2+cu121.html
-```
-
-### 4.6 Verify local GPU install
-
-```powershell
-python -c "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
-```
-
-### 4.7 Verify PyG
-
-```powershell
-python -c "import torch_geometric; import torch_scatter; import torch_sparse; print('PyG OK')"
-```
-
 ---
 
-## 5. Option C: Local CPU
+## 5. Option A: Local CPU
 
-Use this if no NVIDIA GPU is available.
-
-### 5.1 Create virtual environment
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-### 5.2 Install shared dependencies
-
-```powershell
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
-```
-
-### 5.3 Install CPU PyTorch
+Use this path if no NVIDIA GPU is available.
 
 ```powershell
 python -m pip install -r requirements-local-cpu.txt `
   --index-url https://download.pytorch.org/whl/cpu
 ```
 
-### 5.4 Verify CPU install
+Install PyTorch Geometric:
+
+```powershell
+python -m pip install torch-geometric
+```
+
+Verify the install:
 
 ```powershell
 python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
 ```
 
-Expected:
+Expected CUDA result:
 
 ```text
 False
@@ -228,94 +108,45 @@ False
 
 ---
 
-## 6. Common Docker Issues
+## 6. Option B: Local Windows GPU
 
-### Docker command not found
+Use this path if you have an NVIDIA GPU and want CUDA acceleration.
 
-Docker Desktop is not installed or not on PATH.
-
-```powershell
-winget install -e --id Docker.DockerDesktop
-```
-
-Restart Windows after installation.
-
-### WSL must be updated
-
-Run:
+Install the CUDA-enabled PyTorch stack:
 
 ```powershell
-wsl --update
-wsl --shutdown
+python -m pip install -r requirements-local-cu121.txt `
+  --index-url https://download.pytorch.org/whl/cu121
 ```
 
-Restart Docker Desktop.
-
-### Docker daemon not running
-
-Start Docker Desktop manually, then check:
+Install PyTorch Geometric GPU packages:
 
 ```powershell
-docker info
+python -m pip install pyg-lib torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geometric `
+  -f https://data.pyg.org/whl/torch-2.2.2+cu121.html
 ```
 
-### GPU not visible in Docker
-
-Test:
+Verify CUDA:
 
 ```powershell
-docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu22.04 nvidia-smi
+python -c "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
 ```
 
-If this fails, update the NVIDIA driver and restart Docker Desktop.
-
----
-
-## 7. Common Python Issues
-
-### Do not mix Docker and local Torch files
-
-Docker gets Torch from the Docker image.
-
-Local installs get Torch from local requirement files.
-
-Do not run this inside the Docker image:
-
-```powershell
-python -m pip install -r requirements-local-cu121.txt
-```
-
-### Do not install every requirements file
-
-Correct:
+Expected CUDA result:
 
 ```text
-Docker:
-  requirements.txt
-  requirements-docker.txt
-
-Local GPU:
-  requirements.txt
-  requirements-local-cu121.txt
-  PyG wheel command
-
-Local CPU:
-  requirements.txt
-  requirements-local-cpu.txt
+True
 ```
 
-Incorrect:
+Verify PyTorch Geometric:
 
-```text
-pip install -r requirements.txt
-pip install -r requirements-docker.txt
-pip install -r requirements-local-cu121.txt
-pip install -r requirements-local-cpu.txt
+```powershell
+python -c "import torch_geometric; print('PyG OK')"
 ```
 
 ---
 
-## 8. Recommended First Run
+## 7. Recommended First Run
 
 Use a small configuration first:
 
@@ -374,10 +205,55 @@ python -m core.main `
 
 ---
 
-## 9. Rule of Thumb
+## 8. Common Python Issues
+
+### PowerShell blocks Activate.ps1
+
+If activation is blocked by execution policy, run:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+Then activate the venv again:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+### Wrong Python version
+
+Check the interpreter before installing dependencies:
+
+```powershell
+python --version
+where python
+```
+
+Use Python 3.12 for this project.
+
+### Multiple Torch stacks installed
+
+If you accidentally installed both CPU and GPU Torch packages, recreate the
+virtual environment:
+
+```powershell
+deactivate
+Remove-Item -Recurse -Force .venv
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
+```
+
+Then install either the CPU stack or the GPU stack, not both.
+
+---
+
+## 9. Rule Of Thumb
 
 ```text
-Docker owns Docker Torch.
-Local owns local Torch.
-Never install two Torch stacks into the same environment.
+One repository clone.
+One virtual environment.
+One Torch stack.
 ```
