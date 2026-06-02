@@ -20,30 +20,6 @@ python -m pip install -r requirements.txt
 ```
 
 Install one PyTorch stack.
-
-CPU:
-
-```powershell
-python -m pip install -r requirements-local-cpu.txt `
-  --index-url https://download.pytorch.org/whl/cpu
-python -m pip install torch-geometric
-```
-
-Windows GPU:
-
-```powershell
-# Choose the CUDA wheel family for the user's GPU/driver.
-# RTX 50-series example:
-$CUDA_WHEEL = "cu130"
-$TORCH_REQ = "requirements-local-cu130.txt"
-$PYG_TAG = "torch-2.11.0+cu130"
-
-python -m pip install -r $TORCH_REQ `
-  --index-url "https://download.pytorch.org/whl/$CUDA_WHEEL"
-python -m pip install torch_geometric pyg_lib `
-  -f "https://data.pyg.org/whl/$PYG_TAG.html"
-```
-
 See [INSTALL.md](INSTALL.md) for the full setup and verification guide.
 
 ---
