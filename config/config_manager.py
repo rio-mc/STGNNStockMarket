@@ -24,6 +24,13 @@ class ConfigManager:
             help="Execution mode: launch GUI or run a single headless experiment"
         )
         parser.add_argument(
+            "--device",
+            type=str,
+            default="auto",
+            choices=["auto", "cpu", "cuda"],
+            help="Compute device. 'auto' uses CUDA only when the installed PyTorch build supports the GPU."
+        )
+        parser.add_argument(
             "--target_stock",
             type=str,
             default=None,

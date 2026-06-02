@@ -1,6 +1,7 @@
 import gc
 import logging
 import os
+import signal
 import threading
 from datetime import datetime
 
@@ -51,7 +52,6 @@ class MainApp:
     """
 
     def __init__(self):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.args = ConfigManager.parseArgs()
 
         self.args.base_seed = getattr(self.args, "base_seed", 42)
@@ -84,6 +84,12 @@ class MainApp:
 
         if not self.logger.handlers:
             self.logger.addHandler(handler)
+
+        self.device = Utils.resolve_device(
+            getattr(self.args, "device", "auto"),
+            logger=self.logger,
+        )
+        self.logger.info("[Device] Using device=%s", self.device)
 
         self.universe_service = UniverseService()
         self.price_loader_registry = PriceLoaderRegistry()
@@ -118,6 +124,7 @@ class MainApp:
         self.frontendApp.setQueueRunCallback(self.run_queue)
         self.frontendApp.setQueueRemoveCallback(self.remove_job_at)
         self.frontendApp.setQueueClearCallback(self.clear_queue)
+        self.frontendApp.setCloseCallback(self.shutdown)
 
         if run_mode == "headless":
             self.frontendApp.root.withdraw()
@@ -307,10 +314,45 @@ class MainApp:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def shutdown(self) -> None:
+        self.logger.info("[Shutdown] Stopping workers and closing GUI")
+        self.queue_stop_event.set()
+        self.pipeline_running = False
+
+        try:
+            if hasattr(self, "frontendApp") and self.frontendApp is not None:
+                self.frontendApp.stop_event.set()
+        except Exception:
+            pass
+
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def _request_gui_close(self, *_args) -> None:
+        try:
+            if hasattr(self, "frontendApp") and self.frontendApp is not None:
+                self.frontendApp._on_close()
+            else:
+                self.shutdown()
+        except Exception:
+            self.shutdown()
+
     def _run_single_job(self, job: QueueJob):
         prev_model = self.args.model
         prev_seed = self.args.seed
         prev_graph_model = getattr(self.args, "graph_model", "gcn")
+        prev_k = getattr(self.args, "k", 3)
+        prev_graph_mode = getattr(self.args, "graph_mode", "knn_mst")
+        prev_graph_embed = getattr(self.args, "graph_embed", "pca")
+        prev_graph_ablation = getattr(self.args, "graph_ablation", "none")
+        prev_ablate_feature = getattr(self.args, "ablate_feature", "none")
+        prev_seq_len = getattr(self.args, "seq_len", 10)
+        prev_batch_size = getattr(self.args, "batch_size", 256)
+        prev_lstm_epochs = getattr(self.args, "lstm_epochs", 200)
+        prev_stgnn_epochs = getattr(self.args, "stgnn_epochs", 200)
         prev_job_id = self._active_queue_job_id
         prev_queue_run_id = self._active_queue_run_id
 
@@ -318,6 +360,16 @@ class MainApp:
             self.args.model = str(job.model).strip().lower()
             self.args.seed = int(job.seed)
             self.args.graph_model = str(job.graph_model).strip().lower()
+            self.args.k = int(job.k)
+            self.args.graph_mode = str(job.graph_mode).strip().lower()
+            self.args.graph_embed = str(job.graph_embed).strip().lower()
+            self.args.graph_ablation = str(job.graph_ablation).strip().lower()
+            self.args.ablate_feature = str(job.ablate_feature).strip().lower()
+            self.args.seq_len = int(job.seq_len)
+            self.args.graph_window = int(job.seq_len)
+            self.args.batch_size = int(job.batch_size)
+            self.args.lstm_epochs = int(job.lstm_epochs)
+            self.args.stgnn_epochs = int(job.stgnn_epochs)
             self._active_queue_job_id = job.job_id
 
             self._set_all_seeds(self.args.seed)
@@ -332,22 +384,61 @@ class MainApp:
 
             if hasattr(self.frontendApp, "seedVar"):
                 self.frontendApp.ui_call(self.frontendApp.seedVar.set, str(self.args.seed))
+            if hasattr(self.frontendApp, "kVar"):
+                self.frontendApp.ui_call(self.frontendApp.kVar.set, str(self.args.k))
+                self.frontendApp.ui_call(self.frontendApp.graphModeVar.set, self.args.graph_mode)
+                self.frontendApp.ui_call(self.frontendApp.graphEmbedVar.set, self.args.graph_embed)
+                self.frontendApp.ui_call(self.frontendApp.graphAblationVar.set, self.args.graph_ablation)
+                self.frontendApp.ui_call(self.frontendApp.ablateFeatureVar.set, self.args.ablate_feature)
+                self.frontendApp.ui_call(self.frontendApp.seqLenVar.set, str(self.args.seq_len))
+                self.frontendApp.ui_call(self.frontendApp.batchSizeVar.set, str(self.args.batch_size))
+                self.frontendApp.ui_call(self.frontendApp.lstmEpochsVar.set, str(self.args.lstm_epochs))
+                self.frontendApp.ui_call(self.frontendApp.stgnnEpochsVar.set, str(self.args.stgnn_epochs))
 
             self.startPipeline(job.prediction_window, job.ticker, self.queue_stop_event)
         finally:
             self.args.model = prev_model
             self.args.seed = prev_seed
             self.args.graph_model = prev_graph_model
+            self.args.k = prev_k
+            self.args.graph_mode = prev_graph_mode
+            self.args.graph_embed = prev_graph_embed
+            self.args.graph_ablation = prev_graph_ablation
+            self.args.ablate_feature = prev_ablate_feature
+            self.args.seq_len = prev_seq_len
+            self.args.graph_window = prev_seq_len
+            self.args.batch_size = prev_batch_size
+            self.args.lstm_epochs = prev_lstm_epochs
+            self.args.stgnn_epochs = prev_stgnn_epochs
             self._active_queue_job_id = prev_job_id
             self._active_queue_run_id = prev_queue_run_id
 
-    def _load_data_and_start_gui(self):
+    def _apply_frontend_experiment_controls(self) -> None:
+        if not hasattr(self.frontendApp, "export_experiment_controls"):
+            return
+
+        controls = self.frontendApp.export_experiment_controls()
+        if hasattr(self.frontendApp, "graphModelVar"):
+            self.args.graph_model = str(self.frontendApp.graphModelVar.get()).strip().lower()
+        self.args.k = int(controls["k"])
+        self.args.graph_mode = str(controls["graph_mode"])
+        self.args.graph_embed = str(controls["graph_embed"])
+        self.args.graph_ablation = str(controls["graph_ablation"])
+        self.args.ablate_feature = str(controls["ablate_feature"])
+        self.args.seq_len = int(controls["seq_len"])
+        self.args.graph_window = int(controls["seq_len"])
+        self.args.batch_size = int(controls["batch_size"])
+        self.args.lstm_epochs = int(controls["lstm_epochs"])
+        self.args.stgnn_epochs = int(controls["stgnn_epochs"])
+
+    def _refresh_raw_feature_cols_from_ablation(self) -> None:
         engineered = ["return", "volatility", "momentum"]
-
-        if self.args.ablate_feature != "none":
+        if getattr(self.args, "ablate_feature", "none") != "none":
             engineered = [f for f in engineered if f != self.args.ablate_feature]
-
         self.raw_feature_cols = ["close"] + engineered
+
+    def _load_data_and_start_gui(self):
+        self._refresh_raw_feature_cols_from_ablation()
 
         self.logger.info(
             f"[Ablation] ablate_feature={self.args.ablate_feature} | "
@@ -448,15 +539,15 @@ class MainApp:
         text = str(text)
         usable = width - 4
         if len(text) > usable:
-            text = text[: usable - 1] + "…"
-        return "║ " + text.ljust(usable) + " ║"
+            text = text[: usable - 3] + "..."
+        return "| " + text.ljust(usable) + " |"
 
     def _box_rule(self, kind="middle", width=96):
         if kind == "top":
-            return "╔" + ("═" * (width - 2)) + "╗"
+            return "+" + ("-" * (width - 2)) + "+"
         if kind == "bottom":
-            return "╚" + ("═" * (width - 2)) + "╝"
-        return "╠" + ("═" * (width - 2)) + "╣"
+            return "+" + ("-" * (width - 2)) + "+"
+        return "+" + ("-" * (width - 2)) + "+"
 
     def _metrics_dict(self, metrics):
         if not metrics:
@@ -701,6 +792,15 @@ class MainApp:
             "seed": int(self.args.seed),
             "graph_backend": graph_backend,
             "graph_model": record_graph_model or None,
+            "k": int(getattr(self.args, "k", 0)),
+            "graph_mode": str(getattr(self.args, "graph_mode", "unknown")),
+            "graph_embed": str(getattr(self.args, "graph_embed", "unknown")),
+            "graph_ablation": str(getattr(self.args, "graph_ablation", "none")),
+            "ablate_feature": str(getattr(self.args, "ablate_feature", "none")),
+            "seq_len": int(getattr(self.args, "seq_len", 0)),
+            "batch_size": int(getattr(self.args, "batch_size", 0)),
+            "lstm_epochs": int(getattr(self.args, "lstm_epochs", 0)),
+            "stgnn_epochs": int(getattr(self.args, "stgnn_epochs", 0)),
             "direction": str(getattr(result, "direction", "")) if result is not None else "",
             "confidence": float(getattr(result, "confidence", 0.0)) if result is not None else 0.0,
             "metrics": metrics_payload,
@@ -797,6 +897,7 @@ class MainApp:
             k=int(getattr(self.args, "k", 0)),
             graph_mode=str(getattr(self.args, "graph_mode", "unknown")),
             graph_embed=str(getattr(self.args, "graph_embed", "unknown")),
+            graph_ablation=str(getattr(self.args, "graph_ablation", "none")),
             ablate_feature=str(getattr(self.args, "ablate_feature", "none")),
             threshold_policy=str(getattr(self.args, "decision_threshold_policy", "fixed")),
             direction=str(getattr(result, "direction", "")) if result is not None else "",
@@ -834,6 +935,9 @@ class MainApp:
 
         try:
             self.args.model = selected_model
+            if self._active_queue_job_id is None:
+                self._apply_frontend_experiment_controls()
+            self._refresh_raw_feature_cols_from_ablation()
 
             self.frontendApp.root.after(
                 0,
@@ -842,10 +946,7 @@ class MainApp:
 
             self.logger.info("[ModelSelection] %s", selected_model)
 
-            use_headless_evaluator = (
-                self._active_queue_job_id is not None
-                or threading.current_thread() is not threading.main_thread()
-            )
+            use_headless_evaluator = self._active_queue_job_id is not None
             if use_headless_evaluator:
                 evaluator = HeadlessEvaluator()
             else:
@@ -946,7 +1047,24 @@ class MainApp:
         if run_mode == "gui":
             self.logger.info("[RunMode] Starting GUI mode")
             threading.Thread(target=self._load_data_and_start_gui, daemon=True).start()
-            self.frontendApp.root.mainloop()
+            previous_sigint = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, self._request_gui_close)
+
+            def _poll_sigint():
+                try:
+                    if not getattr(self.frontendApp, "_closing", False):
+                        self.frontendApp.root.after(200, _poll_sigint)
+                except Exception:
+                    pass
+
+            self.frontendApp.root.after(200, _poll_sigint)
+            try:
+                self.frontendApp.root.mainloop()
+            except KeyboardInterrupt:
+                self._request_gui_close()
+            finally:
+                signal.signal(signal.SIGINT, previous_sigint)
+                self.shutdown()
             return None
 
         if run_mode == "headless":
@@ -971,6 +1089,7 @@ class MainApp:
 
             print()
             print(self._format_headless_report(result))
+            return result
 
         raise ValueError(
             f"Unknown run_mode '{self.args.run_mode}'. "

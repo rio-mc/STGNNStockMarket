@@ -15,6 +15,7 @@ os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 from config.config_manager import ConfigManager
 from core.experiment_runner import ExperimentRunner, ExperimentResult
 from core.pipeline import Pipeline
+from core.utils.utils import Utils
 from data.dataset_registry import DatasetRegistry
 from data.universe_service import UniverseService
 
@@ -75,7 +76,7 @@ def load_data(args, logger):
 
 def run_experiment(args):
     logger = setup_logging(args)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = Utils.resolve_device(getattr(args, "device", "auto"), logger=logger)
 
     logger.info("=" * 60)
     logger.info("EXPERIMENT START")
@@ -87,7 +88,7 @@ def run_experiment(args):
 
     seed = getattr(args, "seed", 42)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
+    if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
 
     # --- FIX: restore data loading ---

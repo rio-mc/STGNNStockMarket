@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
@@ -11,6 +10,7 @@ from typing import Any, Dict, Optional
 import torch
 
 from core.headless_app import HeadlessEvaluator, HeadlessStateAdapter
+from core.utils.utils import Utils
 from models.registry import ModelRegistry
 
 
@@ -39,7 +39,10 @@ class ExperimentRunner:
             self.frontendApp = getattr(app, "frontendApp", None)
         else:
             self.args = args
-            self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.device = device or Utils.resolve_device(
+                getattr(args, "device", "auto"),
+                logger=self.logger,
+            )
             self.frontendApp = None
 
     def run(self, model_name: str, stock: str, state: Dict[str, Any], evaluator=None, stop_event=None) -> ExperimentResult:
@@ -88,7 +91,7 @@ class ExperimentRunner:
             return True
         if getattr(self.app, "_active_queue_job_id", None) is not None:
             return True
-        return threading.current_thread() is not threading.main_thread()
+        return False
 
     def _make_runner_app(self, state: Dict[str, Any], stock: str, force_headless: bool = False):
         if self.app is None or force_headless:

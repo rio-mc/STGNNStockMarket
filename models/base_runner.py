@@ -215,7 +215,7 @@ class BaseModelRunner(ABC):
             "graph_model": graph_backend if model_family == "stgnn" else None,
             "seed": getattr(app.args, "seed", None),
             "universe_id": getattr(app.args, "universe_id", None),
-            "interval": getattr(app.args, "interval", None),
+            "interval": getattr(app.args, "effective_interval", getattr(app.args, "interval", None)),
         }
 
         # Only genuinely graph-aware models should carry graph construction
@@ -241,7 +241,7 @@ class BaseModelRunner(ABC):
             "train_samples": getattr(trainer, "total_samples", None),
             "gpu_peak_memory_mb": (
                 torch.cuda.max_memory_allocated() / (1024 ** 2)
-                if torch.cuda.is_available()
+                if getattr(trainer.device, "type", None) == "cuda"
                 else None
             ),
         })
@@ -365,7 +365,7 @@ class BaseModelRunner(ABC):
     # ------------------------------------------------------------------
 
     def _prepare_memory_logging(self, label: str) -> None:
-        if torch.cuda.is_available():
+        if getattr(getattr(self, "device", None), "type", None) == "cuda":
             torch.cuda.reset_peak_memory_stats()
         Utils.log_gpu_memory(f"Before {label}")
 

@@ -32,10 +32,16 @@ python -m pip install torch-geometric
 Windows GPU:
 
 ```powershell
-python -m pip install -r requirements-local-cu121.txt `
-  --index-url https://download.pytorch.org/whl/cu121
-python -m pip install pyg-lib torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geometric `
-  -f https://data.pyg.org/whl/torch-2.2.2+cu121.html
+# Choose the CUDA wheel family for the user's GPU/driver.
+# RTX 50-series example:
+$CUDA_WHEEL = "cu130"
+$TORCH_REQ = "requirements-local-cu130.txt"
+$PYG_TAG = "torch-2.11.0+cu130"
+
+python -m pip install -r $TORCH_REQ `
+  --index-url "https://download.pytorch.org/whl/$CUDA_WHEEL"
+python -m pip install torch_geometric pyg_lib `
+  -f "https://data.pyg.org/whl/$PYG_TAG.html"
 ```
 
 See [INSTALL.md](INSTALL.md) for the full setup and verification guide.
@@ -929,7 +935,219 @@ foreach ($gm in $graphModels) {
 
 ---
 
-## 12 / INTERPRETATION NOTES
+## 12 / HEADLESS RESULT SUITES
+
+Use these PowerShell templates to generate structured result suites without the
+GUI. Start with the pilot settings, inspect the CSV outputs, then scale up.
+
+Outputs are written under:
+
+```text
+<results_dir>/runs/experiments.csv
+<results_dir>/runs/experiments.jsonl
+<results_dir>/runs/<model>/...
+<results_dir>/graph_logging/...
+```
+
+For queue-style/batch summaries, also inspect:
+
+```text
+<results_dir>/runs/queue_runs/<queue_run_id>/seed_results.csv
+<results_dir>/runs/queue_runs/<queue_run_id>/summary_by_model.csv
+```
+
+### 12.1 / Shared Setup
+
+```powershell
+$DATASET = "sp500"
+$TOP_N = 50
+$SEEDS = 42..46
+$TICKERS = Import-Csv .\static\universes\sp500_tickers.csv |
+  Select-Object -First $TOP_N |
+  ForEach-Object { $_.ticker }
+
+$COMMON = @(
+  "--run_mode", "headless",
+  "--device", "cuda",
+  "--dataset_name", $DATASET,
+  "--top_n", "$TOP_N",
+  "--prediction_window", "1d",
+  "--interval", "1h",
+  "--seq_len", "8",
+  "--batch_size", "16",
+  "--graph_mode", "knn_mst",
+  "--graph_embed", "pca",
+  "--save_results"
+)
+```
+
+Pilot settings:
+
+```powershell
+$TOP_N = 5
+$SEEDS = 42..43
+
+$COMMON += @(
+  "--lstm_epochs", "2",
+  "--stgnn_epochs", "5"
+)
+```
+
+For final runs, use the intended epoch counts and seed range.
+
+### 12.2 / Recurrent Suite
+
+Purpose: temporal baselines without graph message passing.
+
+```powershell
+$MODELS = @("lstm", "gru", "panel_lstm", "panel_gru")
+
+foreach ($model in $MODELS) {
+  foreach ($ticker in $TICKERS) {
+    foreach ($seed in $SEEDS) {
+      python -m core.main @COMMON `
+        --model $model `
+        --target_stock $ticker `
+        --seed $seed `
+        --results_dir ".\results_suites\recurrent"
+    }
+  }
+}
+```
+
+### 12.3 / Static Graph k-Sensitivity Suite
+
+Purpose: isolate the effect of graph neighbourhood density for static graph
+baselines.
+
+```powershell
+$GRAPH_MODELS = @("gcn", "gat", "graphsage", "nnconv")
+$KS = @(1, 3, 5, 10)
+
+foreach ($k in $KS) {
+  foreach ($model in $GRAPH_MODELS) {
+    foreach ($ticker in $TICKERS) {
+      foreach ($seed in $SEEDS) {
+        python -m core.main @COMMON `
+          --model $model `
+          --target_stock $ticker `
+          --seed $seed `
+          --k $k `
+          --results_dir ".\results_suites\graph_k$k"
+      }
+    }
+  }
+}
+```
+
+Keep fixed during this suite:
+
+```text
+dataset
+top_n
+target stocks
+seeds
+prediction_window
+seq_len
+batch_size
+graph_mode = knn_mst
+graph_embed = pca
+```
+
+### 12.4 / STGNN Backend Suite
+
+Purpose: compare temporal + graph integration across graph backends.
+
+```powershell
+$BACKENDS = @("gcn", "gat", "graphsage", "nnconv")
+$K = 3
+
+foreach ($backend in $BACKENDS) {
+  foreach ($ticker in $TICKERS) {
+    foreach ($seed in $SEEDS) {
+      python -m core.main @COMMON `
+        --model "stgnn" `
+        --graph_model $backend `
+        --target_stock $ticker `
+        --seed $seed `
+        --k $K `
+        --results_dir ".\results_suites\stgnn_$backend"
+    }
+  }
+}
+```
+
+### 12.5 / STGNN Ablation Suite
+
+Run this after choosing a candidate backend and `k` from the previous suites.
+
+```powershell
+$BEST_BACKEND = "gcn"
+$BEST_K = 3
+$GRAPH_ABLATIONS = @("none", "identity", "empty")
+
+foreach ($ablation in $GRAPH_ABLATIONS) {
+  foreach ($ticker in $TICKERS) {
+    foreach ($seed in $SEEDS) {
+      python -m core.main @COMMON `
+        --model "stgnn" `
+        --graph_model $BEST_BACKEND `
+        --target_stock $ticker `
+        --seed $seed `
+        --k $BEST_K `
+        --graph_ablation $ablation `
+        --results_dir ".\results_suites\stgnn_ablation_$ablation"
+    }
+  }
+}
+```
+
+Feature ablations should be run separately:
+
+```powershell
+$FEATURE_ABLATIONS = @("return", "volatility", "momentum")
+
+foreach ($feature in $FEATURE_ABLATIONS) {
+  foreach ($ticker in $TICKERS) {
+    foreach ($seed in $SEEDS) {
+      python -m core.main @COMMON `
+        --model "stgnn" `
+        --graph_model $BEST_BACKEND `
+        --target_stock $ticker `
+        --seed $seed `
+        --k $BEST_K `
+        --ablate_feature $feature `
+        --results_dir ".\results_suites\stgnn_feature_ablation_$feature"
+    }
+  }
+}
+```
+
+### 12.6 / Result Checks
+
+Before using a suite in a manuscript, check:
+
+```text
+all expected ticker x seed x model rows are present
+failed rows are explained
+experiments.csv contains k, graph_mode, graph_embed, graph_ablation, ablate_feature
+graph stats exist for graph-aware models
+metric_macro_f1_dense / metric_roc_auc_dense / trade metrics are populated
+energy and train time are populated
+```
+
+Use the suite structure for the results narrative:
+
+```text
+1. recurrent baselines
+2. static graph baselines with k-sensitivity
+3. STGNN backend comparison
+4. STGNN graph and feature ablations
+```
+
+---
+
+## 13 / INTERPRETATION NOTES
 
 Do **not** evaluate this framework on raw accuracy alone.
 

@@ -17,6 +17,15 @@ class QueueJob:
     model: str
     seed: int
     graph_model: str = "gcn"
+    k: int = 3
+    graph_mode: str = "knn_mst"
+    graph_embed: str = "pca"
+    graph_ablation: str = "none"
+    ablate_feature: str = "none"
+    seq_len: int = 10
+    batch_size: int = 256
+    lstm_epochs: int = 200
+    stgnn_epochs: int = 200
 
 
 class JobQueueController:

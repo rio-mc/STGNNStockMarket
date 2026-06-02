@@ -52,6 +52,7 @@ class Pipeline:
         mode = deltas.mode()
         sample_interval = mode.iloc[0] if not mode.empty else deltas.median()
         bars_per_day = max(1, int(pd.Timedelta("1D") / sample_interval))
+        self.args.effective_interval = Utils.infer_interval_label(price_df.index)
 
         horizon = Utils.parse_window(gui_window, bars_per_day)
         seq_len = int(self.args.seq_len)

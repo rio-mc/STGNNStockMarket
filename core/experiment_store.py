@@ -31,6 +31,7 @@ class RunRecord:
     k: int
     graph_mode: str
     graph_embed: str
+    graph_ablation: str
     ablate_feature: str
     threshold_policy: str
 
@@ -310,6 +311,15 @@ class ExperimentStore:
             "model": row.get("model"),
             "seed": row.get("seed"),
             "graph_model": row.get("graph_model"),
+            "k": row.get("k"),
+            "graph_mode": row.get("graph_mode"),
+            "graph_embed": row.get("graph_embed"),
+            "graph_ablation": row.get("graph_ablation"),
+            "ablate_feature": row.get("ablate_feature"),
+            "seq_len": row.get("seq_len"),
+            "batch_size": row.get("batch_size"),
+            "lstm_epochs": row.get("lstm_epochs"),
+            "stgnn_epochs": row.get("stgnn_epochs"),
             "direction": row.get("direction"),
             "confidence": row.get("confidence"),
             "error_message": row.get("error_message"),
@@ -350,17 +360,37 @@ class ExperimentStore:
                 row.get("model"),
                 row.get("graph_model"),
                 row.get("prediction_window"),
+                row.get("k"),
+                row.get("graph_mode"),
+                row.get("graph_embed"),
+                row.get("graph_ablation"),
+                row.get("ablate_feature"),
             )
             grouped.setdefault(key, []).append(row)
 
         out: list[Dict[str, Any]] = []
 
-        for (queue_group, model, graph_model, prediction_window), group_rows in grouped.items():
+        for (
+            queue_group,
+            model,
+            graph_model,
+            prediction_window,
+            k,
+            graph_mode,
+            graph_embed,
+            graph_ablation,
+            ablate_feature,
+        ), group_rows in grouped.items():
             summary: Dict[str, Any] = {
                 "queue_group": queue_group,
                 "model": model,
                 "graph_model": graph_model,
                 "prediction_window": prediction_window,
+                "k": k,
+                "graph_mode": graph_mode,
+                "graph_embed": graph_embed,
+                "graph_ablation": graph_ablation,
+                "ablate_feature": ablate_feature,
                 "n_jobs": len(group_rows),
                 "n_success": sum(1 for r in group_rows if r.get("status") == "success"),
                 "n_failed": sum(1 for r in group_rows if r.get("status") == "failed"),
@@ -488,6 +518,7 @@ class ExperimentStore:
             "k": payload.get("k"),
             "graph_mode": payload.get("graph_mode"),
             "graph_embed": payload.get("graph_embed"),
+            "graph_ablation": payload.get("graph_ablation"),
             "ablate_feature": payload.get("ablate_feature"),
             "threshold_policy": payload.get("threshold_policy"),
             "direction": payload.get("direction"),

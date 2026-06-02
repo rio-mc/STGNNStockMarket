@@ -1,5 +1,6 @@
 import random
 import re
+import warnings
 import numpy as np
 import torch
 import networkx as nx
@@ -9,6 +10,51 @@ from torch.optim import AdamW
 from pathlib import Path
 
 class Utils:
+    @staticmethod
+    def cuda_device_is_usable(logger=None, warn: bool = True) -> bool:
+        if not torch.cuda.is_available():
+            return False
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                major, minor = torch.cuda.get_device_capability(0)
+                device_name = torch.cuda.get_device_name(0)
+                supported_arches = set(torch.cuda.get_arch_list())
+            device_sm = f"sm_{major}{minor}"
+        except Exception as exc:
+            if logger is not None:
+                logger.warning("[Device] CUDA detected but capability check failed: %s", exc)
+            return False
+
+        if device_sm in supported_arches:
+            return True
+
+        message = (
+            f"CUDA device '{device_name}' has capability {device_sm}, but this PyTorch "
+            f"build supports {sorted(supported_arches)}. Falling back to CPU."
+        )
+        if logger is not None:
+            logger.warning("[Device] %s", message)
+        elif warn:
+            warnings.warn(message, RuntimeWarning)
+        return False
+
+    @staticmethod
+    def resolve_device(preferred: str = "auto", logger=None) -> torch.device:
+        preferred = str(preferred or "auto").strip().lower()
+        if preferred == "cpu":
+            return torch.device("cpu")
+        if preferred in {"cuda", "gpu"}:
+            if Utils.cuda_device_is_usable(logger=logger):
+                return torch.device("cuda")
+            raise RuntimeError(
+                "CUDA was requested, but the installed PyTorch build does not support "
+                "the available GPU. Use --device cpu or install a compatible PyTorch wheel."
+            )
+        if preferred != "auto":
+            raise ValueError("device must be one of: auto, cpu, cuda")
+        return torch.device("cuda" if Utils.cuda_device_is_usable(logger=logger) else "cpu")
 
     def parse_window(window: str, bars_per_day: float) -> int:
         """
@@ -44,7 +90,8 @@ class Utils:
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+        if Utils.cuda_device_is_usable(warn=False):
+            torch.cuda.manual_seed_all(seed)
 
         # Optional determinism controls
         torch.backends.cudnn.deterministic = deterministic
@@ -104,7 +151,7 @@ class Utils:
     def log_gpu_memory(tag: str = ""):
         # ===================================
 		# === Helper to log GPU memory consumption
-        if torch.cuda.is_available():
+        if Utils.cuda_device_is_usable(warn=False):
             allocated = torch.cuda.memory_allocated()
             reserved = torch.cuda.memory_reserved()
             peak = torch.cuda.max_memory_allocated()
@@ -118,6 +165,26 @@ class Utils:
         horizon_days = horizon / bars_per_day
         seq_days = 3 * horizon_days
         return int(seq_days * bars_per_day)
+
+    @staticmethod
+    def infer_interval_label(index) -> str:
+        deltas = pd.Series(index).diff().dropna()
+        if deltas.empty:
+            return "unknown"
+
+        mode = deltas.mode()
+        delta = mode.iloc[0] if not mode.empty else deltas.median()
+
+        total_seconds = int(delta.total_seconds())
+        if total_seconds <= 0:
+            return "unknown"
+        if total_seconds % 86400 == 0:
+            return f"{total_seconds // 86400}d"
+        if total_seconds % 3600 == 0:
+            return f"{total_seconds // 3600}h"
+        if total_seconds % 60 == 0:
+            return f"{total_seconds // 60}m"
+        return str(delta)
     
     def sanity_check_features(feats: dict, raw: dict, window: int = 5):
         """

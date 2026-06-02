@@ -133,7 +133,7 @@ class Trainer:
                     if stop_event and stop_event.is_set():
                         print("[Trainer] Early stopping triggered.")
                         time.sleep(0.01)
-                        if torch.cuda.is_available():
+                        if getattr(self.device, "type", None) == "cuda":
                             torch.cuda.synchronize()
                         self._finalise_energy_monitoring()
                         return
@@ -360,6 +360,10 @@ class Trainer:
         return None
 
     def _init_energy_monitoring(self):
+        if getattr(self.device, "type", None) != "cuda":
+            self.handle = None
+            return
+
         try:
             nvmlInit()
             self.handle = nvmlDeviceGetHandleByIndex(0)

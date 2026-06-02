@@ -361,7 +361,7 @@ class HeadlessApp:
         np.random.seed(seed)
         torch.manual_seed(seed)
         
-        if torch.cuda.is_available():
+        if getattr(self.device, "type", None) == "cuda":
             torch.cuda.manual_seed_all(seed)
             # Deterministic settings
             if getattr(self.args, "deterministic", False):

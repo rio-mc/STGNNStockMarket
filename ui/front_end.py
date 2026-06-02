@@ -19,6 +19,7 @@ from core.job_queue import (
     parse_seed_spec,
     parse_ticker_spec,
 )
+from core.utils.utils import Utils
 from evaluation.evaluation_methods import EvaluationMethods
 
 
@@ -71,9 +72,12 @@ class FrontEnd:
         self._queue_run_callback = None
         self._queue_remove_callback = None
         self._queue_clear_callback = None
+        self._close_callback = None
+        self._closing = False
 
         self.queue_popout = None
         self.queue_popout_table = None
+        self.queueGraphModelMenu = None
 
         # ------------------------------------------------------------------
         # Notebook
@@ -190,6 +194,22 @@ class FrontEnd:
         )
         self.graphModelMenu.grid(row=1, column=6, sticky="ew", padx=(0, 10))
 
+        # Advanced experiment controls are shown in the queue popout but are
+        # kept as shared variables so queued and direct GUI runs use one source.
+        self.kVar = tk.StringVar(value="3")
+        self.graphModeValues = ["knn_mst", "knn", "mst"]
+        self.graphModeVar = tk.StringVar(value="knn_mst")
+        self.graphEmbedValues = ["pca", "raw"]
+        self.graphEmbedVar = tk.StringVar(value="pca")
+        self.graphAblationValues = ["none", "identity", "empty"]
+        self.graphAblationVar = tk.StringVar(value="none")
+        self.ablateFeatureValues = ["none", "return", "volatility", "momentum"]
+        self.ablateFeatureVar = tk.StringVar(value="none")
+        self.seqLenVar = tk.StringVar(value="10")
+        self.batchSizeVar = tk.StringVar(value="256")
+        self.lstmEpochsVar = tk.StringVar(value="200")
+        self.stgnnEpochsVar = tk.StringVar(value="200")
+
         # Run group
         self.btnCompute = tk.Button(self.runGroup, text="Compute ▶", command=self._onCompute, width=14)
         self.btnCompute.grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 4))
@@ -234,11 +254,11 @@ class FrontEnd:
         queue_body = tk.Frame(self.queueFrame)
         queue_body.pack(fill=tk.X, expand=True)
 
-        queue_cols = ("Job ID", "Window", "Ticker", "Model", "Seed", "Graph")
+        queue_cols = ("Job ID", "Window", "Ticker", "Model", "Seed", "Graph", "k", "Mode", "Embed", "Ablation", "Seq")
         self.queueTable = ttk.Treeview(self.queueFrame, columns=queue_cols, show="headings", height=4)
         for c in queue_cols:
             self.queueTable.heading(c, text=c)
-            self.queueTable.column(c, width=110, anchor=tk.CENTER)
+            self.queueTable.column(c, width=90 if c in {"k", "Seq"} else 110, anchor=tk.CENTER)
         self.queueTable.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         queue_scroll = ttk.Scrollbar(self.queueFrame, orient=tk.VERTICAL, command=self.queueTable.yview)
@@ -488,14 +508,16 @@ class FrontEnd:
             pass
 
     def ui_call(self, fn, *args, **kwargs):
+        if self._closing:
+            return
         try:
             self.root.after(0, lambda: fn(*args, **kwargs))
-        except RuntimeError:
+        except (RuntimeError, tk.TclError):
             pass
 
     def bindMainApp(self, main_app):
         self._main_app = main_app
-        interval = self._main_app.args.interval
+        self._sync_experiment_controls_from_args()
         ticker = self.stockVar.get()
 
         for t in self._main_app.args.tickers:
@@ -510,6 +532,7 @@ class FrontEnd:
             return
 
         df_trimmed = self.priceHistory[ticker]
+        interval = Utils.infer_interval_label(df_trimmed.index)
         data_len = len(df_trimmed)
         est_days = self.bars_to_days(data_len, interval)
         start = df_trimmed.index[0]
@@ -522,12 +545,54 @@ class FrontEnd:
         self.zoomSlider.set(self.currentWindowIdx + 1)
 
         print(
-            f"[DEBUG] {ticker}: {data_len} bars ({interval}) ≈ {est_days:.1f} trading days, "
-            f"{duration.days} calendar days from {start.date()} to {end.date()} → windowOptions=1…{data_len}"
+            f"[DEBUG] {ticker}: {data_len} bars ({interval}) ~= {est_days:.1f} trading days, "
+            f"{duration.days} calendar days from {start.date()} to {end.date()} -> windowOptions=1...{data_len}"
         )
 
         raw_df = self._main_app.raw_feature_dfs[ticker]
         self._refresh_and_plot(ticker, raw_df, num_bars=self.currentWindowIdx + 1)
+
+    def _sync_experiment_controls_from_args(self):
+        if self._main_app is None:
+            return
+
+        args = self._main_app.args
+        self.kVar.set(str(getattr(args, "k", 3)))
+        self.graphModeVar.set(str(getattr(args, "graph_mode", "knn_mst")))
+        self.graphEmbedVar.set(str(getattr(args, "graph_embed", "pca")))
+        self.graphAblationVar.set(str(getattr(args, "graph_ablation", "none")))
+        self.ablateFeatureVar.set(str(getattr(args, "ablate_feature", "none")))
+        self.seqLenVar.set(str(getattr(args, "seq_len", 10)))
+        self.batchSizeVar.set(str(getattr(args, "batch_size", 256)))
+        self.lstmEpochsVar.set(str(getattr(args, "lstm_epochs", 200)))
+        self.stgnnEpochsVar.set(str(getattr(args, "stgnn_epochs", 200)))
+
+    @staticmethod
+    def _parse_positive_int(raw: str, name: str) -> int:
+        value = int(str(raw).strip())
+        if value < 1:
+            raise ValueError(f"{name} must be >= 1")
+        return value
+
+    @staticmethod
+    def _parse_nonnegative_int(raw: str, name: str) -> int:
+        value = int(str(raw).strip())
+        if value < 0:
+            raise ValueError(f"{name} must be >= 0")
+        return value
+
+    def export_experiment_controls(self) -> dict:
+        return {
+            "k": self._parse_nonnegative_int(self.kVar.get(), "k"),
+            "graph_mode": str(self.graphModeVar.get()).strip().lower(),
+            "graph_embed": str(self.graphEmbedVar.get()).strip().lower(),
+            "graph_ablation": str(self.graphAblationVar.get()).strip().lower(),
+            "ablate_feature": str(self.ablateFeatureVar.get()).strip().lower(),
+            "seq_len": self._parse_positive_int(self.seqLenVar.get(), "seq_len"),
+            "batch_size": self._parse_positive_int(self.batchSizeVar.get(), "batch_size"),
+            "lstm_epochs": self._parse_positive_int(self.lstmEpochsVar.get(), "lstm_epochs"),
+            "stgnn_epochs": self._parse_positive_int(self.stgnnEpochsVar.get(), "stgnn_epochs"),
+        }
 
     def set_active_model_titles(self, model_name: str):
         labels = {
@@ -582,6 +647,9 @@ class FrontEnd:
     def setQueueClearCallback(self, cb):
         self._queue_clear_callback = cb
 
+    def setCloseCallback(self, cb):
+        self._close_callback = cb
+
     def _is_graph_backend_applicable(self, model_name: str) -> bool:
         return str(model_name).strip().lower() == "stgnn"
 
@@ -589,6 +657,11 @@ class FrontEnd:
         selected_model = str(self.modelVar.get()).strip().lower()
         enabled = self._is_graph_backend_applicable(selected_model)
         self.graphModelMenu.config(state="readonly" if enabled else "disabled")
+        if getattr(self, "queueGraphModelMenu", None) is not None:
+            try:
+                self.queueGraphModelMenu.config(state="readonly" if enabled else "disabled")
+            except tk.TclError:
+                self.queueGraphModelMenu = None
         if not enabled:
             self.graphModelVar.set("GCN")
 
@@ -614,6 +687,7 @@ class FrontEnd:
             if self._is_graph_backend_applicable(model_name)
             else "gcn"
         )
+        controls = self.export_experiment_controls()
 
         jobs: List[QueueJob] = []
         for ticker in ticker_values:
@@ -627,6 +701,15 @@ class FrontEnd:
                         model=model_name,
                         seed=int(seed),
                         graph_model=graph_model,
+                        k=controls["k"],
+                        graph_mode=controls["graph_mode"],
+                        graph_embed=controls["graph_embed"],
+                        graph_ablation=controls["graph_ablation"],
+                        ablate_feature=controls["ablate_feature"],
+                        seq_len=controls["seq_len"],
+                        batch_size=controls["batch_size"],
+                        lstm_epochs=controls["lstm_epochs"],
+                        stgnn_epochs=controls["stgnn_epochs"],
                     )
                 )
         return jobs
@@ -656,6 +739,15 @@ class FrontEnd:
         idx = self.queueTable.index(selected[0])
         self._queue_remove_callback(idx)
 
+    def _onRemoveQueuePopoutItem(self):
+        if self.queue_popout_table is None or self._queue_remove_callback is None:
+            return
+        selected = self.queue_popout_table.selection()
+        if not selected:
+            return
+        idx = self.queue_popout_table.index(selected[0])
+        self._queue_remove_callback(idx)
+
     def _onClearQueue(self):
         if self._queue_clear_callback is not None:
             self._queue_clear_callback()
@@ -679,6 +771,7 @@ class FrontEnd:
 
     def _on_queue_popout_closed(self):
         self.queue_popout_table = None
+        self.queueGraphModelMenu = None
         try:
             if self.queue_popout is not None and self.queue_popout.winfo_exists():
                 self.queue_popout.destroy()
@@ -700,6 +793,11 @@ class FrontEnd:
                         job.model.upper(),
                         job.seed,
                         job.graph_model.upper(),
+                        job.k,
+                        job.graph_mode,
+                        job.graph_embed,
+                        job.graph_ablation,
+                        job.seq_len,
                     ),
                 )
 
@@ -719,6 +817,11 @@ class FrontEnd:
                                 job.model.upper(),
                                 job.seed,
                                 job.graph_model.upper(),
+                                job.k,
+                                job.graph_mode,
+                                job.graph_embed,
+                                job.graph_ablation,
+                                job.seq_len,
                             ),
                         )
                 except tk.TclError:
@@ -740,15 +843,135 @@ class FrontEnd:
 
         self.queue_popout = tk.Toplevel(self.root)
         self.queue_popout.title("Prediction Queue")
-        self.queue_popout.geometry("900x300")
+        self.queue_popout.geometry("1220x560")
         self.queue_popout.protocol("WM_DELETE_WINDOW", self._on_queue_popout_closed)
 
-        cols = ("Job ID", "Window", "Ticker", "Model", "Seed", "Graph")
+        self._build_queue_popout_controls(self.queue_popout)
+
+        cols = ("Job ID", "Window", "Ticker", "Model", "Seed", "Graph", "k", "Mode", "Embed", "Ablation", "Seq")
         self.queue_popout_table = ttk.Treeview(self.queue_popout, columns=cols, show="headings")
         for c in cols:
             self.queue_popout_table.heading(c, text=c)
-            self.queue_popout_table.column(c, width=130, anchor=tk.CENTER)
+            self.queue_popout_table.column(c, width=90 if c in {"k", "Seq"} else 120, anchor=tk.CENTER)
         self.queue_popout_table.pack(fill=tk.BOTH, expand=True)
+        self._copy_queue_strip_to_popout()
+
+    def _copy_queue_strip_to_popout(self):
+        if self.queue_popout_table is None:
+            return
+
+        try:
+            self.queue_popout_table.delete(*self.queue_popout_table.get_children())
+            for item in self.queueTable.get_children():
+                values = self.queueTable.item(item).get("values", [])
+                self.queue_popout_table.insert("", "end", values=values)
+        except tk.TclError:
+            self.queue_popout_table = None
+
+    def _build_queue_popout_controls(self, parent):
+        controls = tk.LabelFrame(parent, text="Queue Experiment Controls", padx=8, pady=8)
+        controls.pack(fill=tk.X, padx=8, pady=(8, 4))
+
+        for col in range(10):
+            controls.columnconfigure(col, weight=1)
+
+        def add_label(text, row, col):
+            tk.Label(controls, text=text).grid(row=row, column=col, sticky="w", padx=(0, 4), pady=(0, 2))
+
+        def add_entry(var, row, col, width=10):
+            entry = ttk.Entry(controls, textvariable=var, width=width)
+            entry.grid(row=row, column=col, sticky="ew", padx=(0, 8), pady=(0, 8))
+            return entry
+
+        def add_combo(var, values, row, col, width=12):
+            combo = ttk.Combobox(controls, textvariable=var, values=values, width=width, state="readonly")
+            combo.grid(row=row, column=col, sticky="ew", padx=(0, 8), pady=(0, 8))
+            return combo
+
+        add_label("Window", 0, 0)
+        add_combo(self.windowVar, self.windowValues, 1, 0, width=8)
+
+        add_label("Stock spec", 0, 1)
+        add_combo(self.stockVar, list(self.stockMenu.cget("values")), 1, 1, width=18).configure(state="normal")
+
+        add_label("Model", 0, 2)
+        add_combo(self.modelVar, self.modelValues, 1, 2, width=14).bind("<<ComboboxSelected>>", self._on_model_selection_change)
+
+        add_label("Seeds", 0, 3)
+        add_entry(self.seedVar, 1, 3, width=12)
+
+        add_label("STGNN backend", 0, 4)
+        graph_backend_combo = add_combo(self.graphModelVar, self.graphModelValues, 1, 4, width=14)
+        self.queueGraphModelMenu = graph_backend_combo
+
+        add_label("k", 0, 5)
+        add_entry(self.kVar, 1, 5, width=6)
+
+        add_label("Graph mode", 0, 6)
+        add_combo(self.graphModeVar, self.graphModeValues, 1, 6, width=10)
+
+        add_label("Embed", 0, 7)
+        add_combo(self.graphEmbedVar, self.graphEmbedValues, 1, 7, width=8)
+
+        add_label("Universe", 0, 8)
+        universe_combo = add_combo(self.universeVar, self.universeValues, 1, 8, width=12)
+        universe_combo.bind("<<ComboboxSelected>>", self._on_universe_change)
+        tk.Button(controls, text="Import CSV", command=self._on_import_csv).grid(
+            row=1,
+            column=9,
+            sticky="ew",
+            padx=(0, 8),
+            pady=(0, 8),
+        )
+
+        add_label("Graph ablation", 2, 0)
+        add_combo(self.graphAblationVar, self.graphAblationValues, 3, 0, width=12)
+
+        add_label("Feature ablation", 2, 1)
+        add_combo(self.ablateFeatureVar, self.ablateFeatureValues, 3, 1, width=14)
+
+        add_label("Seq len", 2, 2)
+        add_entry(self.seqLenVar, 3, 2, width=8)
+
+        add_label("Batch", 2, 3)
+        add_entry(self.batchSizeVar, 3, 3, width=8)
+
+        add_label("Recurrent epochs", 2, 4)
+        add_entry(self.lstmEpochsVar, 3, 4, width=10)
+
+        add_label("Graph/STGNN epochs", 2, 5)
+        add_entry(self.stgnnEpochsVar, 3, 5, width=10)
+
+        tk.Button(controls, text="Add to queue +", command=self._onAddToQueue).grid(
+            row=3,
+            column=6,
+            sticky="ew",
+            padx=(0, 8),
+            pady=(0, 8),
+        )
+        tk.Button(controls, text="Run queue", command=self._onRunQueue).grid(
+            row=3,
+            column=7,
+            sticky="ew",
+            padx=(0, 8),
+            pady=(0, 8),
+        )
+        tk.Button(controls, text="Remove selected", command=self._onRemoveQueuePopoutItem).grid(
+            row=3,
+            column=8,
+            sticky="ew",
+            padx=(0, 8),
+            pady=(0, 8),
+        )
+        tk.Button(controls, text="Clear", command=self._onClearQueue).grid(
+            row=3,
+            column=9,
+            sticky="ew",
+            padx=(0, 8),
+            pady=(0, 8),
+        )
+
+        self._sync_graph_backend_state()
 
     def _onCompute(self):
         if self._background_busy:
@@ -1124,10 +1347,20 @@ class FrontEnd:
         self.btnStop.config(state=tk.DISABLED)
 
     def set_status(self, msg: str):
-        self.root.after(0, lambda: self.statusVar.set(msg))
+        if self._closing:
+            return
+        try:
+            self.root.after(0, lambda: self.statusVar.set(msg))
+        except (RuntimeError, tk.TclError):
+            pass
 
     def clear_status(self):
-        self.root.after(0, lambda: self.statusVar.set("Idle"))
+        if self._closing:
+            return
+        try:
+            self.root.after(0, lambda: self.statusVar.set("Idle"))
+        except (RuntimeError, tk.TclError):
+            pass
 
     def _set_loading_state(self, busy: bool, message: str = ""):
         """
@@ -1573,10 +1806,35 @@ class FrontEnd:
         self._rebalance_job = self.root.after(120, _run)
 
     def _on_close(self):
+        if self._closing:
+            return
+        self._closing = True
+        self.stop_event.set()
+
         job = getattr(self, "_rebalance_job", None)
         if job is not None:
             try:
                 self.root.after_cancel(job)
             except Exception:
                 pass
-        self.root.destroy()
+
+        try:
+            if self._close_callback is not None:
+                self._close_callback()
+        except Exception as exc:
+            print(f"[WARN] Close callback failed: {exc}")
+
+        try:
+            self._on_queue_popout_closed()
+        except Exception:
+            pass
+
+        try:
+            self.root.quit()
+        except Exception:
+            pass
+
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
