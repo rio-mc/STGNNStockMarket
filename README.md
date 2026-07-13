@@ -60,6 +60,7 @@ runner = ModelRegistry.get_runner(model_name)
 
 | Category | Models | Purpose |
 |---|---|---|
+| Linear / Statistical Baselines | `arima` | Single-asset autoregressive baseline |
 | Temporal / Single Asset | `lstm`, `gru` | Target asset only |
 | Panel Temporal / Multi-Asset | `panel_lstm`, `panel_gru` | Multi-asset context, no graph |
 | Graph Neural Networks | `gcn`, `gat`, `graphsage`, `nnconv` | Static graph-aware baselines |
@@ -70,6 +71,7 @@ Registered model names:
 ```text
 lstm
 gru
+arima
 panel_lstm
 panel_gru
 gcn

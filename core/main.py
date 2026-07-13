@@ -925,7 +925,8 @@ class MainApp:
     def startPipeline(self, gui_window: str, stock: str, stop_event: threading.Event):
         if self.pipeline_running:
             self.logger.warning("Pipeline already running.")
-            return ("-", 0.0, "-", 0.0, "-", 0.0)
+            self.frontendApp.set_status("Pipeline already running.")
+            return (self.frontendApp.get_selected_model().upper(), "-", 0.0)
 
         self.pipeline_running = True
         ts_start = self.experiment_store.utc_now_iso()
@@ -958,6 +959,9 @@ class MainApp:
 
             pipeline = Pipeline(self)
             state = pipeline.run(stock, gui_window, stop_event)
+            graph_models = {"gcn", "gat", "graphsage", "nnconv", "stgnn"}
+            if self._active_queue_job_id is None and selected_model in graph_models:
+                self.frontendApp.render_graph_state(state)
 
             experiment_runner = ExperimentRunner(self)
             result = experiment_runner.run(

@@ -35,6 +35,7 @@ class GATRunner(BaseModelRunner):
             graph_builder=app.graphBuilder,
             features={"feature": None},
             tickers=aligned_tickers,
+            train_dataset=train_ds,
         )
         self._set_target_from_dataset(trainer, model, train_ds)
 

@@ -35,6 +35,7 @@ class LSTMRunner(BaseModelRunner):
             graph_builder=None,
             features=None,
             tickers=[stock],
+            train_dataset=train_ds,
         )
 
         dl = self._make_torch_loader(app, train_ds)

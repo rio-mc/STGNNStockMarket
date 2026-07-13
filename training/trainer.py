@@ -270,6 +270,13 @@ class Trainer:
         print(f"[EVAL][SUMMARY] total_samples={total_samples}, predictions={len(prediction_dates)}")
         print(f"[EVAL] Predicted 1s: {sum(y_pred_all)}, 0s: {len(y_pred_all) - sum(y_pred_all)}")
         print(f"[EVAL] True 1s: {sum(y_true_all)}, 0s: {len(y_true_all) - sum(y_true_all)}")
+        if probs_all:
+            probs_np = np.asarray(probs_all, dtype=float)
+            print(
+                "[EVAL] Probability summary: "
+                f"min={probs_np.min():.3f}, mean={probs_np.mean():.3f}, "
+                f"max={probs_np.max():.3f}, std={probs_np.std():.3f}"
+            )
         print(f"[EVAL] Mean validation loss (dense): {mean_val_loss:.6f}")
 
         return EvaluationResult(

@@ -1,3 +1,4 @@
+from .runners.arima_runner import ARIMARunner
 from .runners.gcn_runner import GCNRunner
 from .runners.gru_runner import GRURunner
 from .runners.graphsage_runner import GraphSAGERunner
@@ -12,6 +13,7 @@ class ModelRegistry:
     _registry = {
         "lstm": LSTMRunner,
         "gru": GRURunner,
+        "arima": ARIMARunner,
         "panel_gru": PanelGRURunner,
         "panel_lstm": PanelLSTMRunner,
         "gcn": GCNRunner,

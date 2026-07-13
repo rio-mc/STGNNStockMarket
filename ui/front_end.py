@@ -158,6 +158,7 @@ class FrontEnd:
         self.modelValues = [
             "LSTM",
             "GRU",
+            "ARIMA",
             "PANEL_GRU",
             "PANEL_LSTM",
             "GCN",
@@ -598,6 +599,7 @@ class FrontEnd:
         labels = {
             "lstm": "LSTM",
             "gru": "GRU",
+            "arima": "ARIMA",
             "panel_gru": "PANEL GRU",
             "panel_lstm": "PANEL LSTM",
             "gcn": "GCN",
@@ -610,7 +612,7 @@ class FrontEnd:
         key = str(model_name).strip().lower()
         pretty = labels.get(key, key.upper())
 
-        if key in ("lstm", "gru"):
+        if key in ("lstm", "gru", "arima"):
             self.graphFrame.config(text=f"{pretty} Target Node")
         elif key in ("panel_gru", "panel_lstm"):
             self.graphFrame.config(text=f"{pretty} Panel Nodes (no graph edges used)")
@@ -1011,12 +1013,13 @@ class FrontEnd:
             if self.stop_event.is_set():
                 cancelled = True
             else:
-                self.root.after(
-                    0,
-                    lambda: self.updateResults(
-                        result[0], result[1], result[2]
-                    ) if result else self.updateResults(self.modelVar.get(), "—", 0.0)
-                )
+                def _update_result(result=result):
+                    if result and len(result) >= 3:
+                        self.updateResults(result[0], result[1], result[2])
+                    else:
+                        self.updateResults(self.modelVar.get(), "—", 0.0)
+
+                self.root.after(0, _update_result)
         except Cancelled:
             cancelled = True
         finally:
@@ -1279,6 +1282,28 @@ class FrontEnd:
         ax.view_init(elev=20, azim=30)
         fig.canvas.draw_idle()
 
+    def render_graph_state(self, state: dict) -> None:
+        if not state:
+            return
+
+        tickers = state.get("tickers") or []
+        coords = state.get("coords")
+        pruned = state.get("pruned") or []
+        mst = state.get("mst") or []
+
+        if coords is None or not tickers:
+            return
+
+        def _draw():
+            self.plot3d_on_ax(
+                tickers=list(tickers),
+                coords=np.asarray(coords),
+                pruned_edges=list(pruned),
+                mst_edges=list(mst),
+            )
+
+        self.ui_call(_draw)
+
     def update_sector_legend(self):
         for widget in self.legend_frame.winfo_children():
             widget.destroy()
@@ -1500,9 +1525,13 @@ class FrontEnd:
     def updateResults(self, model_name, trend, confidence):
         is_up = "Upwards" in str(trend)
         colour = "green" if is_up else "red" if trend not in ("—", "-", None) else "black"
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError):
+            confidence_value = 0.0
 
         self.modelStatus.config(text=f"Trending: {trend}", fg=colour)
-        self.modelConf.config(text=f"Confidence: {confidence:.1f}%", fg=colour)
+        self.modelConf.config(text=f"Confidence: {confidence_value:.1f}%", fg=colour)
 
     def refresh_selected_tabs(self):
         for tab in [self.metricsTab, self.evalTab, self.backtestTab]:
@@ -1514,19 +1543,19 @@ class FrontEnd:
                 if hasattr(self, "metrics_pane") and isinstance(self.metrics_pane, tk.PanedWindow):
                     self.metrics_pane.update_idletasks()
                     w = self.metrics_pane.winfo_width()
-                    if w > 10:
+                    if w > 10 and len(self.metrics_pane.panes()) > 1:
                         self.metrics_pane.sash_place(0, w // 2, 0)
 
                 if hasattr(self, "eval_vertical_pane") and isinstance(self.eval_vertical_pane, tk.PanedWindow):
                     self.eval_vertical_pane.update_idletasks()
                     h = self.eval_vertical_pane.winfo_height()
-                    if h > 10:
+                    if h > 10 and len(self.eval_vertical_pane.panes()) > 1:
                         self.eval_vertical_pane.sash_place(0, 0, int(h * 0.5))
 
                 if hasattr(self, "metrics_model_pane") and isinstance(self.metrics_model_pane, tk.PanedWindow):
                     self.metrics_model_pane.update_idletasks()
                     h = self.metrics_model_pane.winfo_height()
-                    if h > 10:
+                    if h > 10 and len(self.metrics_model_pane.panes()) > 1:
                         self.metrics_model_pane.sash_place(0, 0, int(h * 0.5))
             except Exception as exc:
                 print(f"[WARN] UI rebalance skipped: {exc}")

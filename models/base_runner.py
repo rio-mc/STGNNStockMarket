@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
 import gc
+import threading
 import numpy as np
 import torch
 from torch.nn import BCEWithLogitsLoss
@@ -155,11 +156,12 @@ class BaseModelRunner(ABC):
         graph_builder=None,
         features=None,
         tickers=None,
+        train_dataset=None,
     ):
         return Trainer(
             model,
             Utils.make_adamw(model, lr=lr, weight_decay=app.args.weight_decay),
-            BCEWithLogitsLoss(),
+            self._make_classification_loss(app, train_dataset),
             app.device,
             graphBuilder=graph_builder,
             features=features,
@@ -171,6 +173,65 @@ class BaseModelRunner(ABC):
             seq_len=app.seq_len,
             model_name=self.model_name,
         )
+
+    def _make_classification_loss(self, app, train_dataset=None):
+        if str(getattr(app.args, "class_balance", "auto")).strip().lower() != "auto":
+            return BCEWithLogitsLoss()
+
+        labels = self._extract_binary_labels(train_dataset)
+        if labels is None or labels.numel() == 0:
+            return BCEWithLogitsLoss()
+
+        positives = float(labels.sum().item())
+        total = float(labels.numel())
+        negatives = total - positives
+
+        if positives <= 0.0 or negatives <= 0.0:
+            app.logger.warning(
+                "[%sRunner] class_balance=auto skipped: one-class training labels "
+                "(positives=%d negatives=%d)",
+                self.model_name,
+                int(positives),
+                int(negatives),
+            )
+            return BCEWithLogitsLoss()
+
+        pos_weight = negatives / positives
+        pos_weight_tensor = torch.tensor([pos_weight], dtype=torch.float32, device=app.device)
+        app.logger.info(
+            "[%sRunner] class_balance=auto | train positives=%d negatives=%d pos_weight=%.3f",
+            self.model_name,
+            int(positives),
+            int(negatives),
+            pos_weight,
+        )
+        return BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+
+    @staticmethod
+    def _extract_binary_labels(dataset):
+        if dataset is None:
+            return None
+
+        for attr in ("y", "y_list"):
+            labels = getattr(dataset, attr, None)
+            if labels is not None:
+                return torch.as_tensor(labels, dtype=torch.float32).view(-1)
+
+        values = []
+        try:
+            for i in range(len(dataset)):
+                sample = dataset[i]
+                y = getattr(sample, "y", None)
+                if y is None and isinstance(sample, (tuple, list)) and len(sample) >= 2:
+                    y = sample[1]
+                if y is not None:
+                    values.append(float(torch.as_tensor(y).view(-1)[0].item()))
+        except Exception:
+            return None
+
+        if not values:
+            return None
+        return torch.tensor(values, dtype=torch.float32)
 
     def _set_target_from_dataset(self, trainer, model, dataset) -> None:
         target_idx = getattr(dataset, "target_idx", None)
@@ -374,6 +435,7 @@ class BaseModelRunner(ABC):
 
     def _cleanup(self, *objects) -> None:
         del objects
-        gc.collect()
+        if threading.current_thread() is threading.main_thread():
+            gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

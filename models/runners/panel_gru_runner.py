@@ -33,6 +33,7 @@ class PanelGRURunner(BaseModelRunner):
             graph_builder=None,
             features=None,
             tickers=aligned_tickers,
+            train_dataset=train_ds,
         )
         self._set_target_from_dataset(trainer, model, train_ds)
 

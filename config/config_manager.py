@@ -158,6 +158,7 @@ class ConfigManager:
             choices=[
                 "lstm",
                 "gru",
+                "arima",
                 "panel_gru",
                 "panel_lstm",
                 "gcn",
@@ -284,12 +285,12 @@ class ConfigManager:
             help="Training-loss early stopping patience"
         )
         epoch_count = 200
-        lr = 1e-4
+        lr = 5e-4
 
         parser.add_argument(
             "--head_temperature",
             type=float,
-            default=2.0,
+            default=1.0,
             help="Post-hoc logit temperature. Keep 1.0 for raw probabilities."
         )
         parser.add_argument(
@@ -298,12 +299,31 @@ class ConfigManager:
             default=1e-5,
             help="Global L2 weight decay"
         )
+        parser.add_argument(
+            "--class_balance",
+            type=str,
+            default="auto",
+            choices=["auto", "none"],
+            help="Use training-label class balance in BCE loss. 'auto' sets pos_weight=negatives/positives."
+        )
 
         # ====================================
         # === LSTM / GRU Training
         parser.add_argument("--lstm_lr", type=float, default=lr, help="LSTM/GRU learning rate")
         parser.add_argument("--lstm_epochs", type=int, default=epoch_count, help="LSTM/GRU epochs")
         parser.add_argument("--lstm_save", type=str, default="misc/lstm_best.pth", help="LSTM save path")
+
+        # ====================================
+        # === ARIMA Baseline
+        parser.add_argument(
+            "--arima_order",
+            type=str,
+            default=None,
+            help="ARIMA order as p,d,q. Overrides --arima_p/--arima_d/--arima_q when provided."
+        )
+        parser.add_argument("--arima_p", type=int, default=1, help="ARIMA autoregressive order")
+        parser.add_argument("--arima_d", type=int, default=1, help="ARIMA differencing order")
+        parser.add_argument("--arima_q", type=int, default=1, help="ARIMA moving-average order")
 
         # ====================================
         # === LSTM / GRU Architecture
@@ -390,6 +410,17 @@ class ConfigManager:
 
         if args.seq_len < 1:
             raise ValueError("--seq_len must be >= 1")
+
+        if args.arima_order is not None:
+            try:
+                arima_order_parts = [int(part.strip()) for part in str(args.arima_order).split(",")]
+            except ValueError as exc:
+                raise ValueError("--arima_order must have the form p,d,q with integer values") from exc
+            if len(arima_order_parts) != 3 or any(part < 0 for part in arima_order_parts):
+                raise ValueError("--arima_order must have the form p,d,q with non-negative integer values")
+
+        if min(args.arima_p, args.arima_d, args.arima_q) < 0:
+            raise ValueError("--arima_p, --arima_d and --arima_q must be >= 0")
 
         # Single source of truth: graph construction uses the same temporal
         # window as the model input sequence. Any legacy --graph_window value

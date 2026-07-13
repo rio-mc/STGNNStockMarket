@@ -71,6 +71,7 @@ class EvaluationMethods:
         self.colour_map = {
             "LSTM": "tab:blue",
             "GRU": "tab:green",
+            "ARIMA": "tab:cyan",
             "PANEL_GRU": "tab:purple",
             "PANEL_LSTM": "tab:brown",
             "NNCONV": "tab:orange",
