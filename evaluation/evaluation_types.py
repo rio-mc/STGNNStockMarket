@@ -18,7 +18,8 @@ class EvaluationResult:
 
     Optional:
     - decision_threshold: threshold used for fixed-threshold evaluation
-    - dense_val_loss: mean validation loss across dense rolling evaluation
+    - dense_val_loss: legacy field containing mean loss for the evaluated split;
+      metadata identifies whether that split is validation or test
     - horizon: prediction horizon in bars
     - model_name: active model for this run
     - metadata: free-form auxiliary fields
@@ -113,17 +114,26 @@ class EvaluationMetrics:
 
     model: str
 
+    # threshold_fixed is retained as a backwards-compatible alias for the
+    # operational threshold used by older result files.
     threshold_fixed: float
+    threshold_operational: float
+    threshold_fixed_05: float
     threshold_macro_f1_dense: float
     threshold_selection_metric: str
     
     val_loss_dense: Optional[float]
+    test_loss_dense: Optional[float]
 
     accuracy_dense: float
     f1_dense: float
     macro_f1_dense: float
     roc_auc_dense: Optional[float]
     ap_dense: Optional[float]
+
+    accuracy_dense_fixed_05: float
+    f1_dense_fixed_05: float
+    macro_f1_dense_fixed_05: float
 
     accuracy_dense_macro_f1_threshold: float
     f1_dense_macro_f1_threshold: float
@@ -156,3 +166,5 @@ class EvaluationMetrics:
 
     graph_backend: Optional[str] = None
     graph_model: Optional[str] = None
+    threshold_source: Optional[str] = None
+    evaluation_split: Optional[str] = None

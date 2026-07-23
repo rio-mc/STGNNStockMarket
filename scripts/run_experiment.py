@@ -24,12 +24,14 @@ def setup_logging(args):
     logger = logging.getLogger("run_experiment")
     logger.setLevel(logging.INFO)
 
-    handler = logging.StreamHandler(sys.stdout)
-    formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
-    )
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    logger.propagate = False
 
     return logger
 
@@ -223,11 +225,15 @@ def main():
     if not getattr(args, "tickers", None):
         universe_service = UniverseService()
         universe_def = universe_service.resolve_definition(
-            universe_id=getattr(args, "universe_id", "sp500"),
+            universe_id=getattr(args, "universe_id", getattr(args, "dataset_name", "sp500")),
             universe_provider=getattr(args, "universe_provider", "static_csv"),
             top_n=getattr(args, "top_n", 100),
+            as_of_date=getattr(args, "universe_as_of", None),
+            custom_tickers=getattr(args, "custom_tickers", None),
         )
         args.tickers = list(universe_def.tickers)
+        args.ticker_to_sector = dict(universe_def.ticker_to_sector)
+        args.universe_id = universe_def.universe_id
 
     result = run_experiment(args)
     run_id = save_results(result, args)

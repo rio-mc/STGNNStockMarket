@@ -89,6 +89,9 @@ class ExperimentRunner:
     def _should_use_headless_adapter(self) -> bool:
         if self.app is None:
             return True
+        run_mode = str(getattr(self.app.args, "run_mode", "gui")).strip().lower()
+        if run_mode == "headless":
+            return True
         if getattr(self.app, "_active_queue_job_id", None) is not None:
             return True
         return False
@@ -111,8 +114,10 @@ class ExperimentRunner:
     def _overlay_state_on_app(self, app, state: Dict[str, Any]) -> None:
         app.train_feats = state.get("train_feats", {})
         app.val_feats = state.get("val_feats", {})
+        app.test_feats = state.get("test_feats", {})
         app.tf_train = state.get("tf_train")
         app.tf_val = state.get("tf_val")
+        app.tf_test = state.get("tf_test")
         app.graphBuilder = state.get("graphBuilder")
         app.edge_index = state.get("edge_index")
         app.init_edge_index = state.get("edge_index")
@@ -123,6 +128,7 @@ class ExperimentRunner:
         app.horizon = state.get("horizon")
         app.seq_len = state.get("seq_len")
         app.graph_window = int(state.get("graph_window", app.seq_len))
+        app.data_quality = state.get("data_quality")
 
         app.target_stock = state.get("target_stock") or state.get("target_ticker")
         app.target_ticker = app.target_stock
@@ -135,6 +141,8 @@ class ExperimentRunner:
             app.min_train_len = min(len(df) for df in app.train_feats.values())
         if app.val_feats:
             app.min_val_len = min(len(df) for df in app.val_feats.values())
+        if app.test_feats:
+            app.min_test_len = min(len(df) for df in app.test_feats.values())
 
         if not hasattr(app, "dl_gen") or app.dl_gen is None:
             seed = int(getattr(app.args, "seed", getattr(app, "current_seed", 42)))
@@ -154,6 +162,9 @@ class ExperimentRunner:
         price_history = getattr(runner_app, "priceHistory", None)
         if isinstance(price_history, dict) and stock in price_history:
             return price_history[stock]
+        test_feats = state.get("test_feats") or getattr(runner_app, "test_feats", None)
+        if isinstance(test_feats, dict) and stock in test_feats:
+            return test_feats[stock]
         val_feats = state.get("val_feats") or getattr(runner_app, "val_feats", None)
         if isinstance(val_feats, dict) and stock in val_feats:
             return val_feats[stock]

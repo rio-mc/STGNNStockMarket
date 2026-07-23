@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from hashlib import sha256
 from datetime import timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -26,8 +27,18 @@ class YahooPriceLoader(BasePriceLoader):
     PROVIDER_NAME = "yahoo"
     REQUIRED_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
     INTRADAY_INTERVALS = {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"}
+    INTRADAY_PERIOD_LIMIT_DAYS = {
+        "1m": 7,
+        "2m": 60,
+        "5m": 60,
+        "15m": 60,
+        "30m": 60,
+        "90m": 60,
+        "60m": 730,
+        "1h": 730,
+    }
 
-    def __init__(self) -> None:
+    def __init__(self, price_cache_dir: Optional[Path] = None) -> None:
         self.logger = logging.getLogger(self.__class__.__name__)
 
         if not self.logger.handlers:
@@ -38,6 +49,13 @@ class YahooPriceLoader(BasePriceLoader):
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
+
+        self.price_cache_dir = Path(
+            price_cache_dir
+            or (Path(__file__).resolve().parent.parent / ".cache" / "prices" / "yahoo")
+        )
+        self.price_cache_dir.mkdir(parents=True, exist_ok=True)
 
         self._configure_yfinance_cache()
 
@@ -62,9 +80,23 @@ class YahooPriceLoader(BasePriceLoader):
         cleaned_data: Dict[str, pd.DataFrame] = {}
         requested = [str(t).upper().strip() for t in tickers]
         effective_interval = self._normalise_interval_for_period(interval, period)
+        cache_hits = 0
 
         for ticker in requested:
             try:
+                cache_path = self._price_cache_path(
+                    ticker=ticker,
+                    start_date=start_date,
+                    end_date=end_date,
+                    interval=effective_interval,
+                    period=period,
+                )
+                cached = self._read_cached_prices(cache_path)
+                if cached is not None:
+                    cleaned_data[ticker] = cached
+                    cache_hits += 1
+                    continue
+
                 df = self._download_single_ticker(
                     ticker=ticker,
                     start_date=start_date,
@@ -72,7 +104,9 @@ class YahooPriceLoader(BasePriceLoader):
                     interval=effective_interval,
                     period=period,
                 )
-                cleaned_data[ticker] = self._clean_dataframe(df)
+                cleaned = self._clean_dataframe(df)
+                cleaned_data[ticker] = cleaned
+                self._write_cached_prices(cache_path, cleaned)
             except Exception as exc:
                 self.logger.warning("Failed to load %s: %s", ticker, exc)
 
@@ -80,13 +114,63 @@ class YahooPriceLoader(BasePriceLoader):
             raise RuntimeError("YahooPriceLoader failed for all requested tickers.")
 
         self.logger.info(
-            "Loaded prices for %d/%d tickers using provider=%s interval=%s.",
+            "Loaded prices for %d/%d tickers using provider=%s interval=%s cache_hits=%d.",
             len(cleaned_data),
             len(requested),
             self.PROVIDER_NAME,
             effective_interval,
+            cache_hits,
         )
         return cleaned_data
+
+    def _price_cache_path(
+        self,
+        *,
+        ticker: str,
+        start_date: Optional[str],
+        end_date: Optional[str],
+        interval: str,
+        period: Optional[str],
+    ) -> Optional[Path]:
+        # Relative periods move with wall-clock time. Cache only an explicitly
+        # frozen date window so resumed research runs cannot silently use stale
+        # or differently dated market data.
+        if not start_date or not end_date:
+            return None
+
+        query = "|".join(
+            [str(start_date), str(end_date), str(interval), str(period or "")]
+        )
+        query_id = sha256(query.encode("utf-8")).hexdigest()[:16]
+        safe_ticker = re.sub(r"[^A-Z0-9._-]+", "_", str(ticker).upper())
+        return self.price_cache_dir / query_id / f"{safe_ticker}.pkl"
+
+    def _read_cached_prices(self, path: Optional[Path]) -> Optional[pd.DataFrame]:
+        if path is None or not path.exists():
+            return None
+        try:
+            cached = pd.read_pickle(path)
+            if not isinstance(cached, pd.DataFrame) or cached.empty:
+                return None
+            return cached
+        except Exception as exc:
+            self.logger.warning("Ignoring unreadable price cache %s: %s", path, exc)
+            return None
+
+    def _write_cached_prices(self, path: Optional[Path], data: pd.DataFrame) -> None:
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        try:
+            data.to_pickle(temporary)
+            temporary.replace(path)
+        except Exception as exc:
+            self.logger.warning("Could not update price cache %s: %s", path, exc)
+            try:
+                temporary.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def _normalise_interval_for_period(self, interval: str, period: Optional[str]) -> str:
         interval_key = str(interval or "1d").strip().lower()
@@ -94,13 +178,16 @@ class YahooPriceLoader(BasePriceLoader):
             return interval
 
         period_days = self._period_to_days(period)
-        if period_days is None or period_days <= 60:
+        max_days = self.INTRADAY_PERIOD_LIMIT_DAYS.get(interval_key)
+        if period_days is None or max_days is None or period_days <= max_days:
             return interval
 
         self.logger.warning(
-            "Yahoo Finance does not provide %s data for period=%s; using interval=1d.",
+            "Yahoo Finance does not provide %s data for period=%s "
+            "(limit is %d days); using interval=1d.",
             interval,
             period,
+            max_days,
         )
         return "1d"
 

@@ -50,6 +50,28 @@ class ConfigManager:
             choices=["yahoo", "yfinance", "csv"],
             help="Price data provider used for loading market data."
         )
+        parser.add_argument(
+            "--headless-report",
+            dest="headless_report",
+            type=str,
+            default="compact",
+            choices=["compact", "full", "none"],
+            help=(
+                "Terminal result format for headless runs. 'compact' prints one "
+                "summary line; 'full' prints the boxed report."
+            ),
+        )
+        parser.add_argument(
+            "--training-log",
+            dest="training_log",
+            type=str,
+            default="summary",
+            choices=["quiet", "summary", "epochs"],
+            help=(
+                "Training console detail. 'summary' hides epoch progress bars; "
+                "'epochs' restores them."
+            ),
+        )
         # ====================================
         # === Result Saving
         parser.add_argument(
@@ -128,6 +150,18 @@ class ConfigManager:
             default="1h",
             help="Yahoo Finance sampling interval, e.g. 1h, 30m, 1d"
         )
+        parser.add_argument(
+            "--train_split_ratio",
+            type=float,
+            default=0.6,
+            help="Chronological fraction assigned to training before purging."
+        )
+        parser.add_argument(
+            "--validation_split_ratio",
+            type=float,
+            default=0.2,
+            help="Chronological fraction assigned to validation before the test split."
+        )
 
         # ====================================
         # === Legacy compatibility
@@ -159,6 +193,8 @@ class ConfigManager:
                 "lstm",
                 "gru",
                 "arima",
+                "random_forest",
+                "rf",
                 "panel_gru",
                 "panel_lstm",
                 "gcn",
@@ -181,9 +217,12 @@ class ConfigManager:
         parser.add_argument(
             "--decision-threshold-policy",
             type=str,
-            default="fixed",
+            default="macro_f1_dense",
             choices=["fixed", "macro_f1_dense"],
-            help="Threshold policy for final decision"
+            help=(
+                "Operational decision threshold policy. The default selects the "
+                "macro-F1-optimal threshold on validation data and freezes it for test."
+            ),
         )
         
         # ====================================
@@ -209,14 +248,14 @@ class ConfigManager:
         parser.add_argument(
             "--deterministic",
             action="store_true",
-            help="Use deterministic CUDA kernels and raise on non-deterministic ops."
+            help="Use deterministic CUDA kernels and raise on non-deterministic ops (default)."
         )
         parser.add_argument(
             "--no_deterministic",
             dest="deterministic",
             action="store_false"
         )
-        parser.set_defaults(deterministic=False)
+        parser.set_defaults(deterministic=True)
 
         parser.add_argument(
             "--num_workers",
@@ -281,8 +320,8 @@ class ConfigManager:
         parser.add_argument(
             "--early_stopping_patience",
             type=int,
-            default=5,
-            help="Training-loss early stopping patience"
+            default=15,
+            help="Epochs without validation-loss improvement before early stopping"
         )
         epoch_count = 200
         lr = 5e-4
@@ -306,6 +345,40 @@ class ConfigManager:
             choices=["auto", "none"],
             help="Use training-label class balance in BCE loss. 'auto' sets pos_weight=negatives/positives."
         )
+        parser.add_argument(
+            "--cpu_power_watts",
+            type=float,
+            default=None,
+            help=(
+                "Optional CPU/package power estimate in watts for non-GPU energy accounting. "
+                "When omitted, CPU/statistical energy_wh is recorded as unavailable rather than zero."
+            )
+        )
+        parser.add_argument(
+            "--lr_scheduler",
+            type=str,
+            default="reduce_on_plateau",
+            choices=["reduce_on_plateau", "none"],
+            help="Learning-rate scheduler used during training."
+        )
+        parser.add_argument(
+            "--lr_plateau_factor",
+            type=float,
+            default=0.5,
+            help="Multiplicative LR decay factor for ReduceLROnPlateau."
+        )
+        parser.add_argument(
+            "--lr_plateau_patience",
+            type=int,
+            default=5,
+            help="Epochs without validation-loss improvement before LR decay."
+        )
+        parser.add_argument(
+            "--lr_plateau_min_lr",
+            type=float,
+            default=0.0,
+            help="Minimum learning rate for ReduceLROnPlateau."
+        )
 
         # ====================================
         # === LSTM / GRU Training
@@ -324,6 +397,37 @@ class ConfigManager:
         parser.add_argument("--arima_p", type=int, default=1, help="ARIMA autoregressive order")
         parser.add_argument("--arima_d", type=int, default=1, help="ARIMA differencing order")
         parser.add_argument("--arima_q", type=int, default=1, help="ARIMA moving-average order")
+        parser.add_argument(
+            "--arima_refit_interval",
+            type=int,
+            default=0,
+            help=(
+                "Refit ARIMA parameters every N walk-forward windows; "
+                "0 keeps fitted parameters and updates only the state (fastest)."
+            ),
+        )
+
+        # ====================================
+        # === Random Forest Baseline
+        parser.add_argument("--rf_estimators", type=int, default=300, help="Random Forest tree count")
+        parser.add_argument(
+            "--rf_max_depth",
+            type=int,
+            default=None,
+            help="Random Forest max depth. Omit/None or <=0 for unbounded depth."
+        )
+        parser.add_argument(
+            "--rf_min_samples_leaf",
+            type=int,
+            default=5,
+            help="Random Forest minimum samples per leaf"
+        )
+        parser.add_argument(
+            "--rf_n_jobs",
+            type=int,
+            default=-1,
+            help="Random Forest parallel worker count"
+        )
 
         # ====================================
         # === LSTM / GRU Architecture
@@ -411,6 +515,16 @@ class ConfigManager:
         if args.seq_len < 1:
             raise ValueError("--seq_len must be >= 1")
 
+        if not 0.0 < args.train_split_ratio < 1.0:
+            raise ValueError("--train_split_ratio must be > 0 and < 1")
+        if not 0.0 < args.validation_split_ratio < 1.0:
+            raise ValueError("--validation_split_ratio must be > 0 and < 1")
+        if args.train_split_ratio + args.validation_split_ratio >= 1.0:
+            raise ValueError(
+                "--train_split_ratio + --validation_split_ratio must be < 1 "
+                "so a held-out test split remains"
+            )
+
         if args.arima_order is not None:
             try:
                 arima_order_parts = [int(part.strip()) for part in str(args.arima_order).split(",")]
@@ -421,6 +535,18 @@ class ConfigManager:
 
         if min(args.arima_p, args.arima_d, args.arima_q) < 0:
             raise ValueError("--arima_p, --arima_d and --arima_q must be >= 0")
+        if args.arima_refit_interval < 0:
+            raise ValueError("--arima_refit_interval must be >= 0")
+
+        if args.rf_estimators < 1:
+            raise ValueError("--rf_estimators must be >= 1")
+        if args.rf_max_depth is not None and args.rf_max_depth <= 0:
+            args.rf_max_depth = None
+        if args.rf_min_samples_leaf < 1:
+            raise ValueError("--rf_min_samples_leaf must be >= 1")
+
+        if args.cpu_power_watts is not None and args.cpu_power_watts <= 0:
+            raise ValueError("--cpu_power_watts must be > 0 when provided")
 
         # Single source of truth: graph construction uses the same temporal
         # window as the model input sequence. Any legacy --graph_window value
@@ -429,5 +555,14 @@ class ConfigManager:
 
         if args.k < 0:
             raise ValueError("--k must be >= 0")
+
+        if args.early_stopping_patience < 1:
+            raise ValueError("--early_stopping_patience must be >= 1")
+        if not 0.0 < args.lr_plateau_factor < 1.0:
+            raise ValueError("--lr_plateau_factor must be > 0 and < 1")
+        if args.lr_plateau_patience < 0:
+            raise ValueError("--lr_plateau_patience must be >= 0")
+        if args.lr_plateau_min_lr < 0:
+            raise ValueError("--lr_plateau_min_lr must be >= 0")
 
         return args

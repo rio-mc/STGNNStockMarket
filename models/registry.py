@@ -1,26 +1,22 @@
-from .runners.arima_runner import ARIMARunner
-from .runners.gcn_runner import GCNRunner
-from .runners.gru_runner import GRURunner
-from .runners.graphsage_runner import GraphSAGERunner
-from .runners.lstm_runner import LSTMRunner
-from .runners.nnconv_runner import NNConvRunner
-from .runners.panel_gru_runner import PanelGRURunner
-from .runners.panel_lstm_runner import PanelLSTMRunner
-from .runners.stgnn_runner import STGNNRunner
-from .runners.gat_runner import GATRunner
+from __future__ import annotations
+
+from importlib import import_module
+
 
 class ModelRegistry:
     _registry = {
-        "lstm": LSTMRunner,
-        "gru": GRURunner,
-        "arima": ARIMARunner,
-        "panel_gru": PanelGRURunner,
-        "panel_lstm": PanelLSTMRunner,
-        "gcn": GCNRunner,
-        "nnconv": NNConvRunner,
-        "graphsage": GraphSAGERunner,
-        "stgnn": STGNNRunner,
-        "gat": GATRunner,
+        "lstm": ("models.runners.lstm_runner", "LSTMRunner"),
+        "gru": ("models.runners.gru_runner", "GRURunner"),
+        "arima": ("models.runners.arima_runner", "ARIMARunner"),
+        "random_forest": ("models.runners.random_forest_runner", "RandomForestRunner"),
+        "rf": ("models.runners.random_forest_runner", "RandomForestRunner"),
+        "panel_gru": ("models.runners.panel_gru_runner", "PanelGRURunner"),
+        "panel_lstm": ("models.runners.panel_lstm_runner", "PanelLSTMRunner"),
+        "gcn": ("models.runners.gcn_runner", "GCNRunner"),
+        "nnconv": ("models.runners.nnconv_runner", "NNConvRunner"),
+        "graphsage": ("models.runners.graphsage_runner", "GraphSAGERunner"),
+        "stgnn": ("models.runners.stgnn_runner", "STGNNRunner"),
+        "gat": ("models.runners.gat_runner", "GATRunner"),
     }
 
     @classmethod
@@ -31,7 +27,19 @@ class ModelRegistry:
                 f"Unknown model '{model_name}'. "
                 f"Available models: {', '.join(sorted(cls._registry.keys()))}"
             )
-        return cls._registry[key]()
+
+        module_name, class_name = cls._registry[key]
+        try:
+            module = import_module(module_name)
+        except ImportError as exc:
+            if key in {"gcn", "gat", "graphsage", "nnconv", "stgnn"}:
+                raise RuntimeError(
+                    f"Model '{model_name}' requires torch_geometric/PyG dependencies. "
+                    "Install the graph dependencies documented in INSTALL.md."
+                ) from exc
+            raise
+
+        return getattr(module, class_name)()
 
     @classmethod
     def available_models(cls):

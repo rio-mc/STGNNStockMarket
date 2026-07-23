@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from threading import Lock
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 
 @dataclass(frozen=True)
@@ -26,6 +26,9 @@ class QueueJob:
     batch_size: int = 256
     lstm_epochs: int = 200
     stgnn_epochs: int = 200
+    suite_id: str = ""
+    suite_label: str = ""
+    suite_total: int = 1
 
 
 class JobQueueController:
@@ -52,6 +55,33 @@ class JobQueueController:
             if index < 0 or index >= len(self._jobs):
                 return None
             return self._jobs.pop(index)
+
+    def remove_indices(self, indices: Iterable[int]) -> List[QueueJob]:
+        with self._lock:
+            valid = sorted(
+                {int(i) for i in indices if 0 <= int(i) < len(self._jobs)},
+                reverse=True,
+            )
+            removed: List[QueueJob] = []
+            for index in valid:
+                removed.append(self._jobs.pop(index))
+            removed.reverse()
+            return removed
+
+    def remove_suite(self, suite_id: str) -> List[QueueJob]:
+        suite_id = str(suite_id or "").strip()
+        if not suite_id:
+            return []
+        with self._lock:
+            kept: List[QueueJob] = []
+            removed: List[QueueJob] = []
+            for job in self._jobs:
+                if str(getattr(job, "suite_id", "") or "") == suite_id:
+                    removed.append(job)
+                else:
+                    kept.append(job)
+            self._jobs = kept
+            return removed
 
     def clear(self) -> None:
         with self._lock:
@@ -231,3 +261,65 @@ def parse_ticker_spec(
         return _parse_alpha_spec(raw, universe)
 
     return _parse_explicit_ticker_list(raw, universe)
+
+
+MODEL_FAMILIES = {
+    "all": [
+        "lstm",
+        "gru",
+        "arima",
+        "random_forest",
+        "panel_gru",
+        "panel_lstm",
+        "gcn",
+        "gat",
+        "nnconv",
+        "graphsage",
+        "stgnn",
+    ],
+    "recurrent": ["lstm", "gru"],
+    "sequence": ["lstm", "gru"],
+    "classical": ["arima", "random_forest"],
+    "tabular": ["random_forest"],
+    "tree": ["random_forest"],
+    "panel": ["panel_gru", "panel_lstm"],
+    "static_graph": ["gcn", "gat", "nnconv", "graphsage"],
+    "graph": ["gcn", "gat", "nnconv", "graphsage", "stgnn"],
+    "gnn": ["gcn", "gat", "nnconv", "graphsage", "stgnn"],
+}
+
+
+def parse_model_spec(model_spec: str, available_models: List[str]) -> List[str]:
+    """
+    Supports:
+    - LSTM
+    - LSTM,GRU,GCN
+    - all
+    - recurrent
+    - panel
+    - static_graph
+    - graph
+    """
+    canonical = {
+        str(model).strip().lower(): str(model).strip().lower()
+        for model in available_models
+        if str(model).strip()
+    }
+    raw = str(model_spec or "").strip()
+    if not raw:
+        raise ValueError("Please enter a model selection.")
+
+    requested: List[str] = []
+    for part in [p.strip().lower() for p in raw.split(",") if p.strip()]:
+        part = part.replace(" ", "_")
+        if part in MODEL_FAMILIES:
+            requested.extend(MODEL_FAMILIES[part])
+        elif part in canonical:
+            requested.append(part)
+        else:
+            supported = sorted(set(canonical) | set(MODEL_FAMILIES))
+            raise ValueError(
+                f"Unknown model or family '{part}'. Supported: {', '.join(supported)}"
+            )
+
+    return _dedupe_keep_order(requested)

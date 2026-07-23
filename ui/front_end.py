@@ -11,11 +11,11 @@ import pandas as pd
 from matplotlib import pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
-from matplotlib.patches import Patch
 
 from core.job_queue import (
     QueueJob,
     JobQueueController,
+    parse_model_spec,
     parse_seed_spec,
     parse_ticker_spec,
 )
@@ -78,6 +78,8 @@ class FrontEnd:
         self.queue_popout = None
         self.queue_popout_table = None
         self.queueGraphModelMenu = None
+        self._queue_item_to_indices = {}
+        self._queue_popout_item_to_indices = {}
 
         # ------------------------------------------------------------------
         # Notebook
@@ -156,9 +158,17 @@ class FrontEnd:
 
         tk.Label(self.configGroup, text="Model").grid(row=0, column=4, sticky="w", padx=(0, 4))
         self.modelValues = [
+            "ALL",
+            "RECURRENT",
+            "CLASSICAL",
+            "TABULAR",
+            "PANEL",
+            "STATIC_GRAPH",
+            "GRAPH",
             "LSTM",
             "GRU",
             "ARIMA",
+            "RANDOM_FOREST",
             "PANEL_GRU",
             "PANEL_LSTM",
             "GCN",
@@ -173,7 +183,7 @@ class FrontEnd:
             textvariable=self.modelVar,
             values=self.modelValues,
             width=13,
-            state="readonly",
+            state="normal",
         )
         self.modelMenu.grid(row=1, column=4, sticky="ew", padx=(0, 10))
         self.modelMenu.bind("<<ComboboxSelected>>", self._on_model_selection_change)
@@ -256,7 +266,9 @@ class FrontEnd:
         queue_body.pack(fill=tk.X, expand=True)
 
         queue_cols = ("Job ID", "Window", "Ticker", "Model", "Seed", "Graph", "k", "Mode", "Embed", "Ablation", "Seq")
-        self.queueTable = ttk.Treeview(self.queueFrame, columns=queue_cols, show="headings", height=4)
+        self.queueTable = ttk.Treeview(self.queueFrame, columns=queue_cols, show="tree headings", height=4)
+        self.queueTable.heading("#0", text="Suite")
+        self.queueTable.column("#0", width=210, anchor=tk.W)
         for c in queue_cols:
             self.queueTable.heading(c, text=c)
             self.queueTable.column(c, width=90 if c in {"k", "Seq"} else 110, anchor=tk.CENTER)
@@ -473,7 +485,7 @@ class FrontEnd:
         self.evaluator = EvaluationMethods(self)
         self.evaluator.reset_histories()
 
-        self.root.after(100, self._schedule_rebalance())
+        self._rebalance_job = self.root.after(100, self._schedule_rebalance)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.root.bind(
@@ -511,6 +523,11 @@ class FrontEnd:
     def ui_call(self, fn, *args, **kwargs):
         if self._closing:
             return
+        if threading.current_thread() is threading.main_thread():
+            try:
+                return fn(*args, **kwargs)
+            except (RuntimeError, tk.TclError):
+                return
         try:
             self.root.after(0, lambda: fn(*args, **kwargs))
         except (RuntimeError, tk.TclError):
@@ -533,22 +550,12 @@ class FrontEnd:
             return
 
         df_trimmed = self.priceHistory[ticker]
-        interval = Utils.infer_interval_label(df_trimmed.index)
         data_len = len(df_trimmed)
-        est_days = self.bars_to_days(data_len, interval)
-        start = df_trimmed.index[0]
-        end = df_trimmed.index[-1]
-        duration = end - start
 
         self.windowOptions = list(range(1, data_len + 1))
         self.currentWindowIdx = data_len - 1
         self.zoomSlider.config(from_=1, to=data_len, resolution=1)
         self.zoomSlider.set(self.currentWindowIdx + 1)
-
-        print(
-            f"[DEBUG] {ticker}: {data_len} bars ({interval}) ~= {est_days:.1f} trading days, "
-            f"{duration.days} calendar days from {start.date()} to {end.date()} -> windowOptions=1...{data_len}"
-        )
 
         raw_df = self._main_app.raw_feature_dfs[ticker]
         self._refresh_and_plot(ticker, raw_df, num_bars=self.currentWindowIdx + 1)
@@ -600,6 +607,8 @@ class FrontEnd:
             "lstm": "LSTM",
             "gru": "GRU",
             "arima": "ARIMA",
+            "random_forest": "Random Forest",
+            "rf": "Random Forest",
             "panel_gru": "PANEL GRU",
             "panel_lstm": "PANEL LSTM",
             "gcn": "GCN",
@@ -612,7 +621,7 @@ class FrontEnd:
         key = str(model_name).strip().lower()
         pretty = labels.get(key, key.upper())
 
-        if key in ("lstm", "gru", "arima"):
+        if key in ("lstm", "gru", "arima", "random_forest", "rf"):
             self.graphFrame.config(text=f"{pretty} Target Node")
         elif key in ("panel_gru", "panel_lstm"):
             self.graphFrame.config(text=f"{pretty} Panel Nodes (no graph edges used)")
@@ -653,7 +662,14 @@ class FrontEnd:
         self._close_callback = cb
 
     def _is_graph_backend_applicable(self, model_name: str) -> bool:
-        return str(model_name).strip().lower() == "stgnn"
+        try:
+            selected_models = parse_model_spec(
+                str(model_name).strip(),
+                [m.lower() for m in self.modelValues],
+            )
+        except Exception:
+            selected_models = [str(model_name).strip().lower()]
+        return "stgnn" in selected_models
 
     def _sync_graph_backend_state(self):
         selected_model = str(self.modelVar.get()).strip().lower()
@@ -679,41 +695,83 @@ class FrontEnd:
             rng_seed=first_seed,
         )
 
+    def _parse_selected_models(self) -> List[str]:
+        concrete_models = [
+            "lstm",
+            "gru",
+            "arima",
+            "random_forest",
+            "panel_gru",
+            "panel_lstm",
+            "gcn",
+            "gat",
+            "nnconv",
+            "graphsage",
+            "stgnn",
+        ]
+        return parse_model_spec(
+            model_spec=str(self.modelVar.get()).strip(),
+            available_models=concrete_models,
+        )
+
+    @staticmethod
+    def _format_suite_label(*, tickers: List[str], models: List[str], seeds: List[int], window: str) -> str:
+        ticker_label = tickers[0] if len(tickers) == 1 else f"{len(tickers)} stocks"
+        model_label = models[0].upper() if len(models) == 1 else f"{len(models)} models"
+        seed_label = str(seeds[0]) if len(seeds) == 1 else f"{len(seeds)} seeds"
+        return f"{ticker_label} x {model_label} x {seed_label} x {window}"
+
     def _build_current_jobs(self) -> List[QueueJob]:
         seed_values = parse_seed_spec(str(self.seedVar.get()).strip())
         ticker_values = self._parse_selected_tickers()
-
-        model_name = str(self.modelVar.get()).strip().lower()
-        graph_model = (
-            str(self.graphModelVar.get()).strip().lower()
-            if self._is_graph_backend_applicable(model_name)
-            else "gcn"
-        )
+        model_values = self._parse_selected_models()
         controls = self.export_experiment_controls()
+        window = str(self.windowVar.get()).strip()
+        suite_total = len(ticker_values) * len(model_values) * len(seed_values)
+        suite_id = JobQueueController.make_job_id("SUITE") if suite_total > 1 else ""
+        suite_label = (
+            self._format_suite_label(
+                tickers=ticker_values,
+                models=model_values,
+                seeds=seed_values,
+                window=window,
+            )
+            if suite_total > 1
+            else ""
+        )
 
         jobs: List[QueueJob] = []
         for ticker in ticker_values:
-            for seed in seed_values:
-                jobs.append(
-                    QueueJob(
-                        job_id=JobQueueController.make_job_id(),
-                        created_at="now",
-                        prediction_window=str(self.windowVar.get()).strip(),
-                        ticker=ticker,
-                        model=model_name,
-                        seed=int(seed),
-                        graph_model=graph_model,
-                        k=controls["k"],
-                        graph_mode=controls["graph_mode"],
-                        graph_embed=controls["graph_embed"],
-                        graph_ablation=controls["graph_ablation"],
-                        ablate_feature=controls["ablate_feature"],
-                        seq_len=controls["seq_len"],
-                        batch_size=controls["batch_size"],
-                        lstm_epochs=controls["lstm_epochs"],
-                        stgnn_epochs=controls["stgnn_epochs"],
-                    )
+            for model_name in model_values:
+                graph_model = (
+                    str(self.graphModelVar.get()).strip().lower()
+                    if model_name == "stgnn"
+                    else "gcn"
                 )
+                for seed in seed_values:
+                    jobs.append(
+                        QueueJob(
+                            job_id=JobQueueController.make_job_id(),
+                            created_at="now",
+                            prediction_window=window,
+                            ticker=ticker,
+                            model=model_name,
+                            seed=int(seed),
+                            graph_model=graph_model,
+                            k=controls["k"],
+                            graph_mode=controls["graph_mode"],
+                            graph_embed=controls["graph_embed"],
+                            graph_ablation=controls["graph_ablation"],
+                            ablate_feature=controls["ablate_feature"],
+                            seq_len=controls["seq_len"],
+                            batch_size=controls["batch_size"],
+                            lstm_epochs=controls["lstm_epochs"],
+                            stgnn_epochs=controls["stgnn_epochs"],
+                            suite_id=suite_id,
+                            suite_label=suite_label,
+                            suite_total=suite_total,
+                        )
+                    )
         return jobs
 
     def _onAddToQueue(self):
@@ -738,8 +796,9 @@ class FrontEnd:
         selected = self.queueTable.selection()
         if not selected or self._queue_remove_callback is None:
             return
-        idx = self.queueTable.index(selected[0])
-        self._queue_remove_callback(idx)
+        indices = self._queue_item_to_indices.get(selected[0], [])
+        if indices:
+            self._queue_remove_callback(indices)
 
     def _onRemoveQueuePopoutItem(self):
         if self.queue_popout_table is None or self._queue_remove_callback is None:
@@ -747,8 +806,9 @@ class FrontEnd:
         selected = self.queue_popout_table.selection()
         if not selected:
             return
-        idx = self.queue_popout_table.index(selected[0])
-        self._queue_remove_callback(idx)
+        indices = self._queue_popout_item_to_indices.get(selected[0], [])
+        if indices:
+            self._queue_remove_callback(indices)
 
     def _onClearQueue(self):
         if self._queue_clear_callback is not None:
@@ -781,51 +841,115 @@ class FrontEnd:
             pass
         self.queue_popout = None
 
-    def refresh_queue_table(self, jobs):
-        def _apply():
-            self.queueTable.delete(*self.queueTable.get_children())
-            for job in jobs:
-                self.queueTable.insert(
+    @staticmethod
+    def _job_values(job):
+        return (
+            job.job_id,
+            job.prediction_window,
+            job.ticker,
+            job.model.upper(),
+            job.seed,
+            job.graph_model.upper(),
+            job.k,
+            job.graph_mode,
+            job.graph_embed,
+            job.graph_ablation,
+            job.seq_len,
+        )
+
+    @staticmethod
+    def _group_queue_jobs(jobs):
+        groups = []
+        suite_positions = {}
+
+        for index, job in enumerate(jobs):
+            suite_id = str(getattr(job, "suite_id", "") or "")
+            if suite_id:
+                if suite_id not in suite_positions:
+                    suite_positions[suite_id] = len(groups)
+                    groups.append({
+                        "suite_id": suite_id,
+                        "label": getattr(job, "suite_label", "") or suite_id,
+                        "items": [],
+                    })
+                groups[suite_positions[suite_id]]["items"].append((index, job))
+            else:
+                groups.append({
+                    "suite_id": "",
+                    "label": "",
+                    "items": [(index, job)],
+                })
+
+        return groups
+
+    def _populate_queue_tree(self, tree, jobs, item_map):
+        tree.delete(*tree.get_children())
+        item_map.clear()
+
+        for group in self._group_queue_jobs(jobs):
+            items = group["items"]
+            if len(items) > 1:
+                indices = [idx for idx, _job in items]
+                first_job = items[0][1]
+                tickers = sorted({job.ticker for _idx, job in items})
+                models = sorted({job.model.upper() for _idx, job in items})
+                seeds = sorted({int(job.seed) for _idx, job in items})
+                parent_id = tree.insert(
                     "",
                     "end",
+                    text=group["label"],
+                    open=False,
                     values=(
-                        job.job_id,
-                        job.prediction_window,
-                        job.ticker,
-                        job.model.upper(),
-                        job.seed,
-                        job.graph_model.upper(),
-                        job.k,
-                        job.graph_mode,
-                        job.graph_embed,
-                        job.graph_ablation,
-                        job.seq_len,
+                        group["suite_id"],
+                        first_job.prediction_window,
+                        f"{len(tickers)} stocks",
+                        f"{len(models)} models",
+                        f"{len(seeds)} seeds",
+                        "",
+                        first_job.k,
+                        first_job.graph_mode,
+                        first_job.graph_embed,
+                        first_job.graph_ablation,
+                        first_job.seq_len,
                     ),
                 )
+                item_map[parent_id] = indices
+                for idx, job in items:
+                    child_id = tree.insert(
+                        parent_id,
+                        "end",
+                        text="",
+                        values=self._job_values(job),
+                    )
+                    item_map[child_id] = [idx]
+            else:
+                idx, job = items[0]
+                item_id = tree.insert(
+                    "",
+                    "end",
+                    text="",
+                    values=self._job_values(job),
+                )
+                item_map[item_id] = [idx]
+
+    def refresh_queue_table(self, jobs):
+        def _apply():
+            self._last_queue_jobs = list(jobs)
+            self._populate_queue_tree(
+                self.queueTable,
+                self._last_queue_jobs,
+                self._queue_item_to_indices,
+            )
 
             self._clear_dead_queue_popout_refs()
 
             if self.queue_popout_table is not None:
                 try:
-                    self.queue_popout_table.delete(*self.queue_popout_table.get_children())
-                    for job in jobs:
-                        self.queue_popout_table.insert(
-                            "",
-                            "end",
-                            values=(
-                                job.job_id,
-                                job.prediction_window,
-                                job.ticker,
-                                job.model.upper(),
-                                job.seed,
-                                job.graph_model.upper(),
-                                job.k,
-                                job.graph_mode,
-                                job.graph_embed,
-                                job.graph_ablation,
-                                job.seq_len,
-                            ),
-                        )
+                    self._populate_queue_tree(
+                        self.queue_popout_table,
+                        self._last_queue_jobs,
+                        self._queue_popout_item_to_indices,
+                    )
                 except tk.TclError:
                     self.queue_popout_table = None
 
@@ -851,7 +975,9 @@ class FrontEnd:
         self._build_queue_popout_controls(self.queue_popout)
 
         cols = ("Job ID", "Window", "Ticker", "Model", "Seed", "Graph", "k", "Mode", "Embed", "Ablation", "Seq")
-        self.queue_popout_table = ttk.Treeview(self.queue_popout, columns=cols, show="headings")
+        self.queue_popout_table = ttk.Treeview(self.queue_popout, columns=cols, show="tree headings")
+        self.queue_popout_table.heading("#0", text="Suite")
+        self.queue_popout_table.column("#0", width=260, anchor=tk.W)
         for c in cols:
             self.queue_popout_table.heading(c, text=c)
             self.queue_popout_table.column(c, width=90 if c in {"k", "Seq"} else 120, anchor=tk.CENTER)
@@ -863,10 +989,11 @@ class FrontEnd:
             return
 
         try:
-            self.queue_popout_table.delete(*self.queue_popout_table.get_children())
-            for item in self.queueTable.get_children():
-                values = self.queueTable.item(item).get("values", [])
-                self.queue_popout_table.insert("", "end", values=values)
+            self._populate_queue_tree(
+                self.queue_popout_table,
+                list(getattr(self, "_last_queue_jobs", [])),
+                self._queue_popout_item_to_indices,
+            )
         except tk.TclError:
             self.queue_popout_table = None
 
@@ -897,7 +1024,9 @@ class FrontEnd:
         add_combo(self.stockVar, list(self.stockMenu.cget("values")), 1, 1, width=18).configure(state="normal")
 
         add_label("Model", 0, 2)
-        add_combo(self.modelVar, self.modelValues, 1, 2, width=14).bind("<<ComboboxSelected>>", self._on_model_selection_change)
+        model_combo = add_combo(self.modelVar, self.modelValues, 1, 2, width=14)
+        model_combo.configure(state="normal")
+        model_combo.bind("<<ComboboxSelected>>", self._on_model_selection_change)
 
         add_label("Seeds", 0, 3)
         add_entry(self.seedVar, 1, 3, width=12)
@@ -980,13 +1109,19 @@ class FrontEnd:
             self.set_status("Please wait until loading finishes.")
             return
 
-        selected_model = self.get_selected_model()
-
         try:
+            selected_models = self._parse_selected_models()
             tickers = self._parse_selected_tickers()
         except Exception as exc:
             self.set_status(str(exc))
             return
+
+        if len(selected_models) != 1:
+            self.set_status("Compute supports one model only. Use Add To Queue for model families.")
+            return
+
+        selected_model = selected_models[0]
+        self.modelVar.set(selected_model.upper())
 
         if len(tickers) != 1:
             self.set_status("Compute ▶ supports one ticker only. Use Add To Queue for multi-stock specs.")
@@ -1019,15 +1154,14 @@ class FrontEnd:
                     else:
                         self.updateResults(self.modelVar.get(), "—", 0.0)
 
-                self.root.after(0, _update_result)
+                self.ui_call(_update_result)
         except Cancelled:
             cancelled = True
         finally:
             if cancelled:
-                self.root.after(0, self._reset_ui)
+                self.ui_call(self._reset_ui)
             else:
-                self.root.after(
-                    0,
+                self.ui_call(
                     lambda: (
                         self.btnCompute.config(state=tk.NORMAL, text="Compute ▶"),
                         self.btnStop.config(state=tk.DISABLED),
@@ -1290,11 +1424,17 @@ class FrontEnd:
         coords = state.get("coords")
         pruned = state.get("pruned") or []
         mst = state.get("mst") or []
+        ticker_to_sector = state.get("ticker_to_sector")
+        if ticker_to_sector is None:
+            graph_builder = state.get("graphBuilder")
+            ticker_to_sector = getattr(graph_builder, "ticker_to_sector", None)
 
         if coords is None or not tickers:
             return
 
         def _draw():
+            if ticker_to_sector:
+                self.set_sector_map(ticker_to_sector)
             self.plot3d_on_ax(
                 tickers=list(tickers),
                 coords=np.asarray(coords),
@@ -1312,22 +1452,19 @@ class FrontEnd:
             tk.Label(self.legend_frame, text="(sector map not loaded)").pack(anchor="w")
             return
 
-        patches = []
         for sector, colour in sorted(self._sector_to_colour.items()):
-            patches.append(Patch(facecolor=colour, edgecolor="black", label=sector))
-
-        legend_fig = Figure(figsize=(2.6, 4.5), dpi=100)
-        legend_ax = legend_fig.add_subplot(111)
-        legend_ax.axis("off")
-        legend_ax.legend(
-            handles=patches,
-            loc="upper left",
-            frameon=False,
-            fontsize=8,
-        )
-        canvas = FigureCanvasTkAgg(legend_fig, master=self.legend_frame)
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        canvas.draw_idle()
+            row = tk.Frame(self.legend_frame)
+            row.pack(anchor="w", fill=tk.X, pady=2)
+            swatch = tk.Canvas(row, width=18, height=12, highlightthickness=0)
+            swatch.pack(side=tk.LEFT, padx=(0, 6))
+            rgba = tuple(float(v) for v in colour[:3])
+            hex_colour = "#{:02x}{:02x}{:02x}".format(
+                int(max(0.0, min(1.0, rgba[0])) * 255),
+                int(max(0.0, min(1.0, rgba[1])) * 255),
+                int(max(0.0, min(1.0, rgba[2])) * 255),
+            )
+            swatch.create_rectangle(1, 1, 17, 11, fill=hex_colour, outline="black")
+            tk.Label(row, text=str(sector), anchor="w", justify=tk.LEFT).pack(side=tk.LEFT, fill=tk.X)
 
     def _sector_palette(self, sectors: List[str]):
         unique = sorted(set(sectors))
@@ -1426,8 +1563,10 @@ class FrontEnd:
                         elif widget is self.graphModelMenu:
                             selected_model = str(self.modelVar.get()).strip().lower()
                             widget.configure(state="readonly" if self._is_graph_backend_applicable(selected_model) else tk.DISABLED)
-                        elif widget in (self.universeMenu, self.windowMenu, self.modelMenu):
+                        elif widget in (self.universeMenu, self.windowMenu):
                             widget.configure(state="readonly")
+                        elif widget is self.modelMenu:
+                            widget.configure(state="normal")
                         elif widget is self.stockMenu:
                             widget.configure(state="normal")
                         else:
@@ -1485,6 +1624,10 @@ class FrontEnd:
     def _apply_loaded_universe(self, selected_label: str, valid_tickers):
         valid_tickers = list(valid_tickers or [])
         self.stockMenu.configure(values=valid_tickers)
+        if self._main_app is not None:
+            universe_info = getattr(self._main_app, "universe_info", None)
+            if isinstance(universe_info, dict):
+                self.set_sector_map(universe_info.get("ticker_to_sector", {}))
 
         if valid_tickers:
             self.stockVar.set(valid_tickers[0])
@@ -1676,7 +1819,15 @@ class FrontEnd:
         return self.backtest_pane
 
     def set_sector_map(self, ticker_to_sector):
-        self.ticker_to_sector = dict(ticker_to_sector or {})
+        if threading.current_thread() is not threading.main_thread():
+            self.ui_call(self.set_sector_map, ticker_to_sector)
+            return
+
+        self.ticker_to_sector = {
+            str(ticker).strip().upper(): str(sector).strip()
+            for ticker, sector in dict(ticker_to_sector or {}).items()
+            if str(ticker).strip()
+        }
         sectors = list(self.ticker_to_sector.values())
         self._sector_to_colour = self._sector_palette(sectors) if sectors else {}
         self.update_sector_legend()
@@ -1816,6 +1967,9 @@ class FrontEnd:
         )
 
     def _schedule_rebalance(self):
+        if self._closing:
+            return
+
         # Cancel previous job safely
         job = getattr(self, "_rebalance_job", None)
         if job is not None:
@@ -1846,6 +2000,19 @@ class FrontEnd:
                 self.root.after_cancel(job)
             except Exception:
                 pass
+        self._rebalance_job = None
+
+        # Headless mode never enters mainloop, so callbacks registered by Tk or
+        # matplotlib can otherwise survive until interpreter finalisation.
+        try:
+            pending = self.root.tk.call("after", "info")
+            for callback_id in pending:
+                try:
+                    self.root.after_cancel(callback_id)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         try:
             if self._close_callback is not None:

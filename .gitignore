@@ -10,6 +10,8 @@ __pycache__
 /exports/
 # C extensions
 *.so
+.codex/
+.agents/
 
 # Distribution / packaging
 .Python

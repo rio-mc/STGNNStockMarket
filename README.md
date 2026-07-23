@@ -115,6 +115,59 @@ python -m core.main --run_mode headless
 
 Headless mode loads data, runs the pipeline, executes the selected model, stores results, and prints a terminal report.
 
+Run all 14 model configurations for one target stock and one seed:
+
+```powershell
+python scripts/run_all_models.py `
+  --target_stock AAPL `
+  --seed 42 `
+  --dataset_name sp500 `
+  --top_n 50 `
+  --interval 1h `
+  --prediction_window 1d
+```
+
+This includes the ten non-STGNN models plus STGNN-GCN, STGNN-GraphSAGE,
+STGNN-GAT, and STGNN-NNConv. The script is only a sweeper: it invokes the
+existing `python -m core.main --run_mode headless` CLI once per configuration.
+That CLI remains responsible for data, execution, evaluation, and result
+storage. A failed child process is reported without preventing the next model
+from running. Use `--only <label> ...` for a short smoke test;
+`python scripts/run_all_models.py --list-models` prints all valid labels.
+
+Run the resumable full benchmark across every static S&P 500 and Nasdaq-100
+ticker, four seeds, and `k=0..7`:
+
+```powershell
+python scripts/run_full_benchmark.py `
+  --datasets sp500 nasdaq100 `
+  --seeds 42 43 44 45 `
+  --k-values 0 1 2 3 4 5 6 7 `
+  --interval 1h `
+  --prediction_window 1d `
+  --training-log summary `
+  --headless-report compact `
+  --results_dir ./results/full_benchmark `
+  --resume
+```
+
+The launcher varies `k` only for the eight graph-sensitive configurations;
+the six recurrent, classical, and panel configurations run once per
+ticker/seed because their predictions cannot depend on graph connectivity.
+With the bundled 50-stock S&P and 94-stock Nasdaq snapshots, this produces
+40,320 result rows in 1,296 restartable worker groups. Each result is persisted
+immediately. The benchmark manifest freezes the market-data window, and the
+Yahoo loader caches that exact window under `.cache/prices/yahoo` for reuse.
+Re-run the same command with `--resume` after an interruption.
+
+For graph and STGNN rows, the flat result CSV also records requested/effective
+`k`, node and edge counts, MST edge count, density, mean degree, connected
+components, isolated nodes, and `sector_edge_homophily`. Homophily is the share
+of eligible undirected edges whose endpoints have the same known sector; its
+numerator and denominator are stored as `sector_homophilous_edges` and
+`sector_homophily_eligible_edges`. These fields are non-applicable for
+recurrent, classical, and panel models.
+
 ---
 
 ## 04 / CONFIGURATION SPACE
@@ -132,6 +185,11 @@ The configuration space is the research interface.
 | `--custom_tickers` | Explicit ticker list |
 | `--interval` | Price interval, for example `1h` |
 | `--prediction_window` | Forecast horizon, for example `1d` |
+| `--headless-report` | `compact` (default), `full`, or `none` terminal result format |
+| `--training-log` | `summary` (default), `quiet`, or `epochs` training detail |
+| `--train_split_ratio` | Chronological training fraction before purging (default: 0.60) |
+| `--validation_split_ratio` | Chronological validation fraction before the test split (default: 0.20) |
+| `--decision-threshold-policy` | `macro_f1_dense` by default; `fixed` retains a 0.5 operating threshold |
 | `--results_dir` | Output directory |
 | `--experiment_name` | Human-readable experiment label |
 | `--seed` | Random seed |
@@ -145,6 +203,8 @@ The configuration space is the research interface.
 | `--batch_size` | Training batch size |
 | `--lstm_epochs` | Epochs for recurrent and panel recurrent models |
 | `--stgnn_epochs` | Epochs for graph and spatio-temporal models |
+| `--lr_plateau_patience` | Validation-loss plateau epochs before reducing the learning rate (default: 5) |
+| `--early_stopping_patience` | Validation-loss plateau epochs before stopping and restoring the best model (default: 15) |
 
 ### 04.3 / GRAPH CONSTRUCTION
 
@@ -226,10 +286,13 @@ results_smoke/
   runs/
     experiments.jsonl
     experiments.csv
+    run_results.csv
     histories/
-    recurrent/
-    graph/
-    stgnn/
+    recurrent/run_results.csv
+    panel/run_results.csv
+    classical/run_results.csv
+    graph/run_results.csv
+    stgnn/run_results.csv
   graph_logging/
 ```
 
@@ -239,6 +302,14 @@ results_smoke/
 |---|---|
 | `runs/experiments.jsonl` | Full experiment records |
 | `runs/experiments.csv` | Tabular experiment summary |
+| `runs/run_results.csv` | Stable, one-row-per-run analysis table containing classification, strategy, threshold and compute columns |
+| `runs/<model-family>/run_results.csv` | The same stable rows filtered into recurrent, panel, classical, graph and STGNN families |
+
+Rebuild these analysis tables from historical JSONL records at any time:
+
+```powershell
+python scripts/rebuild_run_results.py --results_dir ./results
+```
 
 Each run record includes:
 
@@ -260,7 +331,7 @@ result paths
 | `result.json` | Main result payload |
 | `config.json` | Configuration snapshot |
 | `graph_stats.json` | Graph diagnostics, where applicable |
-| `history.json` | Training and validation history, where applicable |
+| `history.json` | Training and evaluation history, where applicable |
 
 ### 06.3 / GRAPH DIAGNOSTICS
 
@@ -276,6 +347,18 @@ result paths
 ---
 
 ## 07 / EVALUATION PIPELINE
+
+Data is split chronologically with no shuffling across time:
+
+```text
+TRAIN (60%) | H-bar purge | VALIDATION (20%) | H-bar purge | TEST (20%)
+```
+
+`H` is the prediction horizon in bars. Normalisation statistics and graph
+construction are fitted on training data only. Validation controls learning-rate
+scheduling, early stopping, checkpoint selection, and macro-F1 decision-threshold
+selection. The selected threshold is frozen before test evaluation. Test data is
+used once for reported classification and backtest metrics.
 
 Main interface:
 
@@ -302,15 +385,18 @@ F1, macro
 ROC-AUC
 Average precision
 Dense validation loss
+Dense held-out test loss
 ```
 
 ### 07.2 / THRESHOLD DIAGNOSTICS
 
-The system reports:
+The default operational policy selects the macro-F1-optimal threshold on validation
+data and applies it unchanged to test. The system reports:
 
 ```text
-fixed threshold performance, usually 0.500
-best dense macro-F1 threshold
+operational threshold performance
+macro-F1 threshold selected on validation and applied unchanged to test
+fixed 0.5 threshold performance as a robustness baseline
 ```
 
 ### 07.3 / TRADE-ALIGNED METRICS
@@ -1112,7 +1198,34 @@ experiments.csv contains k, graph_mode, graph_embed, graph_ablation, ablate_feat
 graph stats exist for graph-aware models
 metric_macro_f1_dense / metric_roc_auc_dense / trade metrics are populated
 energy and train time are populated
+capacity fields are populated using the model-family-specific measure
 ```
+
+Capacity is recorded as a profile rather than a single supposedly universal
+parameter count:
+
+```text
+neural / graph / STGNN : total parameters, trainable parameters, parameter bytes
+random forest          : estimators, total nodes/leaves, observed depth, feature count
+ARIMA                  : (p,d,q), fitted coefficients, state dimension, AIC/BIC
+```
+
+`capacity_primary_measure` and `capacity_primary_value` identify the natural
+within-family capacity measure. Do not treat one tree node as equivalent to one
+neural weight or one ARIMA coefficient. Use `parameter_storage_bytes`, training
+time, energy and inference cost for cross-family efficiency comparisons.
+
+Training-volume fields are also explicit:
+
+```text
+train_examples_unique : distinct raw observations or supervised windows
+sample_exposures      : cumulative windows processed across neural epochs
+epochs_completed      : completed neural training epochs
+training_sample_unit  : raw_time_observation or supervised_window
+```
+
+The legacy `train_samples` field remains for compatibility but may represent
+cumulative neural sample exposures.
 
 Use the suite structure for the results narrative:
 

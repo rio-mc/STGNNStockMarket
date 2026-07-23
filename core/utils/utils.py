@@ -4,7 +4,10 @@ import warnings
 import numpy as np
 import torch
 import networkx as nx
-from pympler import asizeof
+try:
+    from pympler import asizeof
+except ImportError:
+    asizeof = None
 import pandas as pd
 from torch.optim import AdamW
 from pathlib import Path
@@ -96,6 +99,7 @@ class Utils:
         # Optional determinism controls
         torch.backends.cudnn.deterministic = deterministic
         torch.backends.cudnn.benchmark = not deterministic
+        torch.use_deterministic_algorithms(bool(deterministic), warn_only=False)
 
         return seed
             
@@ -141,7 +145,7 @@ class Utils:
     def log_graph_memory(G: nx.Graph, coords: np.ndarray, edge_index: torch.Tensor, tag="Graph"):
         # ====================================
 		# === Helper to log graph memory consumption
-        G_bytes = asizeof.asizeof(G)
+        G_bytes = asizeof.asizeof(G) if asizeof is not None else 0
         coords_bytes = coords.nbytes
         ei_bytes = edge_index.element_size() * edge_index.nelement()
         print(f"[Memory] {tag} NetworkX Size: {G_bytes / 1024:.2f} KB")

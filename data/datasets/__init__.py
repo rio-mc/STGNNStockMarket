@@ -1,5 +1,9 @@
 from .recurrent_dataset import RecurrentDataset
-from .stgnn_dataset import STGNNDataset
+
+try:
+    from .stgnn_dataset import STGNNDataset
+except ImportError:
+    STGNNDataset = None
 
 __all__ = [
     "RecurrentDataset",

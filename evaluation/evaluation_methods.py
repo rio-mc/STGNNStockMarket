@@ -65,6 +65,7 @@ class EvaluationMethods:
         self.loss_val_canvas.get_tk_widget().pack(fill="both", expand=True)
 
         self.current_model_name: Optional[str] = None
+        self.current_evaluation_split: str = "evaluation"
         self.loss_history_train: List[float] = []
         self.loss_history_val: List[dict] = []
 
@@ -86,6 +87,7 @@ class EvaluationMethods:
 
     def reset_histories(self) -> None:
         self.current_model_name = None
+        self.current_evaluation_split = "evaluation"
         self.loss_history_train = []
         self.loss_history_val = []
 
@@ -119,6 +121,9 @@ class EvaluationMethods:
             return None
 
         self.current_model_name = str(model_name).upper()
+        self.current_evaluation_split = str(
+            (getattr(result, "metadata", {}) or {}).get("evaluation_split", "evaluation")
+        )
         self.loss_history_train = list(result.hist_train or [])
         self.loss_history_val = list(result.hist_val or [])
 
@@ -130,6 +135,7 @@ class EvaluationMethods:
             dense_thr=dense["dense_thr"],
             macro_f1_optimal_threshold=dense["macro_f1_optimal_threshold"],
             dense_metrics=dense["dense_metrics"],
+            fixed_05_metrics=dense["fixed_05_metrics"],
             macro_f1_optimised_metrics=dense["macro_f1_optimised_metrics"],
         )
 
@@ -141,6 +147,12 @@ class EvaluationMethods:
             dense["dense_pred"],
             dense["dense_thr"],
             dense["macro_f1_optimal_threshold"],
+            str(
+                (getattr(result, "metadata", {}) or {}).get(
+                    "decision_threshold_policy",
+                    "macro_f1_dense",
+                )
+            ),
         )
 
         backtest_result, trade_metrics, strategy_metrics = self.run_backtest_and_trade_metrics(
@@ -171,6 +183,7 @@ class EvaluationMethods:
             dense_thr=dense["dense_thr"],
             macro_f1_optimal_threshold=dense["macro_f1_optimal_threshold"],
             dense_metrics=dense["dense_metrics"],
+            fixed_05_metrics=dense["fixed_05_metrics"],
             macro_f1_optimised_metrics=dense["macro_f1_optimised_metrics"],
             trade_metrics=trade_metrics,
             strategy_metrics=strategy_metrics,
@@ -222,7 +235,7 @@ class EvaluationMethods:
             colour,
         )
 
-        self.ax_val.set_title("Validation Loss")
+        self.ax_val.set_title(f"{self.current_evaluation_split.title()} Loss")
         self.ax_val.set_xlabel("Date")
         self.ax_val.set_ylabel("Loss")
         if self.ax_val.get_legend_handles_labels()[0]:
@@ -245,13 +258,19 @@ class EvaluationMethods:
         dense_pred,
         dense_thr,
         macro_f1_optimal_threshold,
+        threshold_policy="fixed",
     ) -> None:
+        rule_name = (
+            "validation macro-F1"
+            if str(threshold_policy).strip().lower() == "macro_f1_dense"
+            else "fixed"
+        )
         self.plot_confusion_matrix(
             y_true=y_true,
             y_pred=dense_pred,
             model_name=model_name,
             thr=dense_thr,
-            rule_name="fixed",
+            rule_name=rule_name,
         )
         self.plot_roc_and_pr(
             truths=list(np.asarray(y_true, dtype=int)),
@@ -263,7 +282,7 @@ class EvaluationMethods:
             probs=probs,
             model_name=model_name,
             selected_thr=dense_thr,
-            selected_label="Fixed threshold",
+            selected_label="Operational threshold",
             best_thr=macro_f1_optimal_threshold,
         )
         self.frontend.refresh_selected_tabs()
@@ -554,13 +573,19 @@ class EvaluationMethods:
             "macro_f1",
         )
 
-        macro_f1_optimal_threshold = self._select_threshold(
-            truths=y_true,
-            probs=probs,
-            metric=threshold_selection_metric,
-        )
+        metadata = getattr(result, "metadata", {}) or {}
+        calibrated_threshold = metadata.get("threshold_macro_f1_validation")
+        if calibrated_threshold is None:
+            macro_f1_optimal_threshold = self._select_threshold(
+                truths=y_true,
+                probs=probs,
+                metric=threshold_selection_metric,
+            )
+        else:
+            macro_f1_optimal_threshold = float(calibrated_threshold)
 
         tuned_pred = (probs >= macro_f1_optimal_threshold).astype(int)
+        fixed_05_pred = (probs >= 0.5).astype(int)
 
         dense_metrics = self._classification_metrics(
             y_true=y_true,
@@ -573,6 +598,11 @@ class EvaluationMethods:
             y_pred=tuned_pred,
             probs=probs,
         )
+        fixed_05_metrics = self._classification_metrics(
+            y_true=y_true,
+            y_pred=fixed_05_pred,
+            probs=probs,
+        )
 
         return {
             "y_true": y_true,
@@ -582,6 +612,7 @@ class EvaluationMethods:
             "threshold_selection_metric": threshold_selection_metric,
             "macro_f1_optimal_threshold": macro_f1_optimal_threshold,
             "dense_metrics": dense_metrics,
+            "fixed_05_metrics": fixed_05_metrics,
             "macro_f1_optimised_metrics": macro_f1_optimised_metrics,
         }
 
@@ -657,6 +688,7 @@ class EvaluationMethods:
         dense_thr: float,
         macro_f1_optimal_threshold: float,
         dense_metrics: dict,
+        fixed_05_metrics: dict,
         macro_f1_optimised_metrics: dict,
         trade_metrics: dict,
         strategy_metrics: dict,
@@ -667,6 +699,8 @@ class EvaluationMethods:
             "model": str(model_name).upper(),
 
             "threshold_fixed": float(dense_thr),
+            "threshold_operational": float(dense_thr),
+            "threshold_fixed_05": 0.5,
             "threshold_macro_f1_dense": float(macro_f1_optimal_threshold),
             "threshold_selection_metric": getattr(
                 result,
@@ -674,13 +708,24 @@ class EvaluationMethods:
                 "macro_f1",
             ),
 
-            "val_loss_dense": getattr(result, "dense_val_loss", None),
+            "val_loss_dense": metadata.get(
+                "validation_loss_dense",
+                getattr(result, "dense_val_loss", None),
+            ),
+            "test_loss_dense": metadata.get(
+                "test_loss_dense",
+                getattr(result, "dense_val_loss", None),
+            ),
 
             "accuracy_dense": dense_metrics["accuracy"],
             "f1_dense": dense_metrics["f1"],
             "macro_f1_dense": dense_metrics["macro_f1"],
             "roc_auc_dense": dense_metrics["roc_auc"],
             "ap_dense": dense_metrics["ap"],
+
+            "accuracy_dense_fixed_05": fixed_05_metrics["accuracy"],
+            "f1_dense_fixed_05": fixed_05_metrics["f1"],
+            "macro_f1_dense_fixed_05": fixed_05_metrics["macro_f1"],
 
             "accuracy_dense_macro_f1_threshold": macro_f1_optimised_metrics["accuracy"],
             "f1_dense_macro_f1_threshold": macro_f1_optimised_metrics["f1"],
@@ -713,6 +758,8 @@ class EvaluationMethods:
 
             "graph_backend": metadata.get("graph_backend"),
             "graph_model": metadata.get("graph_model"),
+            "threshold_source": metadata.get("threshold_source"),
+            "evaluation_split": metadata.get("evaluation_split"),
         }
 
         try:
@@ -726,21 +773,30 @@ class EvaluationMethods:
         dense_thr: float,
         macro_f1_optimal_threshold: float,
         dense_metrics: dict,
+        fixed_05_metrics: dict,
         macro_f1_optimised_metrics: dict,
     ) -> None:
         print(
-            f"[{model_name} Evaluation][Dense] thr={dense_thr:.3f} (fixed) | "
+            f"[{model_name} Evaluation][Dense] thr={dense_thr:.3f} (operational) | "
             f"Acc={dense_metrics['accuracy']:.3f} | "
             f"F1(pos)={dense_metrics['f1']:.3f} | "
             f"F1(macro)={dense_metrics['macro_f1']:.3f} | "
             f"ROC-AUC={dense_metrics['roc_auc'] if dense_metrics['roc_auc'] is not None else float('nan'):.3f} | "
             f"AP={dense_metrics['ap'] if dense_metrics['ap'] is not None else float('nan'):.3f}"
         )
+        if abs(float(dense_thr) - float(macro_f1_optimal_threshold)) > 1e-12:
+            print(
+                f"[{model_name} Evaluation][Validation Macro-F1 Threshold] "
+                f"thr={macro_f1_optimal_threshold:.3f} | "
+                f"Acc={macro_f1_optimised_metrics['accuracy']:.3f} | "
+                f"F1(pos)={macro_f1_optimised_metrics['f1']:.3f} | "
+                f"F1(macro)={macro_f1_optimised_metrics['macro_f1']:.3f}"
+            )
         print(
-            f"[{model_name} Evaluation][Dense Supplementary] best macro-F1 threshold={macro_f1_optimal_threshold:.3f} | "
-            f"Acc={macro_f1_optimised_metrics['accuracy']:.3f} | "
-            f"F1(pos)={macro_f1_optimised_metrics['f1']:.3f} | "
-            f"F1(macro)={macro_f1_optimised_metrics['macro_f1']:.3f}"
+            f"[{model_name} Evaluation][Fixed 0.5 Baseline] "
+            f"Acc={fixed_05_metrics['accuracy']:.3f} | "
+            f"F1(pos)={fixed_05_metrics['f1']:.3f} | "
+            f"F1(macro)={fixed_05_metrics['macro_f1']:.3f}"
         )
 
     def log_trade_metrics(
@@ -752,7 +808,7 @@ class EvaluationMethods:
         n_exec: int,
     ) -> None:
         print(
-            f"[{model_name} Evaluation][Trade-aligned] thr={dense_thr:.3f} (fixed) | "
+            f"[{model_name} Evaluation][Trade-aligned] thr={dense_thr:.3f} (operational) | "
             f"N={n_exec} | "
             f"Acc={trade_metrics['accuracy']:.3f} | "
             f"F1(pos)={trade_metrics['f1']:.3f} | "

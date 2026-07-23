@@ -55,8 +55,15 @@ class HeadlessEvaluator:
 
         fixed_thr = float(getattr(result, "decision_threshold", 0.5) or 0.5)
         dense_pred = (probs >= fixed_thr).astype(int)
+        fixed_05_pred = (probs >= 0.5).astype(int)
 
-        best_thr = self._best_threshold_macro_f1(y_true, probs)
+        metadata = getattr(result, "metadata", {}) or {}
+        calibrated_threshold = metadata.get("threshold_macro_f1_validation")
+        best_thr = (
+            float(calibrated_threshold)
+            if calibrated_threshold is not None
+            else self._best_threshold_macro_f1(y_true, probs)
+        )
         tuned_pred = (probs >= best_thr).astype(int)
 
         roc_auc = None
@@ -80,7 +87,7 @@ class HeadlessEvaluator:
         )
 
         result.y_pred = dense_pred.astype(int).tolist()
-        result.metadata["decision_threshold_policy"] = "fixed"
+        result.metadata.setdefault("decision_threshold_policy", "macro_f1_dense")
 
         trade_metrics = self._compute_backtest_metrics(
             model_name=model_name,
@@ -95,14 +102,31 @@ class HeadlessEvaluator:
             model=str(model_name).upper(),
 
             threshold_fixed=fixed_thr,
+            threshold_operational=fixed_thr,
+            threshold_fixed_05=0.5,
             threshold_macro_f1_dense=best_thr,
-            val_loss_dense=getattr(result, "dense_val_loss", None),
+            val_loss_dense=metadata.get(
+                "validation_loss_dense",
+                getattr(result, "dense_val_loss", None),
+            ),
+            test_loss_dense=metadata.get(
+                "test_loss_dense",
+                getattr(result, "dense_val_loss", None),
+            ),
 
             accuracy_dense=float(accuracy_score(y_true, dense_pred)),
             f1_dense=float(f1_pos),
             macro_f1_dense=float(f1_score(y_true, dense_pred, average="macro")),
             roc_auc_dense=roc_auc,
             ap_dense=ap,
+
+            accuracy_dense_fixed_05=float(accuracy_score(y_true, fixed_05_pred)),
+            f1_dense_fixed_05=float(
+                f1_score(y_true, fixed_05_pred, average="binary", zero_division=0)
+            ),
+            macro_f1_dense_fixed_05=float(
+                f1_score(y_true, fixed_05_pred, average="macro", zero_division=0)
+            ),
 
             accuracy_dense_macro_f1_threshold=float(accuracy_score(y_true, tuned_pred)),
             f1_dense_macro_f1_threshold=float(tuned_f1_pos),
@@ -127,6 +151,8 @@ class HeadlessEvaluator:
             n_predictions_dense=int(len(y_true)),
             n_predictions_trade_aligned=trade_metrics["n_predictions_trade_aligned"],
             horizon=horizon,
+            threshold_source=metadata.get("threshold_source"),
+            evaluation_split=metadata.get("evaluation_split"),
         )
 
     def _compute_backtest_metrics(
@@ -225,14 +251,21 @@ class HeadlessEvaluator:
         return SimpleNamespace(
             model=str(model_name).upper(),
             threshold_fixed=0.5,
+            threshold_operational=0.5,
+            threshold_fixed_05=0.5,
             threshold_macro_f1_dense=0.5,
             val_loss_dense=val_loss_dense,
+            test_loss_dense=None,
 
             accuracy_dense=0.0,
             f1_dense=0.0,
             macro_f1_dense=0.0,
             roc_auc_dense=None,
             ap_dense=None,
+
+            accuracy_dense_fixed_05=0.0,
+            f1_dense_fixed_05=0.0,
+            macro_f1_dense_fixed_05=0.0,
 
             accuracy_dense_macro_f1_threshold=0.0,
             f1_dense_macro_f1_threshold=0.0,
@@ -255,6 +288,8 @@ class HeadlessEvaluator:
             n_predictions_dense=0,
             n_predictions_trade_aligned=0,
             horizon=horizon,
+            threshold_source=None,
+            evaluation_split=None,
         )
 
     @staticmethod
@@ -313,16 +348,22 @@ class HeadlessApp:
             handler.setFormatter(fmt)
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
         
         # Extract state components
         self.train_feats = state.get("train_feats", {})
         self.val_feats = state.get("val_feats", {})
+        self.test_feats = state.get("test_feats", {})
+        self.tf_train = state.get("tf_train")
+        self.tf_val = state.get("tf_val")
+        self.tf_test = state.get("tf_test")
         self.edge_index = state.get("edge_index", None)
         self.tickers = state.get("tickers", [])
         self.graphBuilder = state.get("graphBuilder", None)
         self.init_edge_index = self.edge_index  # For graph ablation
         self.horizon = state.get("horizon", 1)
         self.seq_len = state.get("seq_len", 10)
+        self.data_quality = state.get("data_quality")
         
         # Feature columns
         self.raw_feature_cols = raw_feature_cols or ["close", "return", "volatility", "momentum"]
@@ -337,6 +378,11 @@ class HeadlessApp:
             self.min_val_len = min(len(df) for df in self.val_feats.values())
         else:
             self.min_val_len = 0
+
+        if self.test_feats:
+            self.min_test_len = min(len(df) for df in self.test_feats.values())
+        else:
+            self.min_test_len = 0
         
         # Set up random seed
         self._setup_seed()
@@ -367,7 +413,7 @@ class HeadlessApp:
             if getattr(self.args, "deterministic", False):
                 torch.backends.cudnn.deterministic = True
                 torch.backends.cudnn.benchmark = False
-                torch.use_deterministic_algorithms(True, warn_only=True)
+                torch.use_deterministic_algorithms(True, warn_only=False)
     
     def _setup_dl_gen(self):
         """Set up DataLoader random generator."""

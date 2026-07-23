@@ -2,6 +2,7 @@ import gc
 import logging
 import os
 import signal
+import sys
 import threading
 from datetime import datetime
 
@@ -21,8 +22,6 @@ from data.price_loader import PriceLoaderRegistry
 from data.tensor_factory import TensorFactory
 from data.universe_service import UniverseService
 from data.yahoo_price_loader import YahooPriceLoader
-from ui.front_end import FrontEnd
-from ui.loading_overlay import LoadingOverlay
 
 from pathlib import Path
 
@@ -30,6 +29,33 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_IS_CLI_ENTRYPOINT = __name__ == "__main__"
+
+
+def _should_force_headless_cli_exit() -> bool:
+    return _IS_CLI_ENTRYPOINT and os.name == "nt"
+
+
+def _finish_successful_windows_headless_process(exit_code: int = 0) -> None:
+    """Exit after explicit cleanup without running fragile native destructors.
+
+    Some Windows CUDA/native-extension combinations terminate with 0xC0000409
+    while Python finalises native objects, even though the headless experiment has
+    already completed, persisted its result, and released its resources.  This
+    helper is deliberately called only after ``MainApp.run()`` returns
+    successfully, so training and persistence failures still propagate with a
+    non-zero process status.
+    """
+
+    try:
+        logging.shutdown()
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+    finally:
+        os._exit(int(exit_code))
 
 
 class LoadedPriceResult:
@@ -84,6 +110,9 @@ class MainApp:
 
         if not self.logger.handlers:
             self.logger.addHandler(handler)
+        # This logger owns its handler.  Do not send the same record to the
+        # root handler configured by graph_builder as well.
+        self.logger.propagate = False
 
         self.device = Utils.resolve_device(
             getattr(self.args, "device", "auto"),
@@ -119,19 +148,22 @@ class MainApp:
         self.args.tickers = sorted(self.args.tickers)
 
         run_mode = str(getattr(self.args, "run_mode", "gui")).strip().lower()
-        self.frontendApp = FrontEnd(self.args.tickers, project_root=PROJECT_ROOT)
-        self.frontendApp.setQueueAddCallback(self.enqueue_jobs)
-        self.frontendApp.setQueueRunCallback(self.run_queue)
-        self.frontendApp.setQueueRemoveCallback(self.remove_job_at)
-        self.frontendApp.setQueueClearCallback(self.clear_queue)
-        self.frontendApp.setCloseCallback(self.shutdown)
-
+        self.frontendApp = None
         if run_mode == "headless":
-            self.frontendApp.root.withdraw()
             self.loader = None
-            self.logger.info("[Init] FrontEnd created in hidden mode for headless execution")
+            self.logger.info("[Init] GUI-free headless mode; FrontEnd not created")
         else:
-            from pathlib import Path
+            # Keep Tk and all frontend dependencies out of the headless import
+            # and execution path.
+            from ui.front_end import FrontEnd
+            from ui.loading_overlay import LoadingOverlay
+
+            self.frontendApp = FrontEnd(self.args.tickers, project_root=PROJECT_ROOT)
+            self.frontendApp.setQueueAddCallback(self.enqueue_jobs)
+            self.frontendApp.setQueueRunCallback(self.run_queue)
+            self.frontendApp.setQueueRemoveCallback(self.remove_job_at)
+            self.frontendApp.setQueueClearCallback(self.clear_queue)
+            self.frontendApp.setCloseCallback(self.shutdown)
 
             project_root = Path(__file__).resolve().parent.parent
             avi_path = project_root / "assets" / "loading.avi"
@@ -190,10 +222,20 @@ class MainApp:
         self.frontendApp.set_status(f"Queued {len(jobs)} job(s)")
 
     def remove_job_at(self, index: int) -> None:
-        removed = self.queue_controller.remove_at(index)
+        if isinstance(index, (list, tuple, set)):
+            removed_jobs = self.queue_controller.remove_indices(index)
+            removed = removed_jobs[0] if removed_jobs else None
+            removed_count = len(removed_jobs)
+        else:
+            removed = self.queue_controller.remove_at(index)
+            removed_count = 1 if removed is not None else 0
+
         self.frontendApp.refresh_queue_table(self.queue_controller.snapshot())
         if removed is not None:
-            self.frontendApp.set_status(f"Removed {removed.job_id}")
+            if removed_count > 1:
+                self.frontendApp.set_status(f"Removed {removed_count} queued job(s)")
+            else:
+                self.frontendApp.set_status(f"Removed {removed.job_id}")
 
     def clear_queue(self) -> None:
         self.queue_controller.clear()
@@ -315,7 +357,7 @@ class MainApp:
         threading.Thread(target=_worker, daemon=True).start()
 
     def shutdown(self) -> None:
-        self.logger.info("[Shutdown] Stopping workers and closing GUI")
+        self.logger.info("[Shutdown] Stopping workers and releasing resources")
         self.queue_stop_event.set()
         self.pipeline_running = False
 
@@ -330,6 +372,83 @@ class MainApp:
                 torch.cuda.empty_cache()
         except Exception:
             pass
+
+    def _release_headless_resources(self, result=None) -> None:
+        """Deterministically release native GUI/cuDNN resources before exit.
+
+        Letting Windows tear CUDA/native objects down during interpreter
+        finalisation can produce 0xC0000409 after a recurrent experiment has
+        already saved and printed its result.
+        """
+
+        self._release_headless_result(result)
+
+        frontend = getattr(self, "frontendApp", None)
+        if frontend is not None:
+            try:
+                trainers = getattr(frontend, "_trainers", None)
+                if isinstance(trainers, dict):
+                    trainers.clear()
+                frontend._on_close()
+            except Exception as exc:
+                self.logger.debug("[HeadlessCleanup] Frontend cleanup failed: %s", exc)
+                self.shutdown()
+        else:
+            self.shutdown()
+
+        # On Windows, forcing collection here can enter cuDNN/native destructors
+        # before the successful CLI path reaches os._exit(). References have
+        # already been detached above; process termination reclaims them.
+        if os.name == "nt":
+            return
+
+        gc.collect()
+
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        except Exception as exc:
+            self.logger.debug("[HeadlessCleanup] CUDA cleanup failed: %s", exc)
+
+    def _release_headless_result(self, result=None) -> None:
+        """Release one completed model while keeping a headless worker alive."""
+
+        trainer = getattr(result, "trainer", None) if result is not None else None
+        model = getattr(result, "model", None) if result is not None else None
+        optimiser = None
+
+        try:
+            if model is not None and hasattr(model, "cpu"):
+                model.cpu()
+        except Exception as exc:
+            self.logger.debug("[HeadlessCleanup] Could not move model to CPU: %s", exc)
+
+        try:
+            if trainer is not None:
+                optimiser = getattr(trainer, "optimiser", None)
+                if optimiser is not None and hasattr(optimiser, "state"):
+                    optimiser.state.clear()
+                trainer.optimiser = None
+                trainer.criterion = None
+                trainer.edge_index = None
+                trainer.model = None
+        except Exception as exc:
+            self.logger.debug("[HeadlessCleanup] Trainer cleanup failed: %s", exc)
+
+        if result is not None:
+            result.trainer = None
+            result.model = None
+
+        trainer = None
+        model = None
+        optimiser = None
+
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as exc:
+            self.logger.debug("[HeadlessCleanup] Result CUDA cleanup failed: %s", exc)
 
     def _request_gui_close(self, *_args) -> None:
         try:
@@ -508,10 +627,22 @@ class MainApp:
             "train_seconds",
             "avg_power_w",
             "energy_per_sample_wh",
+            "energy_measurement_method",
+            "cpu_power_watts",
             "train_samples",
+            "training_sample_unit",
+            "train_examples_unique",
+            "sample_exposures",
+            "epochs_completed",
             "gpu_peak_memory_mb",
+            "total_params",
+            "trainable_params",
         ]
         return {key: metadata_payload.get(key) for key in keys}
+
+    def _extract_capacity_payload(self, metadata_payload):
+        capacity = metadata_payload.get("capacity", {}) or {}
+        return dict(capacity) if isinstance(capacity, dict) else {}
     
 
     def _fmt_float(self, value, digits=3, missing="n/a"):
@@ -564,6 +695,7 @@ class MainApp:
         metrics = self._metrics_dict(getattr(result, "metrics", None))
         metadata = self._serialise_metadata(getattr(result, "eval_result", None))
         compute = self._extract_compute_payload(metadata)
+        capacity = self._extract_capacity_payload(metadata)
 
         model = str(getattr(result, "model_name", metrics.get("model", "MODEL"))).upper()
         ticker = str(metrics.get("ticker") or metadata.get("ticker") or "").upper()
@@ -584,12 +716,36 @@ class MainApp:
             model_label = model
 
         threshold_policy = (
-            metrics.get("threshold_selection_metric")
-            or metadata.get("decision_threshold_policy")
+            metadata.get("decision_threshold_policy")
+            or metrics.get("threshold_selection_metric")
             or "n/a"
         )
-
         width = 96
+
+        operational_threshold = metrics.get(
+            "threshold_operational",
+            metrics.get("threshold_fixed"),
+        )
+        validation_threshold = metrics.get("threshold_macro_f1_dense")
+        try:
+            show_validation_threshold_metrics = (
+                abs(float(operational_threshold) - float(validation_threshold)) > 1e-12
+            )
+        except (TypeError, ValueError):
+            show_validation_threshold_metrics = False
+
+        validation_threshold_lines = []
+        if show_validation_threshold_metrics:
+            validation_threshold_lines = [
+                self._box_line("", width),
+                self._box_line("VALIDATION MACRO-F1 THRESHOLD ON TEST", width),
+                self._box_line(
+                    f"  acc {self._fmt_float(metrics.get('accuracy_dense_macro_f1_threshold'))} | "
+                    f"f1_pos {self._fmt_float(metrics.get('f1_dense_macro_f1_threshold'))} | "
+                    f"f1_macro {self._fmt_float(metrics.get('macro_f1_dense_macro_f1_threshold'))}",
+                    width,
+                ),
+            ]
 
         lines = [
             self._box_rule("top", width),
@@ -603,8 +759,8 @@ class MainApp:
             self._box_line(f"SIGNAL     {direction} {confidence}%", width),
             self._box_line(
                 "THRESHOLD  "
-                f"fixed={self._fmt_float(metrics.get('threshold_fixed'), 3)} | "
-                f"best_macro_f1={self._fmt_float(metrics.get('threshold_macro_f1_dense'), 3)} | "
+                f"operational={self._fmt_float(metrics.get('threshold_operational', metrics.get('threshold_fixed')), 3)} | "
+                f"validation_macro_f1={self._fmt_float(metrics.get('threshold_macro_f1_dense'), 3)} | "
                 f"policy={threshold_policy}",
                 width,
             ),
@@ -632,20 +788,23 @@ class MainApp:
                     width,
                 ),
                 self._box_line(
-                    f"  loss {self._fmt_float(metrics.get('val_loss_dense'))} | "
+                    f"  val_loss {self._fmt_float(metrics.get('val_loss_dense'))} | "
+                    f"test_loss {self._fmt_float(metrics.get('test_loss_dense'))} | "
                     f"n {self._fmt_int(metrics.get('n_predictions_dense'))}",
                     width,
                 ),
 
                 self._box_line("", width),
 
-                self._box_line("BEST MACRO-F1 THRESHOLD", width),
+                self._box_line("FIXED 0.5 ROBUSTNESS BASELINE", width),
                 self._box_line(
-                    f"  acc {self._fmt_float(metrics.get('accuracy_dense_macro_f1_threshold'))} | "
-                    f"f1_pos {self._fmt_float(metrics.get('f1_dense_macro_f1_threshold'))} | "
-                    f"f1_macro {self._fmt_float(metrics.get('macro_f1_dense_macro_f1_threshold'))}",
+                    f"  acc {self._fmt_float(metrics.get('accuracy_dense_fixed_05'))} | "
+                    f"f1_pos {self._fmt_float(metrics.get('f1_dense_fixed_05'))} | "
+                    f"f1_macro {self._fmt_float(metrics.get('macro_f1_dense_fixed_05'))}",
                     width,
                 ),
+
+                *validation_threshold_lines,
 
                 self._box_line("", width),
 
@@ -686,8 +845,26 @@ class MainApp:
                     width,
                 ),
                 self._box_line(
-                    f"  samples {self._fmt_int(compute.get('train_samples'))} | "
-                    f"energy_per_sample {self._fmt_float(compute.get('energy_per_sample_wh'), 8)} Wh",
+                    f"  unique_examples {self._fmt_int(compute.get('train_examples_unique'))} | "
+                    f"sample_exposures {self._fmt_int(compute.get('sample_exposures'))} | "
+                    f"epochs {self._fmt_int(compute.get('epochs_completed'))} | "
+                    f"unit {compute.get('training_sample_unit') or 'n/a'}",
+                    width,
+                ),
+                self._box_line(
+                    f"  energy_per_sample {self._fmt_float(compute.get('energy_per_sample_wh'), 8)} Wh | "
+                    f"method {compute.get('energy_measurement_method') or 'n/a'}",
+                    width,
+                ),
+
+                self._box_line("", width),
+
+                self._box_line("MODEL CAPACITY", width),
+                self._box_line(
+                    f"  family {capacity.get('family') or 'n/a'} | "
+                    f"measure {capacity.get('primary_measure') or 'n/a'} | "
+                    f"value {self._fmt_int(capacity.get('primary_value'))} | "
+                    f"parameter_storage {self._fmt_int(capacity.get('parameter_storage_bytes'))} bytes",
                     width,
                 ),
 
@@ -696,6 +873,37 @@ class MainApp:
         )
 
         return "\n".join(lines)
+
+    def _format_headless_result_line(self, result) -> str:
+        """Compact human-readable companion to runs/run_results.csv."""
+
+        metrics = self._metrics_dict(getattr(result, "metrics", None))
+        metadata = self._serialise_metadata(getattr(result, "eval_result", None))
+        compute = self._extract_compute_payload(metadata)
+        model = str(getattr(result, "model_name", metrics.get("model", "unknown"))).lower()
+        graph_backend = metadata.get("graph_backend") or metrics.get("graph_backend")
+        model_label = f"{model}+{graph_backend}" if model == "stgnn" and graph_backend else model
+        ticker = str(metrics.get("ticker") or metadata.get("ticker") or "").upper()
+        seed = metadata.get("seed", getattr(self.args, "seed", "n/a"))
+        threshold = metrics.get("threshold_operational", metrics.get("threshold_fixed"))
+
+        return " | ".join(
+            [
+                "RESULT",
+                f"model={model_label}",
+                f"ticker={ticker}",
+                f"seed={seed}",
+                f"signal={str(getattr(result, 'direction', 'unknown')).lower()}",
+                f"confidence_pct={self._fmt_float(getattr(result, 'confidence', None), 2)}",
+                f"threshold={self._fmt_float(threshold, 3)}",
+                f"macro_f1={self._fmt_float(metrics.get('macro_f1_dense'))}",
+                f"macro_f1_fixed_05={self._fmt_float(metrics.get('macro_f1_dense_fixed_05'))}",
+                f"macro_f1_trade={self._fmt_float(metrics.get('macro_f1_trade_aligned'))}",
+                f"sharpe={self._fmt_float(metrics.get('sharpe'))}",
+                f"final_equity={self._fmt_float(metrics.get('final_equity'))}",
+                f"train_sec={self._fmt_float(compute.get('train_seconds'), 2)}",
+            ]
+        )
 
 
     def _is_graph_aware_model(self, selected_model: str, graph_backend=None) -> bool:
@@ -741,6 +949,7 @@ class MainApp:
 
         metadata_payload = self._serialise_metadata(eval_result)
         compute_payload = self._extract_compute_payload(metadata_payload)
+        capacity_payload = self._extract_capacity_payload(metadata_payload)
 
         model_key = str(selected_model or "").strip().lower()
         graph_backend = self._resolve_record_graph_backend(model_key, metadata_payload)
@@ -801,11 +1010,14 @@ class MainApp:
             "batch_size": int(getattr(self.args, "batch_size", 0)),
             "lstm_epochs": int(getattr(self.args, "lstm_epochs", 0)),
             "stgnn_epochs": int(getattr(self.args, "stgnn_epochs", 0)),
+            "deterministic": bool(getattr(self.args, "deterministic", True)),
             "direction": str(getattr(result, "direction", "")) if result is not None else "",
             "confidence": float(getattr(result, "confidence", 0.0)) if result is not None else 0.0,
             "metrics": metrics_payload,
             "metadata": metadata_payload,
             "compute": compute_payload,
+            "capacity": capacity_payload,
+            "data_quality": metadata_payload.get("data_quality"),
             "graph_stats": graph_stats_payload,
             "error_message": error_message,
         }
@@ -899,7 +1111,10 @@ class MainApp:
             graph_embed=str(getattr(self.args, "graph_embed", "unknown")),
             graph_ablation=str(getattr(self.args, "graph_ablation", "none")),
             ablate_feature=str(getattr(self.args, "ablate_feature", "none")),
-            threshold_policy=str(getattr(self.args, "decision_threshold_policy", "fixed")),
+            threshold_policy=str(
+                getattr(self.args, "decision_threshold_policy", "macro_f1_dense")
+            ),
+            deterministic=bool(getattr(self.args, "deterministic", True)),
             direction=str(getattr(result, "direction", "")) if result is not None else "",
             confidence=float(getattr(result, "confidence", 0.0)) if result is not None else 0.0,
             metrics=metrics_payload,
@@ -915,6 +1130,8 @@ class MainApp:
                 "queue_group": queue_group,
                 "metadata": metadata_payload,
                 "compute": compute_payload,
+                "capacity": capacity_payload,
+                "graph_stats": graph_stats_payload,
                 "error_message": error_message,
                 "graph_backend": graph_backend,
             },
@@ -1072,27 +1289,44 @@ class MainApp:
             return None
 
         if run_mode == "headless":
-            self.logger.info("[RunMode] Starting headless mode")
+            result = None
+            try:
+                self.logger.info("[RunMode] Starting headless mode")
 
-            selected_stock = getattr(self.args, "target_stock", None)
-            selected_window = getattr(self.args, "prediction_window", "1d")
-            selected_model = getattr(self.args, "model", "lstm")
+                selected_stock = getattr(self.args, "target_stock", None)
+                selected_window = getattr(self.args, "prediction_window", "1d")
+                selected_model = getattr(self.args, "model", "lstm")
 
-            result = self.run_headless(
-                stock=selected_stock,
-                gui_window=selected_window,
-                model_name=selected_model,
-            )
+                result = self.run_headless(
+                    stock=selected_stock,
+                    gui_window=selected_window,
+                    model_name=selected_model,
+                )
 
-            self.logger.info(
-                "[HeadlessResult] model=%s direction=%s confidence=%.2f",
-                result.model_name,
-                result.direction,
-                result.confidence,
-            )
+                self.logger.info(
+                    "[HeadlessResult] model=%s direction=%s confidence=%.2f",
+                    result.model_name,
+                    result.direction,
+                    result.confidence,
+                )
 
-            print()
-            print(self._format_headless_report(result))
+                report_mode = str(
+                    getattr(self.args, "headless_report", "compact")
+                ).strip().lower()
+                if report_mode == "full":
+                    print()
+                    print(self._format_headless_report(result))
+                elif report_mode == "compact":
+                    print(self._format_headless_result_line(result))
+            finally:
+                self._release_headless_resources(result)
+
+            # Exit before Python unwinds this successful CLI frame. On some
+            # Windows CUDA builds, releasing frame-local native objects first
+            # can raise 0xC0000409 even though the result is already persisted.
+            # Imported/library use and genuine exceptions never take this path.
+            if _should_force_headless_cli_exit():
+                _finish_successful_windows_headless_process(0)
             return result
 
         raise ValueError(
@@ -1101,11 +1335,25 @@ class MainApp:
         )
 
     def run_headless(self, stock: str = None, gui_window: str = None, model_name: str = None):
-        try:
-            self.frontendApp.root.withdraw()
-            self.frontendApp.root.update_idletasks()
-        except Exception:
-            pass
+        selected_stock, selected_window, selected_model, state = self.prepare_headless_state(
+            stock=stock,
+            gui_window=gui_window,
+            model_name=model_name,
+        )
+        return self.run_headless_from_state(
+            stock=selected_stock,
+            gui_window=selected_window,
+            model_name=selected_model,
+            state=state,
+        )
+
+    def prepare_headless_state(
+        self,
+        stock: str = None,
+        gui_window: str = None,
+        model_name: str = None,
+    ):
+        """Load one universe and build reusable pipeline state for a worker."""
 
         selected_stock = stock or (self.args.tickers[0] if self.args.tickers else None)
         if not selected_stock:
@@ -1168,50 +1416,64 @@ class MainApp:
                 f"Available: {', '.join(sorted(self.raw_feature_dfs.keys()))}"
             )
 
-        self.frontendApp.bindMainApp(self)
-        self.frontendApp.modelVar.set(selected_model.upper())
-        self.frontendApp.stockVar.set(selected_stock)
-        self.frontendApp.windowVar.set(selected_window)
-        self.frontendApp.set_active_model_titles(selected_model)
-
-        evaluator = self.frontendApp.evaluator
-        evaluator.reset_histories()
-
-        ts_start = self.experiment_store.utc_now_iso()
-
         pipeline = Pipeline(self)
         state = pipeline.run(selected_stock, selected_window, stop_event=None)
+        return selected_stock, selected_window, selected_model, state
 
-        experiment_runner = ExperimentRunner(self)
-        result = experiment_runner.run(
-            model_name=selected_model,
-            stock=selected_stock,
-            state=state,
-            evaluator=evaluator,
-            stop_event=None,
-        )
+    def run_headless_from_state(
+        self,
+        *,
+        stock: str,
+        gui_window: str,
+        model_name: str,
+        state,
+    ):
+        """Run and persist one model using already prepared headless state."""
 
-        self._store_run_result(
-            stock=selected_stock,
-            gui_window=selected_window,
-            selected_model=selected_model,
-            result=result,
-            status="success",
-            ts_start=ts_start,
-            state=state,
-        )
+        selected_stock = str(stock).strip().upper()
+        selected_window = str(gui_window).strip()
+        selected_model = str(model_name).strip().lower()
+        self.args.model = selected_model
+
+        evaluator = HeadlessEvaluator()
+        ts_start = self.experiment_store.utc_now_iso()
+        result = None
 
         try:
-            self.frontendApp.updateResults(
-                result.model_name,
-                result.direction,
-                result.confidence,
+            experiment_runner = ExperimentRunner(self)
+            result = experiment_runner.run(
+                model_name=selected_model,
+                stock=selected_stock,
+                state=state,
+                evaluator=evaluator,
+                stop_event=None,
             )
-            self.frontendApp.root.update_idletasks()
-        except Exception as exc:
-            self.logger.warning("[Headless] UI compatibility update failed: %s", exc)
 
-        return result
+            self._store_run_result(
+                stock=selected_stock,
+                gui_window=selected_window,
+                selected_model=selected_model,
+                result=result,
+                status="success",
+                ts_start=ts_start,
+                state=state,
+            )
+            return result
+        except Exception as exc:
+            try:
+                self._store_run_result(
+                    stock=selected_stock,
+                    gui_window=selected_window,
+                    selected_model=selected_model,
+                    result=result,
+                    status="failed",
+                    ts_start=ts_start,
+                    error_message=str(exc),
+                    state=state,
+                )
+            except Exception:
+                self.logger.exception("[Headless] Could not persist failed run")
+            raise
 
     def _load_price_history(self, tickers, period="729d", return_handler=False):
         loader = self.price_loader_registry.get(self.args.price_provider)
@@ -1312,4 +1574,11 @@ class MainApp:
 
 if __name__ == "__main__":
     app = MainApp()
-    app.run()
+    # Keep the returned result alive until the process boundary. Dropping it
+    # before the next statement can itself trigger native object finalisation.
+    _run_result = app.run()
+    if (
+        os.name == "nt"
+        and str(getattr(app.args, "run_mode", "gui")).strip().lower() == "headless"
+    ):
+        _finish_successful_windows_headless_process(0)

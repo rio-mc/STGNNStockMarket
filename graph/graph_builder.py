@@ -205,11 +205,47 @@ class GraphBuilder:
 
     def compute_graph_stats(self, tickers, edges, mst_edges=None) -> Dict[str, object]:
         n_nodes = len(tickers)
+        deduped_edges = self._dedupe_edges(edges)
+        known_sector_nodes = sum(
+            1
+            for ticker in tickers
+            if self.ticker_to_sector.get(ticker) not in (None, "Unknown")
+        )
+        homophilous_edges, homophily_eligible_edges = self._sector_homophily_counts(
+            tickers,
+            deduped_edges,
+        )
+        topology = nx.Graph()
+        topology.add_nodes_from(range(n_nodes))
+        topology.add_edges_from((i, j) for i, j, _weight in deduped_edges if i != j)
+        connected_components = nx.number_connected_components(topology) if n_nodes else 0
+        isolated_nodes = len(list(nx.isolates(topology))) if n_nodes else 0
+        mean_degree = (
+            sum(dict(topology.degree()).values()) / n_nodes
+            if n_nodes
+            else 0.0
+        )
         stats = {
             "num_nodes": n_nodes,
-            "num_edges": len(self._dedupe_edges(edges)),
-            "density": self._density(n_nodes, edges),
-            "homophily": self.sector_homophily_from_edges(tickers, edges),
+            "num_edges": len(deduped_edges),
+            "density": self._density(n_nodes, deduped_edges),
+            "mean_degree": mean_degree,
+            "connected_components": connected_components,
+            "isolated_nodes": isolated_nodes,
+            "homophily": (
+                homophilous_edges / homophily_eligible_edges
+                if homophily_eligible_edges
+                else float("nan")
+            ),
+            "sector_edge_homophily": (
+                homophilous_edges / homophily_eligible_edges
+                if homophily_eligible_edges
+                else float("nan")
+            ),
+            "sector_homophilous_edges": homophilous_edges,
+            "sector_homophily_eligible_edges": homophily_eligible_edges,
+            "sector_known_nodes": known_sector_nodes,
+            "sector_unknown_nodes": n_nodes - known_sector_nodes,
             "graph_mode": self.graph_mode,
             "graph_window": self.graph_window,
             "requested_k": self.max_k,
@@ -272,6 +308,23 @@ class GraphBuilder:
         if not edges:
             return float("nan")
 
+        same, total = self._sector_homophily_counts(
+            tickers,
+            edges,
+            ignore_unknown=ignore_unknown,
+            ignore_self_loops=ignore_self_loops,
+        )
+        return (same / total) if total > 0 else float("nan")
+
+    def _sector_homophily_counts(
+        self,
+        tickers,
+        edges,
+        ignore_unknown=True,
+        ignore_self_loops=True,
+    ):
+        """Return same-sector and eligible undirected edge counts."""
+
         undirected = set()
         for i, j, _ in edges:
             a, b = (i, j) if i <= j else (j, i)
@@ -289,7 +342,7 @@ class GraphBuilder:
             total += 1
             if si == sj:
                 same += 1
-        return (same / total) if total > 0 else float("nan")
+        return same, total
 
     def sector_homophily_from_edge_index(self, tickers, edge_index: torch.Tensor, ignore_unknown=True, ignore_self_loops=True) -> float:
         if edge_index is None or edge_index.numel() == 0:

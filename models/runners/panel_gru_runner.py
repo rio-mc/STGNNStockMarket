@@ -11,8 +11,8 @@ class PanelGRURunner(BaseModelRunner):
         app.frontendApp.set_status("Training PANEL GRU...")
         self._prepare_memory_logging(self.model_name)
 
-        train_ds, val_ds, aligned_tickers, _num_nodes = self._build_graph_datasets(app, stock)
-        self._log_dataset_summary(app, train_ds, val_ds, aligned_tickers)
+        train_ds, val_ds, test_ds, aligned_tickers, _num_nodes = self._build_graph_datasets(app, stock)
+        self._log_dataset_summary(app, train_ds, val_ds, test_ds, aligned_tickers)
 
         model = PanelGRUClassifier(
             feature_dim=len(app.raw_feature_cols) + 1,
@@ -38,7 +38,15 @@ class PanelGRURunner(BaseModelRunner):
         self._set_target_from_dataset(trainer, model, train_ds)
 
         dl = self._make_geo_loader(app, train_ds)
-        self._train_model(app=app, trainer=trainer, dataloader=dl, epochs=app.args.lstm_epochs, stop_event=stop_event)
+        val_dl = self._make_geo_loader(app, val_ds, shuffle=False)
+        self._train_model(
+            app=app,
+            trainer=trainer,
+            dataloader=dl,
+            validation_dataloader=val_dl,
+            epochs=app.args.lstm_epochs,
+            stop_event=stop_event,
+        )
 
         result = self._evaluate_and_predict(
             app=app,
@@ -49,10 +57,11 @@ class PanelGRURunner(BaseModelRunner):
             model=model,
             trainer=trainer,
             val_ds=val_ds,
-            live_predict_fn=lambda: self._live_panel_probability(app, model, val_ds, pass_target_index=False),
+            test_ds=test_ds,
+            live_predict_fn=lambda: self._live_panel_probability(app, model, test_ds, pass_target_index=False),
             eval_status="Evaluating PANEL GRU...",
             predict_status="Predicting with PANEL GRU...",
         )
 
-        self._cleanup(dl, train_ds, val_ds)
+        self._cleanup(dl, val_dl, train_ds, val_ds, test_ds)
         return result
